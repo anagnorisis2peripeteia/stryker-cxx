@@ -1,0 +1,22 @@
+{
+  "name": "stryker-cxx",
+  "version": "0.1.0",
+  "description": "Potential Stryker-style host/provider adapter for cxx-mutant mutation payloads",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "bin": {
+    "stryker-cxx": "./bin/stryker-cxx.js"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "start": "node bin/stryker-cxx.js"
+  },
+  "keywords": [
+    "mutation-testing",
+    "mutation-testing-elements",
+    "cxx",
+    "cpp",
+    "stryker"
+  ]
+}
