@@ -6,18 +6,17 @@
 
 The adapter intentionally stays small:
 - consumes validated `mutation-testing-elements` (`schemaVersion: 2.0`) payloads,
+- accepts both direct MTE payloads and full `cxx-mutant.report.v1` wrappers,
 - exposes a stable JS surface for summarizing mutants,
-- emits runner-friendly survivor lists or compact summary output,
+- emits survivor lists or compact summary output,
 - keeps `cxx-mutant` as the execution engine.
 
 ## Install
 
 ```bash
-# from this folder
-git clone .../stryker-cxx
-cd stryker-cxx
-npm test
-node bin/stryker-cxx.js --help
+npm install -g stryker-cxx
+# or
+npm install --save-dev stryker-cxx
 ```
 
 ## Usage
@@ -29,9 +28,15 @@ node bin/stryker-cxx.js --mte ./mutation-testing-elements.json --survivors
 node bin/stryker-cxx.js --mte ./mutation-testing-elements.json --survivors --json
 ```
 
+### Supported input shapes
+
+- direct MTE payload: top-level `schemaVersion: "2.0"`, `files` map
+- wrapped `cxx-mutant` payload: top-level `schemaVersion != "2.0"` with
+  `mutationTestingElements` containing the MTE object.
+
 ## Compatibility contract
 
-The CLI expects payload fields in the MTE shape:
+The CLI expects fields in MTE shape:
 
 - `schemaVersion = "2.0"`
 - `language = "cpp"` or `"objc"`

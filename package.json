@@ -4,7 +4,7 @@
   "description": "Potential Stryker-style host/provider adapter for cxx-mutant mutation payloads",
   "type": "module",
   "license": "MIT",
-  "private": true,
+  "private": false,
   "bin": {
     "stryker-cxx": "./bin/stryker-cxx.js"
   },
@@ -15,8 +15,9 @@
   "keywords": [
     "mutation-testing",
     "mutation-testing-elements",
-    "cxx",
-    "cpp",
-    "stryker"
-  ]
+    "stryker",
+    "cpp"
+  ],
+  "repository": "https://github.com/anagnorisis2peripeteia/stryker-cxx.git",
+  "author": "OpenClaw contributors"
 }
