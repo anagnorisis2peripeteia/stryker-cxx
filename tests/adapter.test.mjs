@@ -109,6 +109,27 @@ test("summarizes standard timeout and noCoverage statuses", () => {
   assert.equal(summary.score, 0.0);
 });
 
+test("accepts ignored mutants and excludes them from score", () => {
+  const ignoredSample = structuredClone(sample);
+  ignoredSample.files["src/foo.cpp"].mutants.push({
+    id: "src/foo.cpp:3:0:EqualityOperator:ignored",
+    mutatorName: "EqualityOperator",
+    original: "==",
+    replacement: "!=",
+    status: "Ignored",
+    statusReason: "equivalent generated guard",
+    location: { start: { line: 3, column: 1 }, end: { line: 3, column: 3 } },
+  });
+
+  const parsed = assertMteReport(ignoredSample);
+  const summary = summarizeReport(parsed);
+  assert.equal(summary.total, 3);
+  assert.equal(summary.ignored, 1);
+  assert.equal(summary.killed, 1);
+  assert.equal(summary.survived, 1);
+  assert.equal(summary.score, 0.5);
+});
+
 test("invalid schema version is rejected", () => {
   const payload = structuredClone(sample);
   payload.schemaVersion = "1.0";

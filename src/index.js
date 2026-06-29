@@ -5,6 +5,7 @@ const CXX_STATUS = new Set([
   "Survived",
   "NoCoverage",
   "Timeout",
+  "Ignored",
   "Pending",
   "RuntimeError",
 ]);
@@ -106,6 +107,7 @@ export function summarizeReport(report) {
       if (mut.status === "Survived") acc.survived += 1;
       if (mut.status === "NoCoverage") acc.compileErrors += 1;
       if (mut.status === "Timeout") acc.timeouts += 1;
+      if (mut.status === "Ignored") acc.ignored += 1;
       if (mut.status === "Pending") acc.pending += 1;
       if (mut.status === "RuntimeError") acc.runtimeErrors += 1;
       return acc;
@@ -116,12 +118,14 @@ export function summarizeReport(report) {
       survived: 0,
       compileErrors: 0,
       timeouts: 0,
+      ignored: 0,
       pending: 0,
       runtimeErrors: 0,
     },
   );
 
-  const score = counts.total ? counts.killed / counts.total : 1;
+  const denominator = Math.max(0, counts.total - counts.ignored);
+  const score = denominator ? counts.killed / denominator : 1;
   return {
     schemaVersion: report.schemaVersion,
     language: report.language,
@@ -131,6 +135,7 @@ export function summarizeReport(report) {
     survived: counts.survived,
     compileErrors: counts.compileErrors,
     timedOut: counts.timeouts,
+    ignored: counts.ignored,
     pending: counts.pending,
     runtimeErrors: counts.runtimeErrors,
     score,

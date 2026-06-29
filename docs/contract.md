@@ -32,5 +32,9 @@ The JS adapter accepts both:
 - `Survived`
 - `NoCoverage`
 - `Timeout`
+- `Ignored`
 - `Pending`
 - `RuntimeError`
+
+`Ignored` mutants remain visible in the MTE payload but are excluded from
+adapter summary score calculation.
