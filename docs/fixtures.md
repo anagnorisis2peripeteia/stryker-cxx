@@ -30,9 +30,14 @@ commands. Some require the corresponding framework dependency to be installed.
 - `fixtures/plugins/reporter-hook`: local hook/reporter manifest.
 - `fixtures/plugins/provider-hooks`: local build/check/test runner and
   coverage-provider capability manifest.
+- `fixtures/plugins/config-loader`: local config-loader manifest that can inject
+  config defaults and command resolution before run defaults are finalized.
 
 Plugins are loaded explicitly by path or plugin directory. `stryker-cxx` never
 installs plugins from the network during a mutation run.
+`reporters` entries in a manifest can include an optional `metadata` object that
+is surfaced in `execution.reporterMetadata` and can carry reporter-specific
+integration details.
 
 ## Config schema
 

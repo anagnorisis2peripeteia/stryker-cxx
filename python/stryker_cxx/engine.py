@@ -31,6 +31,7 @@ from typing import Any
 from .schema import (
     REPORT_SCHEMA_VERSION,
     MTE_SCHEMA_VERSION,
+    TOOL_VERSION,
     require_mte,
     require_report,
 )
@@ -38,9 +39,13 @@ from .schema import (
 # Token-level mutators.
 MUTATORS: dict[str, list[tuple[str, str]]] = {
     "ConditionalBoundary": [("<=", "<"), (">=", ">"), ("<", "<="), (">", ">=")],
+    "ConditionalExpression": [],
     "EqualityOperator": [("==", "!="), ("!=", "==")],
     "LogicalOperator": [("&&", "||"), ("||", "&&")],
+    "ShiftOperator": [("<<=", ">>="), (">>=", "<<="), ("<<", ">>"), (">>", "<<")],
     "BooleanLiteral": [("true", "false"), ("false", "true")],
+    "ObjCBoolLiteral": [("YES", "NO"), ("NO", "YES")],
+    "UpdateOperator": [("++", "--"), ("--", "++")],
     "ArithmeticOperator": [("+", "-"), ("-", "+"), ("*", "/"), ("/", "*")],
     "AssignmentOperator": [("+=", "-="), ("-=", "+="), ("*=", "/="), ("/=", "*=")],
     "BitwiseOperator": [("&", "|"), ("|", "&"), ("^", "|")],
@@ -48,14 +53,71 @@ MUTATORS: dict[str, list[tuple[str, str]]] = {
     "ReturnValue": [("return true", "return false"), ("return false", "return true")],
     "IntegerLiteral": [("0", "1"), ("1", "0")],
     "NullLiteral": [("nullptr", "NULL"), ("NULL", "nullptr")],
+    "CharacterLiteral": [],
+    "FloatingPointLiteral": [],
+    "StringLiteral": [],
+    "StatementRemoval": [],
+    "BlockRemoval": [],
     "CallRemoval": [],
+    "LoopBoundary": [("<=", "<"), (">=", ">"), ("<", "<="), (">", ">=")],
+    "LoopCondition": [],
+    "StandardLibraryCall": [
+        ("std::min", "std::max"),
+        ("std::max", "std::min"),
+        ("std::all_of", "std::any_of"),
+        ("std::any_of", "std::all_of"),
+        ("std::none_of", "std::any_of"),
+        ("std::equal", "std::mismatch"),
+        ("std::mismatch", "std::equal"),
+        ("std::lower_bound", "std::upper_bound"),
+        ("std::upper_bound", "std::lower_bound"),
+        ("std::begin", "std::end"),
+        ("std::end", "std::begin"),
+        ("std::cbegin", "std::cend"),
+        ("std::cend", "std::cbegin"),
+        ("std::sort", "std::stable_sort"),
+        ("std::stable_sort", "std::sort"),
+        ("std::partition", "std::stable_partition"),
+        ("std::stable_partition", "std::partition"),
+        ("std::is_sorted", "std::is_heap"),
+        ("std::is_heap", "std::is_sorted"),
+    ],
+    "MemoryOrder": [
+        ("std::memory_order_relaxed", "std::memory_order_seq_cst"),
+        ("std::memory_order_seq_cst", "std::memory_order_relaxed"),
+        ("std::memory_order_acquire", "std::memory_order_relaxed"),
+        ("std::memory_order_release", "std::memory_order_relaxed"),
+        ("std::memory_order_acq_rel", "std::memory_order_seq_cst"),
+        ("std::memory_order_consume", "std::memory_order_acquire"),
+        ("std::memory_order::relaxed", "std::memory_order::seq_cst"),
+        ("std::memory_order::seq_cst", "std::memory_order::relaxed"),
+        ("std::memory_order::acquire", "std::memory_order::relaxed"),
+        ("std::memory_order::release", "std::memory_order::relaxed"),
+        ("std::memory_order::acq_rel", "std::memory_order::seq_cst"),
+        ("std::memory_order::consume", "std::memory_order::acquire"),
+    ],
+    "MemberAccessOperator": [],
+    "ExceptionHandling": [],
+    "PreprocessorGuard": [],
+    "ObjCMessageSend": [],
+    "MetalThreadPosition": [
+        ("thread_position_in_grid", "thread_position_in_threadgroup"),
+        ("thread_position_in_threadgroup", "thread_position_in_grid"),
+        ("thread_index_in_threadgroup", "threads_per_threadgroup"),
+        ("threads_per_threadgroup", "thread_index_in_threadgroup"),
+    ],
+    "MetalAddressSpace": [],
 }
 
 MUTATOR_DESCRIPTIONS: dict[str, str] = {
     "ConditionalBoundary": "replaced conditional boundary operator",
+    "ConditionalExpression": "replaced ternary branch expressions",
     "EqualityOperator": "replaced equality operator",
     "LogicalOperator": "replaced boolean short-circuit operator",
+    "ShiftOperator": "replaced bit-shift operator",
+    "UpdateOperator": "replaced increment/decrement operator",
     "BooleanLiteral": "swapped boolean literal",
+    "ObjCBoolLiteral": "swapped Objective-C boolean literal",
     "ArithmeticOperator": "replaced arithmetic operator",
     "AssignmentOperator": "replaced compound assignment operator",
     "BitwiseOperator": "replaced bitwise operator",
@@ -63,12 +125,33 @@ MUTATOR_DESCRIPTIONS: dict[str, str] = {
     "ReturnValue": "reversed returned boolean result",
     "IntegerLiteral": "changed a basic integer literal",
     "NullLiteral": "changed a null pointer literal",
+    "CharacterLiteral": "replaced a character literal",
+    "FloatingPointLiteral": "replaced a floating-point literal",
+    "StringLiteral": "replaced a string literal",
+    "StatementRemoval": "removed a statement and preserved control flow shape",
+    "BlockRemoval": "removed a single-line compound statement",
     "CallRemoval": "removed a statement-level function call",
+    "LoopBoundary": "replaced loop boundary operator",
+    "LoopCondition": "replaced loop condition",
+    "StandardLibraryCall": "replaced a standard-library call target",
+    "MemoryOrder": "replaced a C++ atomic memory-order constant",
+    "MemberAccessOperator": "replaced a member-access operator",
+    "ExceptionHandling": "removed a throw statement",
+    "PreprocessorGuard": "replaced a simple preprocessor guard",
+    "ObjCMessageSend": "removed a statement-level Objective-C message send",
+    "MetalThreadPosition": "replaced a Metal thread-position attribute",
+    "MetalAddressSpace": "replaced a Metal address-space qualifier",
 }
 
 _TOKEN_PATTERNS: dict[str, str] = {
     "<=": r"<=",
     ">=": r">=",
+    "<<=": r"<<=",
+    ">>=": r">>=",
+    "++": r"(?<![+\-])\+\+(?![+=])",
+    "--": r"(?<![-+])--(?![=-])",
+    "<<": r"<<(?![=<])",
+    ">>": r">>(?![=>])",
     "==": r"==",
     "!=": r"!=",
     "&&": r"&&",
@@ -78,6 +161,8 @@ _TOKEN_PATTERNS: dict[str, str] = {
     ">": r"(?<=\s)>(?=\s)",
     "true": r"\btrue\b",
     "false": r"\bfalse\b",
+    "YES": r"\bYES\b",
+    "NO": r"\bNO\b",
     "+": r"(?<![+])\+(?![+=])",
     "-": r"(?<![-])-(?![->=])",
     "*": r"(?<![*/])\*(?![*/=])",
@@ -96,11 +181,91 @@ _TOKEN_PATTERNS: dict[str, str] = {
     "1": r"(?<![\w.])1(?![\w.])",
     "nullptr": r"\bnullptr\b",
     "NULL": r"\bNULL\b",
+    "STRING_LITERAL": r'"(?:[^"\\\\]|\\\\.)*"',
+    "std::min": r"\bstd::min\b",
+    "std::max": r"\bstd::max\b",
+    "std::all_of": r"\bstd::all_of\b",
+    "std::any_of": r"\bstd::any_of\b",
+    "std::none_of": r"\bstd::none_of\b",
+    "std::equal": r"\bstd::equal\b",
+    "std::mismatch": r"\bstd::mismatch\b",
+    "std::lower_bound": r"\bstd::lower_bound\b",
+    "std::upper_bound": r"\bstd::upper_bound\b",
+    "std::sort": r"\bstd::sort\b",
+    "std::stable_sort": r"\bstd::stable_sort\b",
+    "std::partition": r"\bstd::partition\b",
+    "std::stable_partition": r"\bstd::stable_partition\b",
+    "std::is_sorted": r"\bstd::is_sorted\b",
+    "std::is_heap": r"\bstd::is_heap\b",
+    "std::begin": r"\bstd::begin\b",
+    "std::end": r"\bstd::end\b",
+    "std::cbegin": r"\bstd::cbegin\b",
+    "std::cend": r"\bstd::cend\b",
+    "std::memory_order_relaxed": r"\bstd::memory_order_relaxed\b",
+    "std::memory_order_seq_cst": r"\bstd::memory_order_seq_cst\b",
+    "std::memory_order_acquire": r"\bstd::memory_order_acquire\b",
+    "std::memory_order_release": r"\bstd::memory_order_release\b",
+    "std::memory_order_acq_rel": r"\bstd::memory_order_acq_rel\b",
+    "std::memory_order_consume": r"\bstd::memory_order_consume\b",
+    "std::memory_order::relaxed": r"\bstd::memory_order::relaxed\b",
+    "std::memory_order::seq_cst": r"\bstd::memory_order::seq_cst\b",
+    "std::memory_order::acquire": r"\bstd::memory_order::acquire\b",
+    "std::memory_order::release": r"\bstd::memory_order::release\b",
+    "std::memory_order::acq_rel": r"\bstd::memory_order::acq_rel\b",
+    "std::memory_order::consume": r"\bstd::memory_order::consume\b",
+    "thread_position_in_grid": r"\bthread_position_in_grid\b",
+    "thread_position_in_threadgroup": r"\bthread_position_in_threadgroup\b",
+    "thread_index_in_threadgroup": r"\bthread_index_in_threadgroup\b",
+    "threads_per_threadgroup": r"\bthreads_per_threadgroup\b",
 }
+
+_STRING_LITERAL_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
+_CHARACTER_LITERAL_RE = re.compile(r"(?:L|u8|u|U)?'(?:[^'\\]|\\.)*'")
+_FLOATING_LITERAL_RE = re.compile(
+    r"(?<![\w.])(?:[0-9]+\.[0-9]*|\.[0-9]+|[0-9]+\.[0-9]+[eE][+-]?[0-9]+|[0-9]+[eE][+-]?[0-9]+)(?:[fFlL])?(?![\w.])"
+)
+_INTEGER_LITERAL_RE = re.compile(r"(?<![\w.])(?:0|1)(?![\w.])")
+_NULL_LITERAL_RE = re.compile(r"\b(?:nullptr|NULL)\b")
 
 _CALL_REMOVAL_RE = re.compile(
     r"\b(?!if\b|for\b|while\b|switch\b|return\b|sizeof\b|catch\b)"
     r"([A-Za-z_]\w*(?:(?:\s*::\s*|\s*->\s*|\s*\.\s*)[A-Za-z_]\w*)*\s*\([^;{}]*\))(?=\s*;)"
+)
+_MEMBER_ACCESS_RE = re.compile(
+    r"\b[A-Za-z_]\w*(?:\s*(?:\)|\]))?\s*(?P<op>->\*|->|\.\*|\.)(?=\s*[A-Za-z_]\w*)"
+)
+_THROW_STATEMENT_RE = re.compile(r"\bthrow\b[^;]*;")
+_OBJC_MESSAGE_SEND_RE = re.compile(r"^\s*(\[[^;{}]+\])\s*;")
+_METAL_ADDRESS_SPACE_RE = re.compile(r"\b(device|constant|threadgroup)\b(?=\s+)")
+
+_BLOCK_REMOVAL_RE = re.compile(r"^\s*\{[^{}]*\}\s*$")
+_STATEMENT_REMOVAL_FORBIDDEN_PREFIXES = (
+    "if",
+    "for",
+    "while",
+    "switch",
+    "do",
+    "return",
+    "case",
+    "default",
+    "goto",
+    "break",
+    "continue",
+    "catch",
+    "try",
+    "throw",
+    "asm",
+    "constexpr",
+    "class",
+    "struct",
+    "enum",
+    "namespace",
+    "template",
+    "typename",
+    "operator",
+    "public",
+    "private",
+    "protected",
 )
 
 SOURCE_EXTENSIONS = {
@@ -114,8 +279,27 @@ SOURCE_EXTENSIONS = {
     ".hpp",
     ".hh",
     ".hxx",
+    ".metal",
 }
 DEFAULT_MUTATORS = ["ConditionalBoundary", "EqualityOperator", "LogicalOperator", "BooleanLiteral"]
+EQUIVALENT_SUPPRESSION_MODES = {"off", "conservative", "aggressive"}
+GENERATED_CODE_MARKERS = (
+    "auto-generated",
+    "autogenerated",
+    "automatically generated",
+    "generated by",
+    "do not edit",
+    "do not modify",
+)
+GENERATED_PATH_PATTERNS = (
+    "/generated/",
+    "/gen/",
+    ".pb.",
+    ".grpc.",
+    "moc_",
+    "ui_",
+    "qrc_",
+)
 
 PLUGIN_MANIFEST = "stryker-cxx-plugin.json"
 REDACTED_VALUE = "[REDACTED]"
@@ -209,6 +393,14 @@ class Report:
 
 FATAL_STATUSES = {"KILLED", "SURVIVED", "BUILD_ERROR", "CHECK_ERROR", "NO_COVERAGE", "TIMEOUT", "IGNORED"}
 RETAINABLE_STATUSES = FATAL_STATUSES | {"RUNTIME_ERROR", "PENDING"}
+BATCH_ISOLATED_MUTATORS = {
+    "BlockRemoval",
+    "CallRemoval",
+    "ExceptionHandling",
+    "ObjCMessageSend",
+    "PreprocessorGuard",
+    "StatementRemoval",
+}
 
 
 @dataclass(frozen=True)
@@ -222,10 +414,23 @@ class IgnoreDirective:
 IGNORE_MUTATOR_ALIASES: dict[str, str] = {
     "boolean": "BooleanLiteral",
     "booleanliteral": "BooleanLiteral",
+    "objcbool": "ObjCBoolLiteral",
+    "objcboolean": "ObjCBoolLiteral",
+    "objcboolliteral": "ObjCBoolLiteral",
+    "conditional": "ConditionalExpression",
+    "conditionalexpression": "ConditionalExpression",
+    "statement": "StatementRemoval",
+    "statementremoval": "StatementRemoval",
+    "block": "BlockRemoval",
+    "blockremoval": "BlockRemoval",
     "equality": "EqualityOperator",
     "equalityoperator": "EqualityOperator",
     "logical": "LogicalOperator",
     "logicaloperator": "LogicalOperator",
+    "shift": "ShiftOperator",
+    "shiftoperator": "ShiftOperator",
+    "update": "UpdateOperator",
+    "updateoperator": "UpdateOperator",
     "arithmetic": "ArithmeticOperator",
     "arithmeticoperator": "ArithmeticOperator",
     "assignment": "AssignmentOperator",
@@ -239,21 +444,70 @@ IGNORE_MUTATOR_ALIASES: dict[str, str] = {
     "call": "CallRemoval",
     "callremoval": "CallRemoval",
     "conditionalboundary": "ConditionalBoundary",
+    "char": "CharacterLiteral",
+    "character": "CharacterLiteral",
+    "characterliteral": "CharacterLiteral",
+    "float": "FloatingPointLiteral",
+    "floating": "FloatingPointLiteral",
+    "floatingliteral": "FloatingPointLiteral",
+    "floatingpointliteral": "FloatingPointLiteral",
+    "string": "StringLiteral",
+    "stringliteral": "StringLiteral",
+    "loopboundary": "LoopBoundary",
+    "loopcondition": "LoopCondition",
+    "stdlib": "StandardLibraryCall",
+    "stdlibcall": "StandardLibraryCall",
+    "standardlibrary": "StandardLibraryCall",
+    "standardlibrarycall": "StandardLibraryCall",
+    "memoryorder": "MemoryOrder",
+    "memory-order": "MemoryOrder",
+    "memberaccess": "MemberAccessOperator",
+    "memberaccessoperator": "MemberAccessOperator",
+    "exception": "ExceptionHandling",
+    "exceptionhandling": "ExceptionHandling",
+    "preprocessor": "PreprocessorGuard",
+    "preprocessorguard": "PreprocessorGuard",
+    "objcmessage": "ObjCMessageSend",
+    "objcmessagesend": "ObjCMessageSend",
+    "metal": "MetalThreadPosition",
+    "metalthread": "MetalThreadPosition",
+    "metalthreadposition": "MetalThreadPosition",
+    "metaladdress": "MetalAddressSpace",
+    "metaladdressspace": "MetalAddressSpace",
 }
 
 AST_MUTATOR_CURSOR_KINDS: dict[str, set[str]] = {
     "ConditionalBoundary": {"BINARY_OPERATOR"},
+    "ConditionalExpression": {"CONDITIONAL_OPERATOR"},
     "EqualityOperator": {"BINARY_OPERATOR"},
     "LogicalOperator": {"BINARY_OPERATOR"},
+    "ShiftOperator": {"BINARY_OPERATOR"},
+    "UpdateOperator": {"UNARY_OPERATOR"},
     "ArithmeticOperator": {"BINARY_OPERATOR"},
     "AssignmentOperator": {"COMPOUND_ASSIGNMENT_OPERATOR", "BINARY_OPERATOR"},
     "BitwiseOperator": {"BINARY_OPERATOR"},
     "UnaryOperator": {"UNARY_OPERATOR"},
     "BooleanLiteral": {"CXX_BOOL_LITERAL_EXPR", "OBJC_BOOL_LITERAL_EXPR"},
+    "ObjCBoolLiteral": {"OBJC_BOOL_LITERAL_EXPR"},
     "ReturnValue": {"RETURN_STMT"},
     "IntegerLiteral": {"INTEGER_LITERAL"},
     "NullLiteral": {"CXX_NULL_PTR_LITERAL_EXPR", "GNU_NULL_EXPR", "DECL_REF_EXPR"},
+    "CharacterLiteral": {"CHARACTER_LITERAL", "CXX_CHAR_LITERAL", "OBJC_CHAR_LITERAL"},
+    "FloatingPointLiteral": {"FLOATING_LITERAL", "CXX_FLOATING_LITERAL"},
+    "StringLiteral": {"STRING_LITERAL", "CXX_STRING_LITERAL", "OBJC_STRING_LITERAL"},
     "CallRemoval": {"CALL_EXPR", "CXX_MEMBER_CALL_EXPR", "OBJC_MESSAGE_EXPR"},
+    "StatementRemoval": {"EXPR_STMT", "DECL_STMT", "ASM_STMT"},
+    "BlockRemoval": {"COMPOUND_STMT"},
+    "LoopBoundary": {"FOR_STMT", "WHILE_STMT", "DO_STMT"},
+    "LoopCondition": {"FOR_STMT", "WHILE_STMT", "DO_STMT"},
+    "StandardLibraryCall": {"CALL_EXPR", "DECL_REF_EXPR", "NAMESPACE_REF", "OVERLOADED_DECL_REF"},
+    "MemoryOrder": {"DECL_REF_EXPR", "MEMBER_REF_EXPR", "UNEXPOSED_EXPR"},
+    "MemberAccessOperator": {"MEMBER_REF_EXPR", "CXX_DEPENDENT_SCOPE_MEMBER_EXPR", "OBJC_PROPERTY_REF_EXPR"},
+    "ExceptionHandling": {"CXX_THROW_EXPR"},
+    "PreprocessorGuard": set(),
+    "ObjCMessageSend": {"OBJC_MESSAGE_EXPR"},
+    "MetalThreadPosition": {"PARM_DECL", "VAR_DECL", "UNEXPOSED_ATTR", "ANNOTATE_ATTR"},
+    "MetalAddressSpace": {"PARM_DECL", "VAR_DECL", "TYPE_REF", "UNEXPOSED_ATTR", "ANNOTATE_ATTR"},
 }
 MACRO_CURSOR_KINDS = {"MACRO_INSTANTIATION", "MACRO_EXPANSION"}
 
@@ -286,6 +540,8 @@ def load_plugins(
     for manifest in manifests:
         payload = _load_plugin_manifest(manifest)
         name = str(payload.get("name", os.path.basename(manifest)))
+        reporter_defs: list[dict[str, Any]] = []
+        reporter_metadata: list[dict[str, Any]] = []
         for mutator in payload.get("mutators", []):
             if not isinstance(mutator, dict):
                 raise ValueError(f"plugin {name}: mutator entries must be objects")
@@ -307,6 +563,31 @@ def load_plugins(
                 _TOKEN_PATTERNS.setdefault(original, re.escape(original))
             MUTATORS[mutator_name] = pairs
             MUTATOR_DESCRIPTIONS[mutator_name] = str(mutator.get("description", f"plugin mutator {mutator_name}"))
+        for reporter in payload.get("reporters", []):
+            if not isinstance(reporter, dict):
+                continue
+            reporter_name = str(reporter.get("name", ""))
+            if not reporter_name:
+                continue
+            if reporter.get("metadata") is not None:
+                if not isinstance(reporter.get("metadata"), dict):
+                    raise ValueError(f"plugin {name}: reporter metadata for {reporter_name} must be an object")
+                reporter_metadata.append(
+                    {
+                        "name": reporter_name,
+                        "metadata": reporter.get("metadata"),
+                    }
+                )
+            command = str(reporter.get("command", ""))
+            if not command:
+                continue
+            entry = {
+                "name": reporter_name,
+                "command": command,
+            }
+            if reporter.get("metadata") is not None:
+                entry["metadata"] = reporter.get("metadata")
+            reporter_defs.append(entry)
         loaded.append(
             {
                 "name": name,
@@ -315,11 +596,8 @@ def load_plugins(
                 "capabilities": payload.get("capabilities", {}),
                 "mutators": [m.get("name") for m in payload.get("mutators", []) if isinstance(m, dict)],
                 "reporters": [r.get("name") for r in payload.get("reporters", []) if isinstance(r, dict)],
-                "reporterCommands": [
-                    {"name": r.get("name"), "command": r.get("command")}
-                    for r in payload.get("reporters", [])
-                    if isinstance(r, dict) and r.get("command")
-                ],
+                "reporterCommands": reporter_defs,
+                "reporterMetadata": reporter_metadata,
                 "hooks": payload.get("hooks", {}) if isinstance(payload.get("hooks", {}), dict) else {},
             }
         )
@@ -427,6 +705,32 @@ def _run_reporter_plugins(
                 )
 
 
+def _reporter_metadata(
+    plugins: list[dict[str, Any]],
+    requested_reporters: list[str],
+) -> list[dict[str, Any]]:
+    requested = set(requested_reporters)
+    if not requested:
+        return []
+    out: list[dict[str, Any]] = []
+    for plugin in plugins:
+        for reporter in plugin.get("reporterMetadata", []):
+            if not isinstance(reporter, dict):
+                continue
+            name = str(reporter.get("name", ""))
+            metadata = reporter.get("metadata")
+            if not name or name not in requested or not isinstance(metadata, dict):
+                continue
+            out.append(
+                {
+                    "plugin": str(plugin.get("name", "")),
+                    "reporter": name,
+                    "metadata": metadata,
+                }
+            )
+    return out
+
+
 def _parse_env_overrides(items: list[str] | None) -> dict[str, str]:
     out: dict[str, str] = {}
     for item in items or []:
@@ -520,6 +824,14 @@ def _parse_retain_statuses(spec: str | None) -> set[str] | None:
 
 def _retain_status_names(statuses: set[str] | None) -> list[str]:
     return ["ALL"] if statuses is None else sorted(statuses)
+
+
+def _safe_worker_label(label: str | None) -> str:
+    if not label:
+        return ""
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", label.strip())
+    cleaned = cleaned.strip("-._")
+    return cleaned[:48]
 
 
 def _should_retain_worktree(
@@ -926,8 +1238,13 @@ def _rejects_macro_candidate(
     return True
 
 
-def _strip_noncode(line: str, in_block_comment: bool = False) -> tuple[str, bool]:
-    """Blank out // comments and "string"/'c' literals so we never mutate them."""
+def _strip_noncode(
+    line: str,
+    in_block_comment: bool = False,
+    mask_string_literals: bool = True,
+    mask_character_literals: bool = True,
+) -> tuple[str, bool]:
+    """Blank out comments and optionally preserve quoted literals."""
     if line.lstrip().startswith("#"):
         return " " * len(line), in_block_comment
 
@@ -968,11 +1285,15 @@ def _strip_noncode(line: str, in_block_comment: bool = False) -> tuple[str, bool
                     end += 1
                     break
                 end += 1
-            out.append(" " * (end - i))
+            if mask_string_literals:
+                out.append(" " * (end - i))
+            else:
+                out.append(line[i:end])
             i = end
             continue
 
         if line[i] == "'":
+            start = i
             end = i + 1
             while end < n:
                 if line[end] == "\\":
@@ -982,7 +1303,10 @@ def _strip_noncode(line: str, in_block_comment: bool = False) -> tuple[str, bool
                     end += 1
                     break
                 end += 1
-            out.append(" " * (end - i))
+            if mask_character_literals:
+                out.append(" " * (end - start))
+            else:
+                out.append(line[start:end])
             i = end
             continue
 
@@ -1004,6 +1328,415 @@ def _discover_call_removals(path: str, line: int, code: str, raw: str) -> list[M
         mut.id = stable_id(mut)
         out.append(mut)
     return out
+
+
+def _statement_should_skip(prefix: str) -> bool:
+    return any(prefix == token or prefix.startswith(f"{token} ") for token in _STATEMENT_REMOVAL_FORBIDDEN_PREFIXES)
+
+
+def _discover_statement_removals(path: str, line: int, code: str, raw: str) -> list[Mutant]:
+    out: list[Mutant] = []
+    segments: list[tuple[int, int]] = []
+    paren = 0
+    bracket = 0
+    start = 0
+    line_len = len(code)
+
+    for i, char in enumerate(code):
+        if char == "(":
+            paren += 1
+        elif char == ")":
+            paren = max(0, paren - 1)
+        elif char == "[":
+            bracket += 1
+        elif char == "]":
+            bracket = max(0, bracket - 1)
+        elif char == ";" and paren == 0 and bracket == 0:
+            segments.append((start, min(i + 1, line_len)))
+            start = i + 1
+
+    if start < line_len and code[start:].strip():
+        segments.append((start, line_len))
+
+    for seg_start, seg_end in segments:
+        seg = code[seg_start:seg_end]
+        if not seg:
+            continue
+        segment = seg.rstrip()
+        if not segment:
+            continue
+        semi_pos = segment.rfind(";")
+        if semi_pos < 0:
+            continue
+        statement = segment[: semi_pos + 1]
+        trimmed = statement.strip()
+        if not trimmed or trimmed == ";":
+            continue
+        if trimmed.startswith("{") or trimmed.startswith("}"):
+            continue
+        if ":" in statement:
+            # Avoid confusing ternaries and label-style constructs in token mode.
+            continue
+        prefix = trimmed.split(None, 1)[0]
+        if _statement_should_skip(prefix):
+            continue
+        leading = len(statement) - len(statement.lstrip())
+        original = raw[seg_start + leading : seg_start + len(statement)]
+        if not original.strip():
+            continue
+        mut = Mutant("StatementRemoval", path, line, seg_start + leading, original, ";")
+        mut.id = stable_id(mut)
+        out.append(mut)
+    return out
+
+
+def _discover_block_removals(path: str, line: int, code: str, raw: str) -> list[Mutant]:
+    normalized = code.rstrip("\r\n")
+    raw_line = raw.rstrip("\r\n")
+    if not _BLOCK_REMOVAL_RE.fullmatch(normalized):
+        return []
+    if "{" not in normalized or "}" not in normalized:
+        return []
+    start = normalized.find("{")
+    end = normalized.rfind("}")
+    if start < 0 or end < 0 or end <= start:
+        return []
+    original = raw_line[start : end + 1]
+    mut = Mutant("BlockRemoval", path, line, start, original, "{}")
+    mut.id = stable_id(mut)
+    return [mut]
+
+
+def _find_matching_paren(text: str, start: int) -> int | None:
+    if start < 0 or start >= len(text) or text[start] != "(":
+        return None
+    depth = 0
+    for index, char in enumerate(text[start:], start=start):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def _discover_loop_conditions(code: str) -> list[tuple[int, int, str]]:
+    out: list[tuple[int, int, str]] = []
+
+    for match in re.finditer(r"\bfor\s*\(", code):
+        open_paren = match.end() - 1
+        close_paren = _find_matching_paren(code, open_paren)
+        if close_paren is None:
+            continue
+        inside = code[open_paren + 1 : close_paren]
+        semicolons: list[int] = []
+        paren = 0
+        bracket = 0
+        brace = 0
+        for offset, char in enumerate(inside):
+            if char == "(":
+                paren += 1
+            elif char == ")":
+                paren = max(0, paren - 1)
+            elif char == "[":
+                bracket += 1
+            elif char == "]":
+                bracket = max(0, bracket - 1)
+            elif char == "{":
+                brace += 1
+            elif char == "}":
+                brace = max(0, brace - 1)
+            elif (
+                char == ";"
+                and paren == 0
+                and bracket == 0
+                and brace == 0
+            ):
+                semicolons.append(offset)
+
+        if len(semicolons) < 2:
+            continue
+        cond_start = open_paren + 1 + semicolons[0] + 1
+        cond_end = open_paren + 1 + semicolons[1]
+        condition = code[cond_start:cond_end]
+        if not condition.strip():
+            continue
+        out.append((cond_start, cond_end, condition))
+
+    for match in re.finditer(r"\bwhile\s*\(", code):
+        open_paren = match.end() - 1
+        close_paren = _find_matching_paren(code, open_paren)
+        if close_paren is None:
+            continue
+        cond_start = open_paren + 1
+        cond_end = close_paren
+        condition = code[cond_start:cond_end]
+        if not condition.strip():
+            continue
+        out.append((cond_start, cond_end, condition))
+
+    return out
+
+
+def _discover_loop_boundary_mutations(path: str, line: int, code: str) -> list[Mutant]:
+    out: list[Mutant] = []
+    for cond_start, cond_end, _ in _discover_loop_conditions(code):
+        condition = code[cond_start:cond_end]
+        if not condition.strip():
+            continue
+        for orig, new in MUTATORS["LoopBoundary"]:
+            pattern = _TOKEN_PATTERNS.get(orig)
+            if pattern is None:
+                continue
+            for match in re.finditer(pattern, condition):
+                mut = Mutant(
+                    "LoopBoundary",
+                    path,
+                    line,
+                    cond_start + match.start(),
+                    match.group(0),
+                    new,
+                )
+                mut.id = stable_id(mut)
+                out.append(mut)
+    return out
+
+
+def _discover_loop_condition_mutations(path: str, line: int, code: str) -> list[Mutant]:
+    out: list[Mutant] = []
+    for cond_start, cond_end, condition in _discover_loop_conditions(code):
+        if not condition.strip():
+            continue
+        leading = len(condition) - len(condition.lstrip())
+        trailing = len(condition) - len(condition.rstrip())
+        core = condition.strip()
+        mut = Mutant(
+            "LoopCondition",
+            path,
+            line,
+            cond_start + leading,
+            core,
+            f"!({core})",
+        )
+        mut.id = stable_id(mut)
+        out.append(mut)
+    return out
+
+
+def _discover_member_access_mutations(path: str, line: int, code: str) -> list[Mutant]:
+    replacements = {
+        ".": "->",
+        "->": ".",
+        ".*": "->*",
+        "->*": ".*",
+    }
+    out: list[Mutant] = []
+    for match in re.finditer(_MEMBER_ACCESS_RE, code):
+        op = match.group("op")
+        replacement = replacements.get(op)
+        if replacement is None:
+            continue
+        mut = Mutant(
+            "MemberAccessOperator",
+            path,
+            line,
+            match.start("op"),
+            op,
+            replacement,
+        )
+        mut.id = stable_id(mut)
+        out.append(mut)
+    return out
+
+
+def _discover_exception_handling_mutations(path: str, line: int, code: str, raw: str) -> list[Mutant]:
+    out: list[Mutant] = []
+    for match in re.finditer(_THROW_STATEMENT_RE, code):
+        original = raw[match.start() : match.end()]
+        if not original.strip():
+            continue
+        mut = Mutant(
+            "ExceptionHandling",
+            path,
+            line,
+            match.start(),
+            original,
+            "(void)0;",
+        )
+        mut.id = stable_id(mut)
+        out.append(mut)
+    return out
+
+
+def _discover_preprocessor_guard_mutations(path: str, line: int, raw: str) -> list[Mutant]:
+    out: list[Mutant] = []
+    ifdef_match = re.match(r"(\s*#\s*)(ifdef|ifndef)\b", raw)
+    if ifdef_match:
+        original = ifdef_match.group(2)
+        mutated = "ifndef" if original == "ifdef" else "ifdef"
+        mut = Mutant(
+            "PreprocessorGuard",
+            path,
+            line,
+            ifdef_match.start(2),
+            original,
+            mutated,
+        )
+        mut.id = stable_id(mut)
+        out.append(mut)
+        return out
+
+    if_match = re.match(r"(\s*#\s*if\s+)(0|1)\b", raw)
+    if if_match:
+        original = if_match.group(2)
+        mut = Mutant(
+            "PreprocessorGuard",
+            path,
+            line,
+            if_match.start(2),
+            original,
+            "1" if original == "0" else "0",
+        )
+        mut.id = stable_id(mut)
+        out.append(mut)
+    return out
+
+
+def _discover_objc_message_send_mutations(path: str, line: int, code: str, raw: str) -> list[Mutant]:
+    match = _OBJC_MESSAGE_SEND_RE.match(code)
+    if match is None:
+        return []
+    original = raw[match.start(1) : match.end(1)]
+    if not original.strip():
+        return []
+    mut = Mutant(
+        "ObjCMessageSend",
+        path,
+        line,
+        match.start(1),
+        original,
+        "(void)0",
+    )
+    mut.id = stable_id(mut)
+    return [mut]
+
+
+def _discover_metal_address_space_mutations(path: str, line: int, code: str) -> list[Mutant]:
+    if not path.lower().endswith(".metal"):
+        return []
+    replacements = {
+        "device": "constant",
+        "constant": "device",
+        "threadgroup": "device",
+    }
+    out: list[Mutant] = []
+    for match in re.finditer(_METAL_ADDRESS_SPACE_RE, code):
+        original = match.group(1)
+        replacement = replacements.get(original)
+        if replacement is None:
+            continue
+        mut = Mutant(
+            "MetalAddressSpace",
+            path,
+            line,
+            match.start(1),
+            original,
+            replacement,
+        )
+        mut.id = stable_id(mut)
+        out.append(mut)
+    return out
+
+
+def _mutate_string_literal(token: str) -> str | None:
+    if _STRING_LITERAL_RE.fullmatch(token) is None:
+        return None
+    return "\"\"" if token != "\"\"" else "\"x\""
+
+
+def _mutate_character_literal(token: str) -> str | None:
+    if _CHARACTER_LITERAL_RE.fullmatch(token) is None:
+        return None
+    body = token
+    if token.startswith("u8'"):
+        prefix, quote = "u8", "'"
+    elif token.startswith("L'"):
+        prefix, quote = "L", "'"
+    elif token.startswith("u'"):
+        prefix, quote = "u", "'"
+    elif token.startswith("U'"):
+        prefix, quote = "U", "'"
+    else:
+        prefix, quote = "", "'"
+    body = token[len(prefix) + 1 : -1]
+    if not body:
+        return None
+    return f"{prefix}{quote}x{quote}"
+
+
+def _mutate_floating_literal(token: str) -> str | None:
+    # Keep a trailing C/C++ floating suffix when present.
+    # The full token capture excludes signs and most integer-like values.
+    m = re.fullmatch(r"(?P<body>(?:[0-9]+\.[0-9]*|\.[0-9]+|[0-9]+\.[0-9]+[eE][+-]?[0-9]+|[0-9]+[eE][+-]?[0-9]+))(?P<suffix>[fFlL]?)", token)
+    if not m:
+        return None
+    body = m.group("body")
+    suffix = m.group("suffix")
+    # Toggle zero-like forms to 1.0, everything else to 0.0.
+    is_zero_like = re.fullmatch(r"0(?:\.0*)?(?:[eE][+-]?[0-9]+)?", body, re.IGNORECASE) is not None
+    return f"{'1.0' if is_zero_like else '0.0'}{suffix}"
+
+
+def _integer_literal_range_replacement(text: str) -> tuple[int, str, str] | None:
+    match = _INTEGER_LITERAL_RE.search(text)
+    if not match:
+        return None
+    original = match.group(0)
+    replacement = "1" if original == "0" else "0"
+    return match.start(), original, replacement
+
+
+def _null_literal_range_replacement(text: str) -> tuple[int, str, str] | None:
+    match = _NULL_LITERAL_RE.search(text)
+    if not match:
+        return None
+    original = match.group(0)
+    replacement = "NULL" if original == "nullptr" else "nullptr"
+    return match.start(), original, replacement
+
+
+def _string_literal_range_replacement(text: str) -> tuple[int, str, str] | None:
+    match = _STRING_LITERAL_RE.search(text)
+    if not match:
+        return None
+    original = match.group(0)
+    replacement = _mutate_string_literal(original)
+    if replacement is None:
+        return None
+    return match.start(), original, replacement
+
+
+def _character_literal_range_replacement(text: str) -> tuple[int, str, str] | None:
+    match = _CHARACTER_LITERAL_RE.search(text)
+    if not match:
+        return None
+    original = match.group(0)
+    replacement = _mutate_character_literal(original)
+    if replacement is None:
+        return None
+    return match.start(), original, replacement
+
+
+def _floating_literal_range_replacement(text: str) -> tuple[int, str, str] | None:
+    match = _FLOATING_LITERAL_RE.search(text)
+    if not match:
+        return None
+    original = match.group(0)
+    replacement = _mutate_floating_literal(original)
+    if replacement is None:
+        return None
+    return match.start(), original, replacement
 
 
 def _apply_stryker_ignore_comments(repo: str, path: str, mutants: list[Mutant]) -> list[Mutant]:
@@ -1035,6 +1768,329 @@ def _apply_stryker_ignore_comments(repo: str, path: str, mutants: list[Mutant]) 
             mut.detail = reason
             mut.ignoreReason = reason
     return mutants
+
+
+def _source_has_generated_marker(src: list[str]) -> bool:
+    header = "\n".join(src[:40]).lower()
+    return any(marker in header for marker in GENERATED_CODE_MARKERS)
+
+
+def _path_looks_generated(path: str) -> bool:
+    normalized = path.replace("\\", "/").lower()
+    basename = os.path.basename(normalized)
+    return any(pattern in normalized or basename.startswith(pattern) for pattern in GENERATED_PATH_PATTERNS)
+
+
+def _strip_outer_parens(expr: str) -> str:
+    out = expr.strip()
+    while out.startswith("(") and out.endswith(")"):
+        close = _find_matching_paren(out, 0)
+        if close != len(out) - 1:
+            break
+        out = out[1:-1].strip()
+    return out
+
+
+def _normalize_equivalent_operand(expr: str) -> str:
+    out = expr.strip()
+    if out.startswith("return "):
+        out = out[len("return ") :].strip()
+    out = _strip_outer_parens(out)
+    return re.sub(r"\s+", "", out)
+
+
+def _operand_left(text: str, end: int) -> str:
+    i = end - 1
+    depth = 0
+    while i >= 0:
+        char = text[i]
+        if char in ")]}":
+            depth += 1
+        elif char in "([{":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0:
+            if char in ";,{}?:":
+                break
+            if char == "=" and not (
+                (i > 0 and text[i - 1] in {"=", "!", "<", ">"})
+                or (i + 1 < len(text) and text[i + 1] == "=")
+            ):
+                break
+            if i > 0 and text[i - 1 : i + 1] in {"&&", "||"}:
+                break
+        i -= 1
+    return text[i + 1 : end]
+
+
+def _operand_right(text: str, start: int) -> str:
+    i = start
+    depth = 0
+    while i < len(text):
+        char = text[i]
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0:
+            if char in ";,{}?:":
+                break
+            if char == "=" and not (
+                (i > 0 and text[i - 1] in {"=", "!", "<", ">"})
+                or (i + 1 < len(text) and text[i + 1] == "=")
+            ):
+                break
+            if i + 1 < len(text) and text[i : i + 2] in {"&&", "||"}:
+                break
+        i += 1
+    return text[start:i]
+
+
+def _operand_is_pureish(expr: str) -> bool:
+    compact = _normalize_equivalent_operand(expr)
+    if not compact:
+        return False
+    if "++" in compact or "--" in compact:
+        return False
+    if re.search(r"(?<![=!<>])=(?!=)", compact):
+        return False
+    no_outer = _strip_outer_parens(expr.strip())
+    return "(" not in no_outer and ")" not in no_outer
+
+
+def _numeric_identity_token(expr: str) -> str | None:
+    normalized = _normalize_equivalent_operand(expr)
+    if re.fullmatch(r"0(?:\.0*)?(?:[fFlL])?", normalized):
+        return "0"
+    if re.fullmatch(r"1(?:\.0*)?(?:[fFlL])?", normalized):
+        return "1"
+    return None
+
+
+def _split_top_level_arguments(text: str) -> list[str]:
+    args: list[str] = []
+    start = 0
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    for i, char in enumerate(text):
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth = max(0, depth - 1)
+        elif char == "," and depth == 0:
+            args.append(text[start:i].strip())
+            start = i + 1
+    tail = text[start:].strip()
+    if tail:
+        args.append(tail)
+    return args
+
+
+def _call_arguments_after(text: str, offset: int) -> list[str]:
+    i = offset
+    while i < len(text) and text[i].isspace():
+        i += 1
+    if i >= len(text) or text[i] != "(":
+        return []
+    close = _find_matching_paren(text, i)
+    if close < 0:
+        return []
+    return _split_top_level_arguments(text[i + 1 : close])
+
+
+def _conditional_expression_branches(text: str) -> tuple[str, str] | None:
+    question = text.find("?")
+    if question < 0:
+        depth = 0
+        quote: str | None = None
+        escaped = False
+        for i, char in enumerate(text):
+            if quote is not None:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    quote = None
+                continue
+            if char in {"'", '"'}:
+                quote = char
+                continue
+            if char in "([{":
+                depth += 1
+            elif char in ")]}":
+                depth = max(0, depth - 1)
+            elif char == ":" and depth == 0:
+                left = text[:i].strip()
+                right = text[i + 1 :].strip()
+                left = left.rstrip(";")
+                right = right.rstrip(";")
+                if left and right:
+                    return left, right
+        return None
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    for i in range(question + 1, len(text)):
+        char = text[i]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            continue
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth = max(0, depth - 1)
+        elif char == ":" and depth == 0:
+            return text[question + 1 : i].strip(), text[i + 1 :].strip()
+    return None
+
+
+def _equivalent_suppression_reason(mut: Mutant, src: list[str], generated: bool, mode: str) -> str | None:
+    if generated:
+        return "generated code auto-suppression"
+    if mut.line < 1 or mut.line > len(src):
+        return None
+    line = src[mut.line - 1].rstrip("\r\n")
+    if mut.mutator == "LogicalOperator" and mut.original in {"&&", "||"}:
+        left = _operand_left(line, mut.col)
+        right = _operand_right(line, mut.col + len(mut.original))
+        if (
+            _operand_is_pureish(left)
+            and _operand_is_pureish(right)
+            and _normalize_equivalent_operand(left) == _normalize_equivalent_operand(right)
+        ):
+            return "equivalent duplicate logical operand"
+    if mut.mutator == "ArithmeticOperator" and mut.original in {"+", "-", "*", "/"}:
+        right = _operand_right(line, mut.col + len(mut.original))
+        identity = _numeric_identity_token(right)
+        if mut.original in {"+", "-"} and identity == "0":
+            return "equivalent arithmetic identity"
+        if mut.original in {"*", "/"} and identity == "1":
+            return "equivalent arithmetic identity"
+    if mut.mutator == "BitwiseOperator" and mut.original in {"&", "|"}:
+        left = _operand_left(line, mut.col)
+        right = _operand_right(line, mut.col + len(mut.original))
+        if (
+            _operand_is_pureish(left)
+            and _operand_is_pureish(right)
+            and _normalize_equivalent_operand(left) == _normalize_equivalent_operand(right)
+        ):
+            return "equivalent duplicate bitwise operand"
+    if mut.mutator == "StandardLibraryCall" and mut.original in {"std::min", "std::max"}:
+        args = _call_arguments_after(line, mut.col + len(mut.original))
+        if (
+            len(args) == 2
+            and _operand_is_pureish(args[0])
+            and _operand_is_pureish(args[1])
+            and _normalize_equivalent_operand(args[0]) == _normalize_equivalent_operand(args[1])
+        ):
+            return "equivalent duplicate standard-library operands"
+    if mut.mutator == "ConditionalExpression":
+        branches = _conditional_expression_branches(mut.original)
+        if branches is not None:
+            true_branch, false_branch = branches
+            if true_branch and _normalize_equivalent_operand(true_branch) == _normalize_equivalent_operand(false_branch):
+                return "equivalent duplicate conditional branches"
+    if mode == "aggressive" and mut.mutator == "NullLiteral":
+        return "style-equivalent null literal suppression"
+    return None
+
+
+def _record_equivalent_suppression(
+    analysis: dict[str, Any] | None,
+    mode: str,
+    mut: Mutant,
+    reason: str,
+) -> None:
+    if analysis is None:
+        return
+    payload = analysis.setdefault(
+        "equivalentSuppression",
+        {
+            "mode": mode,
+            "suppressedMutants": 0,
+            "suppressions": [],
+        },
+    )
+    if isinstance(payload, dict):
+        payload["mode"] = mode
+        payload["suppressedMutants"] = int(payload.get("suppressedMutants", 0)) + 1
+        suppressions = payload.setdefault("suppressions", [])
+        if isinstance(suppressions, list):
+            suppressions.append(
+                {
+                    "id": mut.id,
+                    "file": mut.file,
+                    "line": mut.line,
+                    "column": mut.col + 1,
+                    "mutator": mut.mutator,
+                    "reason": reason,
+                }
+            )
+
+
+def _apply_equivalent_suppression(
+    repo: str,
+    path: str,
+    mutants: list[Mutant],
+    mode: str,
+    analysis: dict[str, Any] | None = None,
+) -> list[Mutant]:
+    if not mutants or mode == "off":
+        return mutants
+    if mode not in EQUIVALENT_SUPPRESSION_MODES:
+        raise ValueError(f"unknown equivalent suppression mode: {mode}")
+    try:
+        with open(os.path.join(repo, path)) as f:
+            src = f.readlines()
+    except OSError:
+        src = []
+    generated = _source_has_generated_marker(src) or (mode == "aggressive" and _path_looks_generated(path))
+    for mut in mutants:
+        if mut.status == "IGNORED":
+            continue
+        reason = _equivalent_suppression_reason(mut, src, generated, mode)
+        if reason is None:
+            continue
+        mut.status = "IGNORED"
+        mut.detail = reason
+        mut.ignoreReason = reason
+        mut.run["suppression"] = "equivalent"
+        _record_equivalent_suppression(analysis, mode, mut, reason)
+    return mutants
+
+
+def _finalize_discovered_mutants(
+    repo: str,
+    path: str,
+    mutants: list[Mutant],
+    equivalent_suppression: str,
+    analysis: dict[str, Any] | None = None,
+) -> list[Mutant]:
+    ignored = _apply_stryker_ignore_comments(repo, path, mutants)
+    return _apply_equivalent_suppression(repo, path, ignored, equivalent_suppression, analysis)
 
 
 def parse_lines(spec: str) -> set[int]:
@@ -1088,7 +2144,14 @@ def mutation_repro_command(mut: Mutant, repo: str, build_cmd: str, test_cmd: str
     )
 
 
-def discover(repo: str, path: str, only: set[int] | None, enabled: list[str]) -> list[Mutant]:
+def discover(
+    repo: str,
+    path: str,
+    only: set[int] | None,
+    enabled: list[str],
+    equivalent_suppression: str = "conservative",
+    analysis: dict[str, Any] | None = None,
+) -> list[Mutant]:
     if not _ensure_supported_source_path(path):
         return []
 
@@ -1097,11 +2160,103 @@ def discover(repo: str, path: str, only: set[int] | None, enabled: list[str]) ->
         src = f.readlines()
     in_block_comment = False
     muts: list[Mutant] = []
+    preserve_string_literals = "StringLiteral" in enabled
+    preserve_character_literals = "CharacterLiteral" in enabled
     for i, raw in enumerate(src, start=1):
         if only is not None and i not in only:
             continue
-        code, in_block_comment = _strip_noncode(raw, in_block_comment=in_block_comment)
+        if "PreprocessorGuard" in enabled:
+            muts.extend(_discover_preprocessor_guard_mutations(path, i, raw))
+        code, in_block_comment = _strip_noncode(
+            raw,
+            in_block_comment=in_block_comment,
+            mask_string_literals=not preserve_string_literals,
+            mask_character_literals=not preserve_character_literals,
+        )
+        if "StringLiteral" in enabled:
+            for match in re.finditer(_STRING_LITERAL_RE, code):
+                original = match.group(0)
+                replacement = _mutate_string_literal(original)
+                if replacement is None:
+                    continue
+                mut = Mutant(
+                    "StringLiteral",
+                    path,
+                    i,
+                    match.start(),
+                    original,
+                    replacement,
+                )
+                mut.id = stable_id(mut)
+                muts.append(mut)
+        if "CharacterLiteral" in enabled:
+            for match in re.finditer(_CHARACTER_LITERAL_RE, code):
+                original = match.group(0)
+                replacement = _mutate_character_literal(original)
+                if replacement is None:
+                    continue
+                mut = Mutant(
+                    "CharacterLiteral",
+                    path,
+                    i,
+                    match.start(),
+                    original,
+                    replacement,
+                )
+                mut.id = stable_id(mut)
+                muts.append(mut)
+        if "FloatingPointLiteral" in enabled:
+            for match in re.finditer(_FLOATING_LITERAL_RE, code):
+                original = match.group(0)
+                replacement = _mutate_floating_literal(original)
+                if replacement is None:
+                    continue
+                mut = Mutant(
+                    "FloatingPointLiteral",
+                    path,
+                    i,
+                    match.start(),
+                    original,
+                    replacement,
+                )
+                mut.id = stable_id(mut)
+                muts.append(mut)
         for mutator in enabled:
+            if mutator == "ConditionalExpression":
+                for start, original, mutated in _conditional_expression_range_replacements(code):
+                    mut = Mutant(
+                        "ConditionalExpression",
+                        path,
+                        i,
+                        start,
+                        original,
+                        mutated,
+                    )
+                    mut.id = stable_id(mut)
+                    muts.append(mut)
+                continue
+            if mutator == "LoopBoundary":
+                muts.extend(_discover_loop_boundary_mutations(path, i, code))
+                continue
+            if mutator == "LoopCondition":
+                muts.extend(_discover_loop_condition_mutations(path, i, code))
+                continue
+            if mutator == "MemberAccessOperator":
+                muts.extend(_discover_member_access_mutations(path, i, code))
+                continue
+            if mutator == "ExceptionHandling":
+                muts.extend(_discover_exception_handling_mutations(path, i, code, raw))
+                continue
+            if mutator == "ObjCMessageSend":
+                muts.extend(_discover_objc_message_send_mutations(path, i, code, raw))
+                continue
+            if mutator == "MetalAddressSpace":
+                muts.extend(_discover_metal_address_space_mutations(path, i, code))
+                continue
+            if mutator == "PreprocessorGuard":
+                continue
+            if mutator in {"StringLiteral", "CharacterLiteral", "FloatingPointLiteral"}:
+                continue
             for orig, new in MUTATORS[mutator]:
                 pattern = _TOKEN_PATTERNS.get(orig)
                 if pattern is None:
@@ -1112,7 +2267,11 @@ def discover(repo: str, path: str, only: set[int] | None, enabled: list[str]) ->
                     muts.append(mut)
         if "CallRemoval" in enabled:
             muts.extend(_discover_call_removals(path, i, code, raw))
-    return _apply_stryker_ignore_comments(repo, path, muts)
+        if "StatementRemoval" in enabled:
+            muts.extend(_discover_statement_removals(path, i, code, raw))
+        if "BlockRemoval" in enabled:
+            muts.extend(_discover_block_removals(path, i, code, raw))
+    return _finalize_discovered_mutants(repo, path, muts, equivalent_suppression, analysis)
 
 
 def stable_id(mut: Mutant) -> str:
@@ -1863,6 +3022,170 @@ def _return_bool_replacement(text: str) -> tuple[str, str] | None:
     return original, mutated
 
 
+def _find_matching_ternary_colon(text: str, question_pos: int) -> int | None:
+    if question_pos < 0 or question_pos >= len(text) or text[question_pos] != "?":
+        return None
+    ternary_depth = 0
+    paren = 0
+    bracket = 0
+    brace = 0
+    for i in range(question_pos + 1, len(text)):
+        char = text[i]
+        if char == "(":
+            paren += 1
+        elif char == ")":
+            paren = max(0, paren - 1)
+        elif char == "[":
+            bracket += 1
+        elif char == "]":
+            bracket = max(0, bracket - 1)
+        elif char == "{":
+            brace += 1
+        elif char == "}":
+            brace = max(0, brace - 1)
+        elif char == "?":
+            ternary_depth += 1
+        elif char == ":":
+            if paren or bracket or brace:
+                continue
+            if ternary_depth == 0:
+                return i
+            ternary_depth -= 1
+    return None
+
+
+def _container_depths_before(text: str, index: int) -> tuple[int, int, int]:
+    paren = 0
+    bracket = 0
+    brace = 0
+    for char in text[:index]:
+        if char == "(":
+            paren += 1
+        elif char == ")":
+            paren = max(0, paren - 1)
+        elif char == "[":
+            bracket += 1
+        elif char == "]":
+            bracket = max(0, bracket - 1)
+        elif char == "{":
+            brace += 1
+        elif char == "}":
+            brace = max(0, brace - 1)
+    return paren, bracket, brace
+
+
+def _conditional_expression_false_end(text: str, start: int, *, paren: int = 0, bracket: int = 0, brace: int = 0) -> int:
+    ternary_depth = 0
+    for i in range(start, len(text)):
+        char = text[i]
+        if char == "(":
+            paren += 1
+        elif char == ")":
+            paren = max(0, paren - 1)
+            if paren == 0 and bracket == 0 and brace == 0:
+                return i
+        elif char == "[":
+            bracket += 1
+        elif char == "]":
+            bracket = max(0, bracket - 1)
+            if paren == 0 and bracket == 0 and brace == 0:
+                return i
+        elif char == "{":
+            brace += 1
+        elif char == "}":
+            brace = max(0, brace - 1)
+            if paren == 0 and bracket == 0 and brace == 0:
+                return i
+        elif char == "?":
+            ternary_depth += 1
+        elif char == ":":
+            if paren == 0 and bracket == 0 and brace == 0 and ternary_depth > 0:
+                ternary_depth -= 1
+        elif char in ",;":
+            if paren == 0 and bracket == 0:
+                return i
+    return len(text)
+
+
+def _conditional_expression_start(
+    text: str,
+    question: int,
+) -> int:
+    paren, bracket, brace = _container_depths_before(text, question)
+    for i in range(question - 1, -1, -1):
+        char = text[i]
+        if char == "(":
+            paren = max(0, paren - 1)
+            if paren == 0 and bracket == 0 and brace == 0:
+                return i + 1
+            continue
+        if char == ")":
+            paren += 1
+        elif char == "[":
+            bracket = max(0, bracket - 1)
+            if bracket == 0 and paren == 0 and brace == 0:
+                return i + 1
+            continue
+        elif char == "]":
+            bracket += 1
+        elif char == "{":
+            brace = max(0, brace - 1)
+            if brace == 0 and paren == 0 and bracket == 0:
+                return i + 1
+            continue
+        elif char == "}":
+            brace += 1
+        elif char in ",;" and paren == 0 and bracket == 0 and brace == 0:
+            return i + 1
+    return 0
+
+
+def _conditional_expression_range_replacements(
+    text: str,
+    *,
+    include_condition: bool = False,
+) -> list[tuple[int, str, str]]:
+    out: list[tuple[int, str, str]] = []
+    for i, char in enumerate(text):
+        if char != "?":
+            continue
+        colon = _find_matching_ternary_colon(text, i)
+        if colon is None:
+            continue
+        paren, bracket, brace = _container_depths_before(text, i)
+        end = _conditional_expression_false_end(
+            text,
+            colon + 1,
+            paren=paren,
+            bracket=bracket,
+            brace=brace,
+        )
+        true_expr = text[i + 1 : colon].strip().rstrip(";")
+        false_expr = text[colon + 1 : end].strip().rstrip(";")
+        if not true_expr.strip() or not false_expr.strip():
+            continue
+        start = i + 1
+        if include_condition:
+            start = _conditional_expression_start(text, i)
+            condition_span = text[start:i]
+            return_prefix = re.match(r"^\s*return\s+", condition_span)
+            if return_prefix is not None:
+                start += return_prefix.end()
+                condition = condition_span[return_prefix.end() :].strip()
+            else:
+                condition = condition_span.strip()
+            if not condition:
+                continue
+            true_expr = true_expr.strip()
+            false_expr = false_expr.strip()
+            original = f"{condition} ? {true_expr} : {false_expr}"
+            mutated = f"{condition} ? {false_expr} : {true_expr}"
+            out.append((start, original, mutated))
+        else:
+            out.append((i + 1, text[i + 1 : end].strip().rstrip(";"), f"{false_expr} : {true_expr}"))
+    return out
+
+
 def _direct_ast_range_mutants(
     path: str,
     item: dict[str, int | str],
@@ -1907,6 +3230,134 @@ def _direct_ast_range_mutants(
             mut.nodeKind = kind
             mut.sourceRange = dict(item)
             mut.rewriteStrategy = "clang-ast-direct-return"
+            out.append(mut)
+
+    if "StatementRemoval" in enabled and kind in AST_MUTATOR_CURSOR_KINDS["StatementRemoval"]:
+        if stripped.endswith(";"):
+            original = stripped
+            mut = Mutant("StatementRemoval", path, line_no, col0 + leading, original, ";")
+            mut.id = stable_id(mut)
+            mut.nodeKind = kind
+            mut.sourceRange = dict(item)
+            mut.rewriteStrategy = "clang-ast-direct-statement"
+            out.append(mut)
+
+    if "BlockRemoval" in enabled and kind in AST_MUTATOR_CURSOR_KINDS["BlockRemoval"] and stripped.startswith("{") and stripped.endswith("}"):
+        mut = Mutant("BlockRemoval", path, line_no, col0 + leading, stripped, "{}")
+        mut.id = stable_id(mut)
+        mut.nodeKind = kind
+        mut.sourceRange = dict(item)
+        mut.rewriteStrategy = "clang-ast-direct-block"
+        out.append(mut)
+
+    if (
+        "ConditionalExpression" in enabled
+        and kind in AST_MUTATOR_CURSOR_KINDS["ConditionalExpression"]
+        and ":" in text
+    ):
+        for start, original, mutated in _conditional_expression_range_replacements(text, include_condition=True):
+            mut = Mutant(
+                "ConditionalExpression",
+                path,
+                line_no,
+                col0 + leading + start,
+                original,
+                mutated,
+            )
+            mut.id = stable_id(mut)
+            mut.nodeKind = kind
+            mut.sourceRange = dict(item)
+            mut.rewriteStrategy = "clang-ast-direct-conditional"
+            out.append(mut)
+
+    if "StringLiteral" in enabled and kind in AST_MUTATOR_CURSOR_KINDS["StringLiteral"]:
+        replacement = _string_literal_range_replacement(text)
+        if replacement is not None:
+            token_offset, original, mutated = replacement
+            mut = Mutant(
+                "StringLiteral",
+                path,
+                line_no,
+                col0 + leading + token_offset,
+                original,
+                mutated,
+            )
+            mut.id = stable_id(mut)
+            mut.nodeKind = kind
+            mut.sourceRange = dict(item)
+            mut.rewriteStrategy = "clang-ast-direct-literal"
+            out.append(mut)
+
+    if "CharacterLiteral" in enabled and kind in AST_MUTATOR_CURSOR_KINDS["CharacterLiteral"]:
+        replacement = _character_literal_range_replacement(text)
+        if replacement is not None:
+            token_offset, original, mutated = replacement
+            mut = Mutant(
+                "CharacterLiteral",
+                path,
+                line_no,
+                col0 + leading + token_offset,
+                original,
+                mutated,
+            )
+            mut.id = stable_id(mut)
+            mut.nodeKind = kind
+            mut.sourceRange = dict(item)
+            mut.rewriteStrategy = "clang-ast-direct-literal"
+            out.append(mut)
+
+    if "IntegerLiteral" in enabled and kind in AST_MUTATOR_CURSOR_KINDS["IntegerLiteral"]:
+        replacement = _integer_literal_range_replacement(text)
+        if replacement is not None:
+            token_offset, original, mutated = replacement
+            mut = Mutant(
+                "IntegerLiteral",
+                path,
+                line_no,
+                col0 + leading + token_offset,
+                original,
+                mutated,
+            )
+            mut.id = stable_id(mut)
+            mut.nodeKind = kind
+            mut.sourceRange = dict(item)
+            mut.rewriteStrategy = "clang-ast-direct-literal"
+            out.append(mut)
+
+    if "NullLiteral" in enabled and kind in AST_MUTATOR_CURSOR_KINDS["NullLiteral"]:
+        replacement = _null_literal_range_replacement(text)
+        if replacement is not None:
+            token_offset, original, mutated = replacement
+            mut = Mutant(
+                "NullLiteral",
+                path,
+                line_no,
+                col0 + leading + token_offset,
+                original,
+                mutated,
+            )
+            mut.id = stable_id(mut)
+            mut.nodeKind = kind
+            mut.sourceRange = dict(item)
+            mut.rewriteStrategy = "clang-ast-direct-literal"
+            out.append(mut)
+
+    if "FloatingPointLiteral" in enabled and kind in AST_MUTATOR_CURSOR_KINDS["FloatingPointLiteral"]:
+        replacement = _floating_literal_range_replacement(text)
+        if replacement is not None:
+            token_offset, original, mutated = replacement
+            mut = Mutant(
+                "FloatingPointLiteral",
+                path,
+                line_no,
+                col0 + leading + token_offset,
+                original,
+                mutated,
+            )
+            mut.id = stable_id(mut)
+            mut.nodeKind = kind
+            mut.sourceRange = dict(item)
+            mut.rewriteStrategy = "clang-ast-direct-literal"
             out.append(mut)
 
     return out
@@ -1954,11 +3405,12 @@ def _discover_mode(
     enabled: list[str],
     mode: str,
     analysis: dict[str, Any] | None = None,
+    equivalent_suppression: str = "conservative",
 ) -> list[Mutant]:
     if not _ensure_supported_source_path(path):
         return []
     if mode == "token":
-        return discover(repo, path, only, enabled)
+        return discover(repo, path, only, enabled, equivalent_suppression, analysis)
     if mode in {"clang", "clang-ast"}:
         try:
             from clang import cindex  # type: ignore
@@ -1994,9 +3446,10 @@ def _discover_mode(
                 ranges,
                 macro_ranges,
                 analysis,
+                equivalent_suppression,
             )
 
-        token_mutants = discover(repo, path, only, enabled)
+        token_mutants = discover(repo, path, only, enabled, "off")
         out: list[Mutant] = []
         for mut in token_mutants:
             kinds = _clang_matching_kinds(ranges, mut.line, mut.col, mut.original)
@@ -2007,8 +3460,8 @@ def _discover_mode(
             if _rejects_macro_candidate(analysis, path, macro_ranges, mut):
                 continue
             out.append(mut)
-        return _apply_stryker_ignore_comments(repo, path, out)
-    return discover(repo, path, only, enabled)
+        return _finalize_discovered_mutants(repo, path, out, equivalent_suppression, analysis)
+    return discover(repo, path, only, enabled, equivalent_suppression, analysis)
 
 
 def _discover_clang_ast_first(
@@ -2019,6 +3472,7 @@ def _discover_clang_ast_first(
     ranges: list[dict[str, int | str]],
     macro_ranges: list[dict[str, int | str]] | None = None,
     analysis: dict[str, Any] | None = None,
+    equivalent_suppression: str = "conservative",
 ) -> list[Mutant]:
     full = os.path.join(repo, path)
     with open(full) as f:
@@ -2056,6 +3510,52 @@ def _discover_clang_ast_first(
             out.append(mut)
         for mutator in enabled:
             if kind not in AST_MUTATOR_CURSOR_KINDS.get(mutator, set()):
+                continue
+            if mutator in {"LoopBoundary", "LoopCondition"}:
+                for line_no in range(start_line, min(end_line, len(src)) + 1):
+                    if only is not None and line_no not in only:
+                        continue
+                    code = stripped.get(line_no, "")
+                    if mutator == "LoopBoundary":
+                        loop_mutants = _discover_loop_boundary_mutations(path, line_no, code)
+                    else:
+                        loop_mutants = _discover_loop_condition_mutations(path, line_no, code)
+                    for mut in loop_mutants:
+                        if not _clang_range_contains(item, mut.line, mut.col, mut.col + len(mut.original)):
+                            continue
+                        mut.nodeKind = kind
+                        mut.sourceRange = dict(item)
+                        mut.rewriteStrategy = "clang-ast-source-range"
+                        if _rejects_macro_candidate(analysis, path, macro_ranges or [], mut):
+                            continue
+                        if mut.id not in seen:
+                            seen.add(mut.id)
+                            out.append(mut)
+                continue
+            if mutator in {"MemberAccessOperator", "ExceptionHandling", "ObjCMessageSend", "MetalAddressSpace"}:
+                for line_no in range(start_line, min(end_line, len(src)) + 1):
+                    if only is not None and line_no not in only:
+                        continue
+                    code = stripped.get(line_no, "")
+                    if mutator == "MemberAccessOperator":
+                        custom_mutants = _discover_member_access_mutations(path, line_no, code)
+                    elif mutator == "ExceptionHandling":
+                        custom_mutants = _discover_exception_handling_mutations(path, line_no, code, src[line_no - 1])
+                    elif mutator == "ObjCMessageSend":
+                        custom_mutants = _discover_objc_message_send_mutations(path, line_no, code, src[line_no - 1])
+                    else:
+                        custom_mutants = _discover_metal_address_space_mutations(path, line_no, code)
+                    for mut in custom_mutants:
+                        if not _clang_range_contains(item, mut.line, mut.col, mut.col + len(mut.original)):
+                            continue
+                        mut.nodeKind = kind
+                        mut.sourceRange = dict(item)
+                        mut.rewriteStrategy = "clang-ast-source-range"
+                        if _rejects_macro_candidate(analysis, path, macro_ranges or [], mut):
+                            continue
+                        if mut.id not in seen:
+                            seen.add(mut.id)
+                            out.append(mut)
                 continue
             if mutator == "CallRemoval":
                 for line_no in range(start_line, min(end_line, len(src)) + 1):
@@ -2096,7 +3596,7 @@ def _discover_clang_ast_first(
                         seen.add(mut.id)
                         out.append(mut)
 
-    return _apply_stryker_ignore_comments(repo, path, out)
+    return _finalize_discovered_mutants(repo, path, out, equivalent_suppression, analysis)
 
 
 def _resolve_compile_entry(repo: str, path: str) -> list[str] | None:
@@ -2331,6 +3831,7 @@ def _report_dict(rep: Report, repo: str | None = None, base: str | None = None,
     payload = {
         "schemaVersion": REPORT_SCHEMA_VERSION,
         "tool": rep.tool,
+        "toolVersion": TOOL_VERSION,
         "repo": repo or rep.repo,
         "base": base or rep.base,
         "startedAt": startedAt or rep.startedAt,
@@ -2532,8 +4033,24 @@ def _format_markdown(rep: Report) -> str:
         f"| build command | `{rep.buildCommand or ''}` |",
         f"| test command | `{rep.testCommand or ''}` |",
         "",
-        "## Surviving mutants",
+        "## Mutator summary",
+        "",
+        "| mutator | total | killed | survived | build errors | check errors | no coverage | timeouts | ignored | score |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
+    summary = _summary([_normalize_mutant_record(mut) for mut in rep.mutants])
+    for mutator, bucket in sorted(summary["byMutator"].items()):
+        lines.append(
+            f"| {mutator} | {bucket.get('total', 0)} | {bucket.get('killed', 0)} | "
+            f"{bucket.get('survived', 0)} | {bucket.get('buildErrors', 0)} | "
+            f"{bucket.get('checkErrors', 0)} | {bucket.get('noCoverage', 0)} | "
+            f"{bucket.get('timeouts', 0)} | {bucket.get('ignored', 0)} | "
+            f"{float(bucket.get('score', 0.0)):.2f} |"
+        )
+    lines.extend([
+        "",
+        "## Surviving mutants",
+    ])
     for mut in rep.mutants:
         if mut["status"] == "SURVIVED":
             lines.append(
@@ -2682,7 +4199,12 @@ def _format_github_annotations(rep: Report) -> str:
         status = str(mut.get("status", "PENDING")).upper()
         if status in {"KILLED", "IGNORED"}:
             continue
-        level = "notice" if status == "NO_COVERAGE" else "warning"
+        if status == "NO_COVERAGE":
+            level = "notice"
+        elif status in {"BUILD_ERROR", "CHECK_ERROR", "TIMEOUT"}:
+            level = "error"
+        else:
+            level = "warning"
         title = f"{status} {mut.get('mutator', 'mutant')}"
         message = mut.get("detail") or f"{mut.get('original', '')} -> {mut.get('mutated', '')}"
         lines.append(
@@ -2703,13 +4225,37 @@ def _dashboard_payload(rep: Report) -> dict[str, Any]:
     if not isinstance(dashboard, dict):
         dashboard = {}
     retention_days = dashboard.get("retentionDays")
+    commit = dashboard.get("commit") or os.environ.get("GITHUB_SHA") or os.environ.get("CI_COMMIT_SHA")
+    branch = dashboard.get("branch") or os.environ.get("GITHUB_REF_NAME") or os.environ.get("CI_COMMIT_REF_NAME")
+    project = dashboard.get("project") or os.environ.get("GITHUB_REPOSITORY") or os.environ.get("CI_PROJECT_PATH") or rep.repo
+    run_id = os.environ.get("GITHUB_RUN_ID") or os.environ.get("CI_PIPELINE_ID")
+    build_url = dashboard.get("buildUrl") or os.environ.get("CI_PIPELINE_URL")
+    upload = dict(dashboard.get("upload") or {"enabled": False})
+    upload.setdefault("enabled", False)
+    upload.setdefault("status", "notAttempted" if upload.get("enabled") else "disabled")
+    if (
+        not build_url
+        and os.environ.get("GITHUB_SERVER_URL")
+        and os.environ.get("GITHUB_REPOSITORY")
+        and os.environ.get("GITHUB_RUN_ID")
+    ):
+        build_url = (
+            f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}"
+            f"/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+        )
     return {
         "schemaVersion": "stryker-cxx.dashboard.v1",
         "dashboardVersion": str(dashboard.get("version") or "1"),
         "generatedAt": _utc_now_iso(),
         "tool": rep.tool,
+        "toolVersion": TOOL_VERSION,
         "repo": rep.repo,
         "base": rep.base,
+        "project": project,
+        "branch": branch,
+        "commit": commit,
+        "runId": run_id,
+        "buildUrl": build_url,
         "startedAt": rep.startedAt,
         "completedAt": rep.completedAt,
         "retention": {
@@ -2720,18 +4266,29 @@ def _dashboard_payload(rep: Report) -> dict[str, Any]:
                 else "caller-managed"
             ),
         },
+        "privacy": {
+            "sourceFilesIncluded": False,
+            "mutantSourceSnippetsIncluded": True,
+            "secretValuesRedacted": True,
+            "environmentValuesRedacted": True,
+        },
         "provenance": {
             "reportSchemaVersion": REPORT_SCHEMA_VERSION,
+            "toolVersion": TOOL_VERSION,
             "configHash": (rep.config or {}).get("hash"),
             "configPath": (rep.config or {}).get("path"),
             "ci": {
-                "commit": os.environ.get("GITHUB_SHA") or os.environ.get("CI_COMMIT_SHA"),
-                "runId": os.environ.get("GITHUB_RUN_ID") or os.environ.get("CI_PIPELINE_ID"),
+                "project": project,
+                "branch": branch,
+                "commit": commit,
+                "runId": run_id,
+                "buildUrl": build_url,
             },
-            "upload": dashboard.get("upload", {"enabled": False}),
+            "upload": upload,
         },
         "score": rep.score,
         "thresholds": rep.thresholds,
+        "thresholdStatus": (rep.thresholds or {}).get("status") if isinstance(rep.thresholds, dict) else None,
         "summary": _summary(mutants),
         "counts": {
             "totalMutants": rep.total,
@@ -2768,7 +4325,7 @@ def _upload_dashboard(
     rep: Report,
     auth_token_env: str | None = None,
     auth_header: str | None = None,
-) -> None:
+) -> int:
     body = json.dumps(_redact_report_artifact(_dashboard_payload(rep))).encode("utf-8")
     headers = {"content-type": "application/json", "user-agent": "stryker-cxx"}
     if auth_token_env:
@@ -2785,6 +4342,42 @@ def _upload_dashboard(
     )
     with urllib.request.urlopen(request, timeout=30) as response:
         response.read()
+        return int(response.getcode())
+
+
+def _record_dashboard_upload_status(
+    rep: Report,
+    status: str,
+    *,
+    status_code: int | None = None,
+    error: Exception | None = None,
+) -> None:
+    dashboard = rep.execution.setdefault("dashboard", {})
+    upload = dashboard.setdefault("upload", {})
+    upload["status"] = status
+    if status_code is not None:
+        upload["statusCode"] = status_code
+    if error is not None:
+        upload["error"] = str(error)
+
+
+def _attempt_dashboard_upload(args: argparse.Namespace, rep: Report) -> Exception | None:
+    if not args.dashboard_upload_url:
+        _record_dashboard_upload_status(rep, "disabled")
+        return None
+    _record_dashboard_upload_status(rep, "attempting")
+    try:
+        status_code = _upload_dashboard(
+            args.dashboard_upload_url,
+            rep,
+            args.dashboard_auth_token_env,
+            args.dashboard_auth_header,
+        )
+    except Exception as exc:
+        _record_dashboard_upload_status(rep, "failed", error=exc)
+        return exc
+    _record_dashboard_upload_status(rep, "succeeded", status_code=status_code)
+    return None
 
 
 def _write_human_artifact(path: str, report: str, payload: Any) -> str:
@@ -2847,6 +4440,7 @@ def _run_mutant_once(
     worker_tmp_dir: str | None = None,
     retain_worktrees: bool = False,
     retain_worktrees_for: set[str] | None = None,
+    worker_label: str | None = None,
     env_overrides: dict[str, str] | None = None,
     env_inherit: list[str] | None = None,
     env_block: list[str] | None = None,
@@ -2855,11 +4449,19 @@ def _run_mutant_once(
     run_record = dict(existing_run)
     run_record["mode"] = execution_mode
     run_record["worktreeMode"] = worktree_mode
+    if worker_label:
+        run_record["workerLabel"] = worker_label
     mut.run = run_record
     _record_environment_policy(mut.run, env_overrides, env_inherit, env_block)
     start_ms = time.perf_counter()
     retain_state = {"retain": False}
-    with _workspace(repo, worktree_mode, worker_tmp_dir=worker_tmp_dir, retain_state=retain_state) as work_repo:
+    with _workspace(
+        repo,
+        worktree_mode,
+        worker_tmp_dir=worker_tmp_dir,
+        retain_state=retain_state,
+        worker_label=worker_label,
+    ) as work_repo:
         original = apply_mutant(work_repo, mut)
         build_log = os.path.join(artifact_root, f"build_{_safe_basename(mut.id)}.log")
         check_log = os.path.join(artifact_root, f"check_{_safe_basename(mut.id)}.log")
@@ -2955,6 +4557,8 @@ def _run_mutant_once(
                 retain_state["retain"] = True
                 mut.run["retainedWorktree"] = work_repo
                 mut.run["retainedWorktreeReason"] = mut.status
+                if worker_label:
+                    mut.run["retainedWorktreeLabel"] = worker_label
             else:
                 restore(work_repo, mut.file, mut.line, original)
             mut.durationMs = int((time.perf_counter() - start_ms) * 1000)
@@ -2977,6 +4581,7 @@ def _run_mutant_task(payload: tuple[Any, ...]) -> Mutant:
         worker_tmp_dir,
         retain_worktrees,
         retain_worktrees_for,
+        worker_label,
         env_overrides,
         env_inherit,
         env_block,
@@ -2996,6 +4601,7 @@ def _run_mutant_task(payload: tuple[Any, ...]) -> Mutant:
         worker_tmp_dir=worker_tmp_dir,
         retain_worktrees=retain_worktrees,
         retain_worktrees_for=retain_worktrees_for,
+        worker_label=worker_label,
         env_overrides=env_overrides,
         env_inherit=env_inherit,
         env_block=env_block,
@@ -3005,9 +4611,11 @@ def _run_mutant_task(payload: tuple[Any, ...]) -> Mutant:
 def _mutants_overlap(a: Mutant, b: Mutant) -> bool:
     if a.file != b.file:
         return False
-    # Keep batching conservative: same-line edits can shift columns or interact
-    # with statement-level replacements, so do not batch them.
-    if a.line == b.line:
+    if a.mutator in BATCH_ISOLATED_MUTATORS or b.mutator in BATCH_ISOLATED_MUTATORS:
+        return True
+    # Keep batching conservative: nearby edits can shift columns, interact with
+    # statement-level replacements, or change neighboring branch/loop behavior.
+    if abs(a.line - b.line) <= 1:
         return True
     return False
 
@@ -3046,6 +4654,7 @@ def _run_batch_probe(
     worker_tmp_dir: str | None = None,
     retain_worktrees: bool = False,
     retain_worktrees_for: set[str] | None = None,
+    worker_label: str | None = None,
     env_overrides: dict[str, str] | None = None,
     env_inherit: list[str] | None = None,
     env_block: list[str] | None = None,
@@ -3057,11 +4666,19 @@ def _run_batch_probe(
         "batchId": batch_id,
         "batchSize": len(batch),
     }
+    if worker_label:
+        run["workerLabel"] = worker_label
     _record_environment_policy(run, env_overrides, env_inherit, env_block)
     start_ms = time.perf_counter()
     result: tuple[str, str, int, dict[str, Any]] | None = None
     retain_state = {"retain": False}
-    with _workspace(repo, worktree_mode, worker_tmp_dir=worker_tmp_dir, retain_state=retain_state) as work_repo:
+    with _workspace(
+        repo,
+        worktree_mode,
+        worker_tmp_dir=worker_tmp_dir,
+        retain_state=retain_state,
+        worker_label=worker_label,
+    ) as work_repo:
         originals: list[tuple[Mutant, str]] = []
         build_log = os.path.join(artifact_root, f"batch_build_{batch_id}.log")
         check_log = os.path.join(artifact_root, f"batch_check_{batch_id}.log")
@@ -3175,6 +4792,8 @@ def _run_batch_probe(
                 retain_state["retain"] = True
                 run["retainedWorktree"] = work_repo
                 run["retainedWorktreeReason"] = status
+                if worker_label:
+                    run["retainedWorktreeLabel"] = worker_label
             else:
                 for mut, original in reversed(originals):
                     restore(work_repo, mut.file, mut.line, original)
@@ -3197,6 +4816,7 @@ def _run_batch_task(payload: tuple[Any, ...]) -> tuple[int, list[Mutant], str, s
         worker_tmp_dir,
         retain_worktrees,
         retain_worktrees_for,
+        worker_label,
         env_overrides,
         env_inherit,
         env_block,
@@ -3216,6 +4836,7 @@ def _run_batch_task(payload: tuple[Any, ...]) -> tuple[int, list[Mutant], str, s
         worker_tmp_dir=worker_tmp_dir,
         retain_worktrees=retain_worktrees,
         retain_worktrees_for=retain_worktrees_for,
+        worker_label=worker_label,
         env_overrides=env_overrides,
         env_inherit=env_inherit,
         env_block=env_block,
@@ -3278,6 +4899,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dashboard-upload-url", default=None)
     ap.add_argument("--dashboard-version", default="1")
     ap.add_argument("--dashboard-retention-days", type=int, default=None)
+    ap.add_argument("--dashboard-project", default=None)
+    ap.add_argument("--dashboard-branch", default=None)
+    ap.add_argument("--dashboard-commit", default=None)
+    ap.add_argument("--dashboard-build-url", default=None)
     ap.add_argument("--dashboard-auth-token-env", default=None)
     ap.add_argument("--dashboard-auth-header", default="Authorization")
     ap.add_argument("--incremental", action="store_true",
@@ -3293,6 +4918,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--clear-baseline", action="store_true",
                     help="Delete the selected baseline cache before running")
     ap.add_argument("--mode", default="token", choices=["token", "clang", "clang-ast"])
+    ap.add_argument("--equivalent-suppression", default="conservative",
+                    choices=sorted(EQUIVALENT_SUPPRESSION_MODES),
+                    help="Automatically mark high-confidence equivalent/noisy mutants as IGNORED")
     ap.add_argument("--jobs", type=int, default=1, help="Parallel mutation workers")
     ap.add_argument("--batch-mutants", action="store_true",
                     help="Batch compatible mutants in isolated worktrees and split failed batches for attribution")
@@ -3319,6 +4947,8 @@ def main(argv: list[str] | None = None) -> int:
                     dest="retained_worktree_ttl_hours",
                     help="Remove retained copy/git worktrees older than this many hours under --worker-tmp-dir")
     ap.add_argument("--worker-tmp-dir", default=None, dest="worker_tmp_dir")
+    ap.add_argument("--worker-label", default=None, dest="worker_label",
+                    help="Label retained worker/worktree artifacts for proof or CI grouping")
     ap.add_argument("--env", action="append", default=[])
     ap.add_argument("--env-inherit", action="append", default=[],
                     help="Comma-separated inherited environment variable allowlist")
@@ -3391,6 +5021,7 @@ def main(argv: list[str] | None = None) -> int:
         ap.error(str(exc))
     if args.worker_tmp_dir:
         os.makedirs(args.worker_tmp_dir, exist_ok=True)
+    worker_label = _safe_worker_label(args.worker_label) or None
 
     if args.format == "json" and args.output_format == "legacy":
         output_mode = "legacy"
@@ -3444,6 +5075,11 @@ def main(argv: list[str] | None = None) -> int:
                 "engine": args.mode,
                 "macroRejectedMutants": 0,
                 "macroRejections": [],
+                "equivalentSuppression": {
+                    "mode": args.equivalent_suppression,
+                    "suppressedMutants": 0,
+                    "suppressions": [],
+                },
             },
             "timeoutFactor": args.timeout_factor,
             "timeoutConstantMs": args.timeout_constant_ms,
@@ -3454,14 +5090,24 @@ def main(argv: list[str] | None = None) -> int:
                 "batches": 0,
                 "splitBatches": 0,
                 "batchedMutants": 0,
+                "heuristics": [
+                    "same-file adjacent-line isolation",
+                    "source-structure mutator isolation",
+                    "failed batch split attribution",
+                ],
             },
             "dashboard": {
                 "version": args.dashboard_version,
                 "retentionDays": args.dashboard_retention_days,
+                "project": args.dashboard_project,
+                "branch": args.dashboard_branch,
+                "commit": args.dashboard_commit,
+                "buildUrl": args.dashboard_build_url,
                 "exportPath": args.dashboard_export,
                 "upload": {
                     "enabled": bool(args.dashboard_upload_url),
                     "urlConfigured": bool(args.dashboard_upload_url),
+                    "status": "notAttempted" if args.dashboard_upload_url else "disabled",
                     "authTokenEnv": args.dashboard_auth_token_env,
                     "authHeader": (
                         args.dashboard_auth_header
@@ -3483,6 +5129,7 @@ def main(argv: list[str] | None = None) -> int:
                 "retainedWorktreeTtlHours": args.retained_worktree_ttl_hours,
                 "retainedWorktreeCleanup": retained_worktree_cleanup,
                 "workerTmpDir": args.worker_tmp_dir,
+                "workerLabel": worker_label,
                 "environmentKeys": sorted(env_overrides),
                 "environmentInheritedKeys": sorted(env_inherit) if env_inherit is not None else ["*"],
                 "environmentBlockedKeys": sorted(env_block),
@@ -3505,6 +5152,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     rep.execution["plugins"] = plugins
     rep.execution["reporters"] = args.reporter
+    rep.execution["reporterMetadata"] = _reporter_metadata(plugins, args.reporter)
     rep.execution["providers"] = _execution_provider_summary(plugins)
     discovered: list[Mutant] = []
     for path in files:
@@ -3526,6 +5174,7 @@ def main(argv: list[str] | None = None) -> int:
                 enabled,
                 args.mode,
                 rep.execution.get("analysis"),
+                args.equivalent_suppression,
             )
         )
 
@@ -3628,12 +5277,13 @@ def main(argv: list[str] | None = None) -> int:
             if not args.quiet:
                 print(f"[error] dry run failed: {rep.dryRun.get('failureReason', 'unknown failure')}")
             rep.finalize()
+            dashboard_upload_error = _attempt_dashboard_upload(args, rep)
             _write_report(args.report, rep, output_mode=output_mode)
             _write_output_artifacts(args.report, args.format, rep)
             if args.dashboard_export:
                 _write_dashboard_export(args.dashboard_export, rep)
-            if args.dashboard_upload_url:
-                _upload_dashboard(args.dashboard_upload_url, rep)
+            if dashboard_upload_error is not None:
+                raise dashboard_upload_error
             _run_reporter_plugins(
                 plugins,
                 args.reporter,
@@ -3658,12 +5308,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.dry_run_only:
         rep.finalize()
+        dashboard_upload_error = _attempt_dashboard_upload(args, rep)
         _write_report(args.report, rep, output_mode=output_mode)
         _write_output_artifacts(args.report, args.format, rep)
         if args.dashboard_export:
             _write_dashboard_export(args.dashboard_export, rep)
-        if args.dashboard_upload_url:
-            _upload_dashboard(args.dashboard_upload_url, rep)
+        if dashboard_upload_error is not None:
+            raise dashboard_upload_error
         _run_reporter_plugins(
             plugins,
             args.reporter,
@@ -3782,6 +5433,7 @@ def main(argv: list[str] | None = None) -> int:
                         args.worker_tmp_dir,
                         retain_worktrees,
                         retain_worktrees_for,
+                        worker_label,
                         env_overrides,
                         env_inherit,
                         env_block,
@@ -3816,6 +5468,7 @@ def main(argv: list[str] | None = None) -> int:
                             worker_tmp_dir=args.worker_tmp_dir,
                             retain_worktrees=retain_worktrees,
                             retain_worktrees_for=retain_worktrees_for,
+                            worker_label=worker_label,
                             env_overrides=env_overrides,
                             env_inherit=env_inherit,
                             env_block=env_block,
@@ -3860,6 +5513,7 @@ def main(argv: list[str] | None = None) -> int:
                             worker_tmp_dir=args.worker_tmp_dir,
                             retain_worktrees=retain_worktrees,
                             retain_worktrees_for=retain_worktrees_for,
+                            worker_label=worker_label,
                             env_overrides=env_overrides,
                             env_inherit=env_inherit,
                             env_block=env_block,
@@ -3887,6 +5541,7 @@ def main(argv: list[str] | None = None) -> int:
                         args.worker_tmp_dir,
                         retain_worktrees,
                         retain_worktrees_for,
+                        worker_label,
                         env_overrides,
                         env_inherit,
                         env_block,
@@ -3941,6 +5596,7 @@ def main(argv: list[str] | None = None) -> int:
                         worker_tmp_dir=args.worker_tmp_dir,
                         retain_worktrees=retain_worktrees,
                         retain_worktrees_for=retain_worktrees_for,
+                        worker_label=worker_label,
                         env_overrides=env_overrides,
                         env_inherit=env_inherit,
                         env_block=env_block,
@@ -3984,18 +5640,14 @@ def main(argv: list[str] | None = None) -> int:
                 baseline_entries[key] = _baseline_entry(rec)
         _write_baseline(write_baseline_path, baseline_entries)
         rep.baseline["cacheWrites"] = len([m for m in rep.mutants if isinstance(m.get("baselineKey"), str)])
+    dashboard_upload_error = _attempt_dashboard_upload(args, rep)
     _write_report(args.report, rep, output_mode=output_mode)
 
     _write_output_artifacts(args.report, args.format, rep)
     if args.dashboard_export:
         _write_dashboard_export(args.dashboard_export, rep)
-    if args.dashboard_upload_url:
-        _upload_dashboard(
-            args.dashboard_upload_url,
-            rep,
-            args.dashboard_auth_token_env,
-            args.dashboard_auth_header,
-        )
+    if dashboard_upload_error is not None:
+        raise dashboard_upload_error
     _run_reporter_plugins(
         plugins,
         args.reporter,
@@ -4033,6 +5685,9 @@ def main(argv: list[str] | None = None) -> int:
             return 3
         return 0
 
+    if rep.buildError:
+        return 2
+
     effective_threshold = rep.thresholds["break"]
     if rep.score < effective_threshold:
         return 2
@@ -4051,6 +5706,7 @@ def _workspace(
     worker_tmp_dir: str | None = None,
     retain: bool = False,
     retain_state: dict[str, bool] | None = None,
+    worker_label: str | None = None,
 ):
     if mode == "inplace":
         yield repo
@@ -4058,12 +5714,13 @@ def _workspace(
 
     if worker_tmp_dir:
         os.makedirs(worker_tmp_dir, exist_ok=True)
+    label_prefix = f"{_safe_worker_label(worker_label)}-" if _safe_worker_label(worker_label) else ""
 
     if mode == "git-worktree":
         if not os.path.isdir(os.path.join(repo, ".git")):
             raise ValueError("git-worktree mode requires --repo to point at a git work tree")
 
-        workspace_root = tempfile.mkdtemp(prefix="stryker-cxx-worktree-", dir=worker_tmp_dir)
+        workspace_root = tempfile.mkdtemp(prefix=f"stryker-cxx-worktree-{label_prefix}", dir=worker_tmp_dir)
         workdir = os.path.join(workspace_root, "worktree")
         try:
             subprocess.run(
@@ -4086,7 +5743,7 @@ def _workspace(
         return
 
     if mode == "copy":
-        workdir = tempfile.mkdtemp(prefix="stryker-cxx-copy-", dir=worker_tmp_dir)
+        workdir = tempfile.mkdtemp(prefix=f"stryker-cxx-copy-{label_prefix}", dir=worker_tmp_dir)
         try:
             shutil.copytree(repo, workdir, dirs_exist_ok=True, ignore=shutil.ignore_patterns(".git"))
             yield workdir

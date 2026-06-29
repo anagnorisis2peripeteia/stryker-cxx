@@ -7,8 +7,10 @@ terminal.
 
 - Tags use `vX.Y.Z`.
 - Tags are signed when the maintainer environment supports signed tags.
-- GitHub Releases trigger the `publish` workflow.
-- The `publish` workflow publishes with npm provenance.
+- Pushing a `vX.Y.Z` tag triggers the `release` workflow.
+- Manual release workflow dispatch defaults to `npm publish --dry-run`.
+- The `release` workflow publishes with npm provenance when tag-triggered or
+  explicitly dispatched with `publish=true`.
 - Local publishing is reserved for emergency recovery and must be documented in
   the release notes if it ever happens.
 
@@ -21,8 +23,8 @@ npm publish --provenance --access public
 ```
 
 The repository must have an `NPM_TOKEN` secret with publish permission for the
-`stryker-cxx` package. The workflow also requests `id-token: write`, which npm
-uses for provenance.
+`stryker-cxx` package, exposed to npm as `NODE_AUTH_TOKEN`. The workflow also
+requests `id-token: write`, which npm uses for provenance.
 
 ## Compatibility expectations
 

@@ -8,6 +8,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from stryker_cxx.cli import _adapter_commands, _checker_command
+
 
 class CliContractTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -107,6 +109,17 @@ class CliContractTests(unittest.TestCase):
         self.assertIn('buildSystem: "cmake"', text)
         self.assertIn('buildCommand: ""', text)
 
+    def test_init_can_write_xcodebuild_preset_config(self) -> None:
+        config = self.repo / "xcodebuild-stryker-cxx.yml"
+
+        created = self._cli("init", "--path", str(config), "--preset", "xcodebuild")
+
+        self.assertEqual(created.returncode, 0, created.stderr + created.stdout)
+        text = config.read_text()
+        self.assertIn('buildSystem: "xcodebuild"', text)
+        self.assertIn('xcodeConfiguration: "Debug"', text)
+        self.assertIn('testFramework: "xctest"', text)
+
     def test_init_can_write_framework_preset_config(self) -> None:
         config = self.repo / "cmake-gtest-stryker-cxx.yml"
 
@@ -117,6 +130,48 @@ class CliContractTests(unittest.TestCase):
         self.assertIn('buildSystem: "cmake"', text)
         self.assertIn('testFramework: "gtest"', text)
         self.assertIn('testBinary: ""', text)
+
+    def test_xcodebuild_adapter_synthesizes_build_and_test_commands(self) -> None:
+        commands = _adapter_commands(
+            "xcodebuild",
+            None,
+            None,
+            None,
+            "AppTests/testFast",
+            xcode_workspace="App.xcworkspace",
+            xcode_scheme="AppTests",
+            xcode_configuration="Debug",
+            xcode_sdk="iphonesimulator",
+            xcode_destination="platform=iOS Simulator,name=iPhone 15",
+            xctest_only_testing=["AppTests/testSpecific"],
+            xctest_skip_testing=["AppTests/testSlow"],
+        )
+
+        self.assertEqual(
+            commands["build"],
+            "xcodebuild build -workspace 'App.xcworkspace' -scheme 'AppTests' "
+            "-configuration 'Debug' -sdk 'iphonesimulator' "
+            "-destination 'platform=iOS Simulator,name=iPhone 15'",
+        )
+        self.assertEqual(
+            commands["test"],
+            "xcodebuild test -workspace 'App.xcworkspace' -scheme 'AppTests' "
+            "-configuration 'Debug' -sdk 'iphonesimulator' "
+            "-destination 'platform=iOS Simulator,name=iPhone 15' "
+            "'-only-testing:AppTests/testSpecific' '-skip-testing:AppTests/testSlow'",
+        )
+
+    def test_clang_checker_adapter_synthesizes_fsyntax_only_command(self) -> None:
+        command = _checker_command(
+            "clang++",
+            "-std=c++20 -I include",
+            "sample.cpp,sources/view.mm",
+        )
+
+        self.assertEqual(
+            command,
+            "clang++ -fsyntax-only '-std=c++20' '-I' 'include' 'sample.cpp' 'sources/view.mm'",
+        )
 
     def test_config_unknown_keys_are_rejected(self) -> None:
         config = self.repo / "stryker-cxx.yml"
@@ -151,7 +206,8 @@ class CliContractTests(unittest.TestCase):
             "entries": {
                 "a": {
                     "updatedAt": "2026-01-01T00:00:00Z",
-                    "mutant": {"file": "sample.cpp", "status": "KILLED"},
+                    "branch": "main",
+                    "mutant": {"id": "mut-a", "file": "sample.cpp", "line": 1, "mutator": "EqualityOperator", "status": "KILLED"},
                 }
             },
         }))
@@ -160,22 +216,32 @@ class CliContractTests(unittest.TestCase):
             "entries": {
                 "b": {
                     "updatedAt": "2026-01-02T00:00:00Z",
-                    "mutant": {"file": "missing.cpp", "status": "SURVIVED"},
+                    "branch": "feature",
+                    "mutant": {"id": "mut-b", "file": "missing.cpp", "line": 2, "mutator": "LogicalOperator", "status": "SURVIVED"},
                 }
             },
         }))
 
         merge = self._cli("baseline-merge", "--output", str(merged), str(first), str(second))
         info = self._cli("baseline-info", "--baseline-file", str(merged), "--repo", str(self.repo))
+        history = self._cli("baseline-history", "--baseline-file", str(merged), "--repo", str(self.repo), "--limit", "1")
         prune = self._cli("baseline-prune", "--baseline-file", str(merged), "--repo", str(self.repo))
 
         self.assertEqual(merge.returncode, 0, merge.stderr + merge.stdout)
         self.assertEqual(info.returncode, 0, info.stderr + info.stdout)
+        self.assertEqual(history.returncode, 0, history.stderr + history.stdout)
         self.assertEqual(prune.returncode, 0, prune.stderr + prune.stdout)
         info_payload = json.loads(info.stdout)
         self.assertEqual(info_payload["entries"], 2)
         self.assertEqual(info_payload["byStatus"], {"KILLED": 1, "SURVIVED": 1})
         self.assertEqual(info_payload["fileExistence"], {"present": 1, "missing": 1})
+        history_payload = json.loads(history.stdout)
+        self.assertEqual(history_payload["entries"], 2)
+        self.assertEqual(history_payload["matchedEntries"], 2)
+        self.assertEqual(history_payload["byDay"]["2026-01-01"]["KILLED"], 1)
+        self.assertEqual(history_payload["byDay"]["2026-01-02"]["SURVIVED"], 1)
+        self.assertEqual(history_payload["history"][0]["key"], "b")
+        self.assertEqual(history_payload["history"][0]["fileExists"], False)
         payload = json.loads(merged.read_text())
         self.assertEqual(list(payload["entries"].keys()), ["a"])
 
@@ -287,6 +353,57 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual((self.repo / "hook-pre.txt").read_text(), "pre")
         self.assertEqual((self.repo / "hook-post.txt").read_text(), "post")
         self.assertTrue((self.repo / "hook-report.json").exists())
+
+    def test_plugin_reporter_metadata_is_recorded_in_execution_payload(self) -> None:
+        plugin = self.repo / "metadata-plugin.json"
+        plugin.write_text(json.dumps({
+            "name": "metadata-plugin",
+            "version": "0.1.0",
+            "reporters": [
+                {
+                    "name": "copy-json",
+                    "command": "cp \"$STRYKER_CXX_REPORT\" metadata-report.json",
+                    "metadata": {
+                        "scope": "local",
+                        "format": "json",
+                    },
+                }
+            ],
+        }))
+        report = self.repo / "metadata.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "true",
+            "--report",
+            str(report),
+            "--plugin",
+            str(plugin),
+            "--reporter",
+            "copy-json",
+            "--dry-run-only",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        metadata = payload["execution"].get("reporterMetadata")
+        self.assertEqual(len(metadata), 1)
+        self.assertEqual(
+            metadata[0],
+            {
+                "plugin": "metadata-plugin",
+                "reporter": "copy-json",
+                "metadata": {"scope": "local", "format": "json"},
+            },
+        )
 
     def test_plugin_runner_provider_commands_override_build_check_test_phases(self) -> None:
         plugin = self.repo / "runner-plugin.json"
@@ -433,6 +550,44 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(payload["coverage"]["provider"], "fixture-coverage")
         self.assertEqual(payload["coverage"]["plugin"]["plugin"], "provider-hooks-fixture")
         self.assertEqual(payload["dryRun"]["build"]["provider"], "fixture-runner")
+        reporter_metadata = payload["execution"].get("reporterMetadata")
+        self.assertEqual(
+            reporter_metadata,
+            [
+                {
+                    "plugin": "reporter-hook-fixture",
+                    "reporter": "copy-json",
+                    "metadata": {"format": "json", "source": "fixture"},
+                }
+            ],
+        )
+
+    def test_plugin_config_loader_contributes_effective_defaults(self) -> None:
+        fixture_root = Path(__file__).resolve().parents[2] / "fixtures" / "plugins" / "config-loader"
+        config = self.repo / "loader.config.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": "stryker-cxx.config.v1",
+                    "plugins": [str(fixture_root / "stryker-cxx-plugin.json")],
+                },
+                indent=2,
+            )
+        )
+
+        result = self._cli(
+            "list-mutants",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--config",
+            str(config),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        mutants = json.loads(result.stdout)
+        self.assertEqual(len(mutants), 1)
 
     def test_killed_mutant_meets_default_threshold(self) -> None:
         report = self.repo / "killed.json"
@@ -770,7 +925,12 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(payload["execution"]["batching"]["batchedMutants"], 4)
         self.assertEqual(payload["execution"]["batching"]["parallelWorkers"], 2)
         self.assertEqual(payload["execution"]["batching"]["splitBatches"], 0)
+        self.assertIn("same-file adjacent-line isolation", payload["execution"]["batching"]["heuristics"])
         self.assertEqual([m["resultSource"] for m in payload["mutants"]], ["batch", "batch", "batch", "batch"])
+        lines_by_batch: dict[str, list[int]] = {}
+        for mut in payload["mutants"]:
+            lines_by_batch.setdefault(mut["run"]["batchId"], []).append(mut["line"])
+        self.assertEqual(sorted(sorted(lines) for lines in lines_by_batch.values()), [[1, 3], [2, 4]])
 
     def test_timeout_maps_to_canonical_mte_timeout(self) -> None:
         report = self.repo / "timeout.json"
@@ -863,6 +1023,8 @@ class CliContractTests(unittest.TestCase):
                     "copy",
                     "--worker-tmp-dir",
                     worker_tmp,
+                    "--worker-label",
+                    "pr 96205 proof",
                     "--retained-worktree-ttl-hours",
                     "0",
                     "--retain-worktrees",
@@ -888,6 +1050,7 @@ class CliContractTests(unittest.TestCase):
                 self.assertGreaterEqual(isolation["retainedWorktreeCleanup"]["removed"], 1)
                 self.assertFalse(stale.exists())
                 self.assertEqual(isolation["workerTmpDir"], worker_tmp)
+                self.assertEqual(isolation["workerLabel"], "pr-96205-proof")
                 self.assertEqual(isolation["environmentKeys"], ["SECRET_TOKEN", "STRYKER_CXX_FLAG"])
                 self.assertEqual(isolation["environmentInheritedKeys"], ["PATH"])
                 self.assertEqual(isolation["environmentBlockedKeys"], ["STRYKER_CXX_BLOCKED"])
@@ -898,6 +1061,9 @@ class CliContractTests(unittest.TestCase):
                 )
                 retained = payload["mutants"][0]["run"]["retainedWorktree"]
                 self.assertTrue(retained.startswith(worker_tmp))
+                self.assertIn("stryker-cxx-copy-pr-96205-proof-", retained)
+                self.assertEqual(payload["mutants"][0]["run"]["workerLabel"], "pr-96205-proof")
+                self.assertEqual(payload["mutants"][0]["run"]["retainedWorktreeLabel"], "pr-96205-proof")
                 self.assertIn("!=", (Path(retained) / "sample.cpp").read_text())
                 self.assertEqual(
                     payload["mutants"][0]["run"]["environmentKeys"],
@@ -1092,6 +1258,87 @@ class CliContractTests(unittest.TestCase):
         statuses = [mut["status"] for mut in json.loads(listed.stdout)]
         self.assertEqual(statuses, ["PENDING", "IGNORED"])
 
+    def test_equivalent_suppression_marks_high_confidence_noise_ignored(self) -> None:
+        self.source.write_text(
+            "bool redundant(bool flag) { return flag && flag; }\n"
+            "int identity(int x) { return x + 0; }\n"
+            "bool redundant_bits(int flags) { return (flags & flags) != 0; }\n"
+            "int redundant_min(int x) { return std::min(x, x); }\n"
+            "int redundant_choice(bool flag, int x) { return flag ? x : x; }\n"
+        )
+        self._git("add", "sample.cpp")
+        self._git("-c", "user.name=stryker-cxx", "-c", "user.email=stryker-cxx@example.invalid", "commit", "-q", "-m", "equivalent-suppression")
+        report = self.repo / "equivalent-suppression.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "false",
+            "--skip-initial-test",
+            "--report",
+            str(report),
+            "--mutators",
+            "LogicalOperator,ArithmeticOperator,BitwiseOperator,StandardLibraryCall,ConditionalExpression",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["totalMutants"], 5)
+        self.assertEqual(payload["ignored"], 5)
+        self.assertEqual(payload["killed"], 0)
+        reasons = {mut["ignoreReason"] for mut in payload["mutants"]}
+        self.assertIn("equivalent duplicate logical operand", reasons)
+        self.assertIn("equivalent arithmetic identity", reasons)
+        self.assertIn("equivalent duplicate bitwise operand", reasons)
+        self.assertIn("equivalent duplicate standard-library operands", reasons)
+        self.assertIn("equivalent duplicate conditional branches", reasons)
+        suppression = payload["execution"]["analysis"]["equivalentSuppression"]
+        self.assertEqual(suppression["mode"], "conservative")
+        self.assertEqual(suppression["suppressedMutants"], 5)
+
+    def test_equivalent_suppression_can_be_disabled(self) -> None:
+        self.source.write_text(
+            "bool redundant(bool flag) { return flag && flag; }\n"
+            "int identity(int x) { return x + 0; }\n"
+        )
+        self._git("add", "sample.cpp")
+        self._git("-c", "user.name=stryker-cxx", "-c", "user.email=stryker-cxx@example.invalid", "commit", "-q", "-m", "equivalent-suppression-off")
+        report = self.repo / "equivalent-suppression-off.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "false",
+            "--skip-initial-test",
+            "--report",
+            str(report),
+            "--mutators",
+            "LogicalOperator,ArithmeticOperator",
+            "--equivalent-suppression",
+            "off",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["totalMutants"], 2)
+        self.assertEqual(payload["ignored"], 0)
+        self.assertEqual(payload["killed"], 2)
+        self.assertEqual(payload["execution"]["analysis"]["equivalentSuppression"]["mode"], "off")
+
     def test_call_removal_mutator_removes_statement_level_calls(self) -> None:
         self.source.write_text(
             "void touched() {}\n"
@@ -1130,11 +1377,399 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(payload["mutants"][0]["original"], "touched()")
         self.assertEqual(payload["mutants"][0]["mutated"], "(void)0")
 
+    def test_statement_removal_mutator_discovers_simple_statements(self) -> None:
+        self.source.write_text(
+            "int x = 0;\n"
+            "int main() {\n"
+            "  int y = 1;\n"
+            "  return y;\n"
+            "}\n"
+        )
+        self._git("add", "sample.cpp")
+        self._git("-c", "user.name=stryker-cxx", "-c", "user.email=stryker-cxx@example.invalid", "commit", "-q", "-m", "statement-removal")
+
+        listed = self._cli(
+            "list-mutants",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--mutators",
+            "StatementRemoval",
+        )
+
+        self.assertEqual(listed.returncode, 0, listed.stderr + listed.stdout)
+        payload = json.loads(listed.stdout)
+        self.assertEqual({mut["mutator"] for mut in payload}, {"StatementRemoval"})
+        self.assertTrue(
+            any(
+                mut["original"].strip() == "int x = 0;" and mut["mutated"] == ";"
+                for mut in payload
+            )
+        )
+        self.assertTrue(
+            any(
+                mut["original"].strip() == "int y = 1;" and mut["mutated"] == ";"
+                for mut in payload
+            )
+        )
+
+    def test_block_removal_mutator_discovers_simple_blocks(self) -> None:
+        self.source.write_text(
+            "{ int x = 1; }\n"
+        )
+        self._git("add", "sample.cpp")
+        self._git("-c", "user.name=stryker-cxx", "-c", "user.email=stryker-cxx@example.invalid", "commit", "-q", "-m", "block-removal")
+
+        listed = self._cli(
+            "list-mutants",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--mutators",
+            "BlockRemoval",
+        )
+
+        self.assertEqual(listed.returncode, 0, listed.stderr + listed.stdout)
+        payload = json.loads(listed.stdout)
+        self.assertEqual({mut["mutator"] for mut in payload}, {"BlockRemoval"})
+        self.assertEqual(len(payload), 1)
+        self.assertEqual(payload[0]["original"], "{ int x = 1; }")
+        self.assertEqual(payload[0]["mutated"], "{}")
+
+    def test_statement_removal_mutator_runs_simple_statements(self) -> None:
+        self.source.write_text(
+            "int x = 0;\n"
+            "int main() {\n"
+            "  int y = 1;\n"
+            "  if (y == 1) {\n"
+            "    return y;\n"
+            "  }\n"
+            "}\n"
+        )
+        self._git("add", "sample.cpp")
+        self._git(
+            "-c",
+            "user.name=stryker-cxx",
+            "-c",
+            "user.email=stryker-cxx@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "statement-run",
+        )
+
+        report = self.repo / "statement-removal-run.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "false",
+            "--skip-initial-test",
+            "--report",
+            str(report),
+            "--mutators",
+            "StatementRemoval",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["totalMutants"], 2)
+        self.assertEqual(payload["killed"], 2)
+        self.assertEqual(payload["mutants"][0]["mutator"], "StatementRemoval")
+        self.assertEqual(payload["mutants"][0]["mutated"], ";")
+
+    def test_shift_operator_mutator_discovers_candidates(self) -> None:
+        self.source.write_text(
+            "int shifted(int x) {\n"
+            "  int a = x << 2;\n"
+            "  int b = x >> 1;\n"
+            "  return a + b;\n"
+            "}\n"
+        )
+        self._git("add", "sample.cpp")
+        self._git("-c", "user.name=stryker-cxx", "-c", "user.email=stryker-cxx@example.invalid", "commit", "-q", "-m", "shift-operator-fixture")
+
+        listed = self._cli(
+            "list-mutants",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--mutators",
+            "ShiftOperator",
+        )
+
+        self.assertEqual(listed.returncode, 0, listed.stderr + listed.stdout)
+        payload = json.loads(listed.stdout)
+        mutator_names = {mut["mutator"] for mut in payload}
+        self.assertEqual(mutator_names, {"ShiftOperator"})
+        pairs = {(mut["original"], mut["mutated"]) for mut in payload}
+        self.assertIn(("<<", ">>"), pairs)
+        self.assertIn((">>", "<<"), pairs)
+
+    def test_update_operator_mutator_discovers_candidates(self) -> None:
+        self.source.write_text(
+            "int updated(int x) {\n"
+            "  int i = 0;\n"
+            "  ++i;\n"
+            "  --i;\n"
+            "  i++;\n"
+            "  return --x;\n"
+            "}\n"
+        )
+        self._git("add", "sample.cpp")
+        self._git("-c", "user.name=stryker-cxx", "-c", "user.email=stryker-cxx@example.invalid", "commit", "-q", "-m", "update-operator-fixture")
+
+        listed = self._cli(
+            "list-mutants",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--mutators",
+            "UpdateOperator",
+        )
+
+        self.assertEqual(listed.returncode, 0, listed.stderr + listed.stdout)
+        payload = json.loads(listed.stdout)
+        self.assertTrue(payload)
+        self.assertEqual({mut["mutator"] for mut in payload}, {"UpdateOperator"})
+        pairs = {(mut["original"], mut["mutated"]) for mut in payload}
+        self.assertIn(("++", "--"), pairs)
+        self.assertIn(("--", "++"), pairs)
+
+    def test_loop_boundary_mutator_discovers_candidates(self) -> None:
+        self.source.write_text(
+            "void loops(int n) {\n"
+            "  for (int i = 0; i < n; ++i) {\n"
+            "  }\n"
+            "  while (n >= 0) {}\n"
+            "  do {\n"
+            "    --n;\n"
+            "  } while (n > 0);\n"
+            "}\n"
+        )
+        self._git("add", "sample.cpp")
+        self._git("-c", "user.name=stryker-cxx", "-c", "user.email=stryker-cxx@example.invalid", "commit", "-q", "-m", "loop-boundary-fixture")
+
+        listed = self._cli(
+            "list-mutants",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--mutators",
+            "LoopBoundary",
+        )
+
+        self.assertEqual(listed.returncode, 0, listed.stderr + listed.stdout)
+        payload = json.loads(listed.stdout)
+        self.assertEqual({mut["mutator"] for mut in payload}, {"LoopBoundary"})
+        pairs = {(mut["original"], mut["mutated"]) for mut in payload}
+        self.assertIn(("<", "<="), pairs)
+        self.assertIn((">=", ">"), pairs)
+        self.assertIn((">", ">="), pairs)
+
+    def test_loop_condition_mutator_discovers_candidates(self) -> None:
+        self.source.write_text(
+            "void loops(int n) {\n"
+            "  for (int i = 0; i < n; ++i) {\n"
+            "  }\n"
+            "  while (n >= 0) {}\n"
+            "  do {\n"
+            "    --n;\n"
+            "  } while (n > 0);\n"
+            "}\n"
+        )
+        self._git("add", "sample.cpp")
+        self._git("-c", "user.name=stryker-cxx", "-c", "user.email=stryker-cxx@example.invalid", "commit", "-q", "-m", "loop-condition-fixture")
+
+        listed = self._cli(
+            "list-mutants",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--mutators",
+            "LoopCondition",
+        )
+
+        self.assertEqual(listed.returncode, 0, listed.stderr + listed.stdout)
+        payload = json.loads(listed.stdout)
+        self.assertEqual({mut["mutator"] for mut in payload}, {"LoopCondition"})
+        pairs = {(mut["original"], mut["mutated"]) for mut in payload}
+        self.assertIn(("i < n", "!(i < n)"), pairs)
+        self.assertIn(("n >= 0", "!(n >= 0)"), pairs)
+        self.assertIn(("n > 0", "!(n > 0)"), pairs)
+
+    def test_expanded_cxx_catalog_discovers_opt_in_candidates(self) -> None:
+        self.source.write_text(
+            "#include <algorithm>\n"
+            "#ifdef FEATURE_FLAG\n"
+            "#endif\n"
+            "#if 1\n"
+            "#endif\n"
+            "struct Node { int value; void touch(); };\n"
+            "void objc(id obj) {\n"
+            "  [obj touch];\n"
+            "}\n"
+            "BOOL enabled() { return YES; }\n"
+            "kernel void shade(uint gid [[thread_position_in_grid]]) {}\n"
+            "void cases(Node node, Node* ptr, bool fail) {\n"
+            "  int low = std::min(1, 2);\n"
+            "  int high = std::max(1, 2);\n"
+            "  auto lower = std::lower_bound(values.begin(), values.end(), 2);\n"
+            "  auto upper = std::upper_bound(values.begin(), values.end(), 2);\n"
+            "  auto first = std::begin(values);\n"
+            "  auto last = std::end(values);\n"
+            "  std::sort(values.begin(), values.end());\n"
+            "  std::stable_sort(values.begin(), values.end());\n"
+            "  std::partition(values.begin(), values.end(), pred);\n"
+            "  std::stable_partition(values.begin(), values.end(), pred);\n"
+            "  bool sorted = std::is_sorted(values.begin(), values.end());\n"
+            "  bool heap = std::is_heap(values.begin(), values.end());\n"
+            "  auto order = std::memory_order_relaxed;\n"
+            "  int left = node.value;\n"
+            "  int right = ptr->value;\n"
+            "  bool boundary = left <= right;\n"
+            "  if (fail) { throw std::runtime_error(\"x\"); }\n"
+            "}\n"
+        )
+        self._git("add", "sample.cpp")
+        self._git("-c", "user.name=stryker-cxx", "-c", "user.email=stryker-cxx@example.invalid", "commit", "-q", "-m", "expanded-cxx-catalog-fixture")
+
+        listed = self._cli(
+            "list-mutants",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--mutators",
+            ",".join([
+                "ConditionalBoundary",
+                "StandardLibraryCall",
+                "MemoryOrder",
+                "MemberAccessOperator",
+                "ExceptionHandling",
+                "PreprocessorGuard",
+                "ObjCMessageSend",
+                "ObjCBoolLiteral",
+                "MetalThreadPosition",
+            ]),
+        )
+
+        self.assertEqual(listed.returncode, 0, listed.stderr + listed.stdout)
+        payload = json.loads(listed.stdout)
+        mutator_names = {mut["mutator"] for mut in payload}
+        self.assertEqual(
+            mutator_names,
+            {
+                "ConditionalBoundary",
+                "StandardLibraryCall",
+                "MemoryOrder",
+                "MemberAccessOperator",
+                "ExceptionHandling",
+                "PreprocessorGuard",
+                "ObjCMessageSend",
+                "ObjCBoolLiteral",
+                "MetalThreadPosition",
+            },
+        )
+        pairs = {(mut["mutator"], mut["original"], mut["mutated"]) for mut in payload}
+        self.assertIn(("ConditionalBoundary", "<=", "<"), pairs)
+        self.assertIn(("StandardLibraryCall", "std::min", "std::max"), pairs)
+        self.assertIn(("StandardLibraryCall", "std::max", "std::min"), pairs)
+        self.assertIn(("StandardLibraryCall", "std::lower_bound", "std::upper_bound"), pairs)
+        self.assertIn(("StandardLibraryCall", "std::upper_bound", "std::lower_bound"), pairs)
+        self.assertIn(("StandardLibraryCall", "std::begin", "std::end"), pairs)
+        self.assertIn(("StandardLibraryCall", "std::end", "std::begin"), pairs)
+        self.assertIn(("StandardLibraryCall", "std::sort", "std::stable_sort"), pairs)
+        self.assertIn(("StandardLibraryCall", "std::stable_sort", "std::sort"), pairs)
+        self.assertIn(("StandardLibraryCall", "std::partition", "std::stable_partition"), pairs)
+        self.assertIn(("StandardLibraryCall", "std::stable_partition", "std::partition"), pairs)
+        self.assertIn(("StandardLibraryCall", "std::is_sorted", "std::is_heap"), pairs)
+        self.assertIn(("StandardLibraryCall", "std::is_heap", "std::is_sorted"), pairs)
+        self.assertIn(("MemoryOrder", "std::memory_order_relaxed", "std::memory_order_seq_cst"), pairs)
+        self.assertIn(("MemberAccessOperator", ".", "->"), pairs)
+        self.assertIn(("MemberAccessOperator", "->", "."), pairs)
+        self.assertIn(("PreprocessorGuard", "ifdef", "ifndef"), pairs)
+        self.assertIn(("PreprocessorGuard", "1", "0"), pairs)
+        self.assertIn(("ObjCBoolLiteral", "YES", "NO"), pairs)
+        self.assertIn(("MetalThreadPosition", "thread_position_in_grid", "thread_position_in_threadgroup"), pairs)
+        self.assertTrue(any(mut["mutator"] == "ExceptionHandling" and mut["mutated"] == "(void)0;" for mut in payload))
+        self.assertTrue(any(mut["mutator"] == "ObjCMessageSend" and mut["mutated"] == "(void)0" for mut in payload))
+
+    def test_metal_source_catalog_discovers_address_space_candidates(self) -> None:
+        shader = self.repo / "shader.metal"
+        shader.write_text(
+            "kernel void shade(device float* out, constant float* scale, threadgroup float* scratch, uint gid [[thread_position_in_grid]]) {}\n"
+        )
+        self._git("add", "shader.metal")
+        self._git("-c", "user.name=stryker-cxx", "-c", "user.email=stryker-cxx@example.invalid", "commit", "-q", "-m", "metal-address-space-fixture")
+
+        listed = self._cli(
+            "list-mutants",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "shader.metal",
+            "--include-metal",
+            "--mutators",
+            "MetalAddressSpace",
+        )
+
+        self.assertEqual(listed.returncode, 0, listed.stderr + listed.stdout)
+        payload = json.loads(listed.stdout)
+        self.assertEqual({mut["mutator"] for mut in payload}, {"MetalAddressSpace"})
+        pairs = {(mut["original"], mut["mutated"]) for mut in payload}
+        self.assertIn(("device", "constant"), pairs)
+        self.assertIn(("constant", "device"), pairs)
+        self.assertIn(("threadgroup", "device"), pairs)
+        self.assertNotIn(("thread_position_in_grid", "thread_position_in_threadgroup"), pairs)
+
+    def test_conditional_expression_mutator_discovers_candidates(self) -> None:
+        self.source.write_text(
+            "int choose(int x) {\n"
+            "  return x ? 1 : 0;\n"
+            "}\n"
+        )
+        self._git("add", "sample.cpp")
+        self._git("-c", "user.name=stryker-cxx", "-c", "user.email=stryker-cxx@example.invalid", "commit", "-q", "-m", "conditional-expression-fixture")
+
+        listed = self._cli(
+            "list-mutants",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--mutators",
+            "ConditionalExpression",
+        )
+
+        self.assertEqual(listed.returncode, 0, listed.stderr + listed.stdout)
+        payload = json.loads(listed.stdout)
+        self.assertTrue(payload)
+        self.assertEqual({mut["mutator"] for mut in payload}, {"ConditionalExpression"})
+        pairs = {(mut["original"].strip(), mut["mutated"].strip()) for mut in payload}
+        self.assertTrue(("1 : 0", "0 : 1") in pairs or ("1 : 0", "0: 1") in pairs)
+
     def test_literal_mutators_are_available_as_opt_in_catalog_entries(self) -> None:
         self.source.write_text(
             "#include <cstddef>\n"
             "int value() { return 1; }\n"
             "void* ptr() { return nullptr; }\n"
+            'const char* label() { return "alpha"; }\n'
+            "char flag = 'A';\n"
+            "double scale = 0.5;\n"
         )
         self._git("add", "sample.cpp")
         self._git(
@@ -1163,7 +1798,7 @@ class CliContractTests(unittest.TestCase):
             "--report",
             str(report),
             "--mutators",
-            "IntegerLiteral,NullLiteral",
+            "IntegerLiteral,NullLiteral,CharacterLiteral,FloatingPointLiteral,StringLiteral",
             "--quiet",
         )
 
@@ -1172,6 +1807,9 @@ class CliContractTests(unittest.TestCase):
         mutators = {mut["mutator"] for mut in payload["mutants"]}
         self.assertIn("IntegerLiteral", mutators)
         self.assertIn("NullLiteral", mutators)
+        self.assertIn("CharacterLiteral", mutators)
+        self.assertIn("FloatingPointLiteral", mutators)
+        self.assertIn("StringLiteral", mutators)
 
     def test_clang_mode_runs_compile_database_fixture_when_bindings_are_available(self) -> None:
         try:
@@ -1285,6 +1923,320 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(payload["mutants"][0]["nodeKind"], "RETURN_STMT")
         self.assertEqual(payload["mutants"][0]["rewriteStrategy"], "clang-ast-direct-return")
 
+    def test_clang_ast_mode_generates_direct_conditional_expression_mutant_when_available(self) -> None:
+        try:
+            from clang import cindex  # type: ignore
+            cindex.Index.create()
+        except Exception as exc:
+            self.skipTest(f"optional libclang binding is unavailable: {exc}")
+
+        self.source.write_text(
+            "int choose(int x) { return x ? 1 : 0; }\n"
+        )
+        compile_db = [
+            {
+                "directory": str(self.repo),
+                "command": "clang++ -std=c++17 -c sample.cpp -o sample.o",
+                "file": str(self.source),
+            }
+        ]
+        (self.repo / "compile_commands.json").write_text(json.dumps(compile_db))
+        self._git("add", "sample.cpp", "compile_commands.json")
+        self._git(
+            "-c",
+            "user.name=stryker-cxx",
+            "-c",
+            "user.email=stryker-cxx@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "clang-ast-conditional-fixture",
+        )
+        report = self.repo / "clang-ast-conditional-expression.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "false",
+            "--skip-initial-test",
+            "--report",
+            str(report),
+            "--mutators",
+            "ConditionalExpression",
+            "--mode",
+            "clang-ast",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["totalMutants"], 1)
+        self.assertEqual(payload["mutants"][0]["original"].strip(), "1 : 0")
+        self.assertEqual(payload["mutants"][0]["mutated"].strip(), "0 : 1")
+        self.assertEqual(payload["mutants"][0]["nodeKind"], "CONDITIONAL_OPERATOR")
+        self.assertEqual(payload["mutants"][0]["rewriteStrategy"], "clang-ast-direct-conditional")
+
+    def test_clang_ast_mode_generates_direct_statement_range_mutant_when_available(self) -> None:
+        try:
+            from clang import cindex  # type: ignore
+            cindex.Index.create()
+        except Exception as exc:
+            self.skipTest(f"optional libclang binding is unavailable: {exc}")
+
+        self.source.write_text(
+            "int main() {\n"
+            "  int x = 1;\n"
+            "  return x;\n"
+            "}\n"
+        )
+        compile_db = [
+            {
+                "directory": str(self.repo),
+                "command": "clang++ -std=c++17 -c sample.cpp -o sample.o",
+                "file": str(self.source),
+            }
+        ]
+        (self.repo / "compile_commands.json").write_text(json.dumps(compile_db))
+        self._git("add", "sample.cpp", "compile_commands.json")
+        self._git(
+            "-c",
+            "user.name=stryker-cxx",
+            "-c",
+            "user.email=stryker-cxx@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "clang-ast-statement-fixture",
+        )
+        report = self.repo / "clang-ast-statement.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "false",
+            "--skip-initial-test",
+            "--report",
+            str(report),
+            "--mutators",
+            "StatementRemoval",
+            "--mode",
+            "clang-ast",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["totalMutants"], 1)
+        self.assertEqual(payload["mutants"][0]["original"].strip(), "int x = 1;")
+        self.assertEqual(payload["mutants"][0]["mutated"], ";")
+        self.assertEqual(payload["mutants"][0]["nodeKind"], "DECL_STMT")
+        self.assertEqual(payload["mutants"][0]["rewriteStrategy"], "clang-ast-direct-statement")
+
+    def test_clang_ast_mode_generates_direct_block_range_mutant_when_available(self) -> None:
+        try:
+            from clang import cindex  # type: ignore
+            cindex.Index.create()
+        except Exception as exc:
+            self.skipTest(f"optional libclang binding is unavailable: {exc}")
+
+        self.source.write_text(
+            "int main() {{ int x = 1; } return 0; }\n"
+        )
+        compile_db = [
+            {
+                "directory": str(self.repo),
+                "command": "clang++ -std=c++17 -c sample.cpp -o sample.o",
+                "file": str(self.source),
+            }
+        ]
+        (self.repo / "compile_commands.json").write_text(json.dumps(compile_db))
+        self._git("add", "sample.cpp", "compile_commands.json")
+        self._git(
+            "-c",
+            "user.name=stryker-cxx",
+            "-c",
+            "user.email=stryker-cxx@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "clang-ast-block-fixture",
+        )
+        report = self.repo / "clang-ast-block.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "false",
+            "--skip-initial-test",
+            "--report",
+            str(report),
+            "--mutators",
+            "BlockRemoval",
+            "--mode",
+            "clang-ast",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["totalMutants"], 1)
+        self.assertEqual(payload["mutants"][0]["original"], "{ int x = 1; }")
+        self.assertEqual(payload["mutants"][0]["mutated"], "{}")
+        self.assertEqual(payload["mutants"][0]["nodeKind"], "COMPOUND_STMT")
+        self.assertEqual(payload["mutants"][0]["rewriteStrategy"], "clang-ast-direct-block")
+
+    def test_clang_ast_mode_generates_direct_integer_and_null_literals(self) -> None:
+        try:
+            from clang import cindex  # type: ignore
+            cindex.Index.create()
+        except Exception as exc:
+            self.skipTest(f"optional libclang binding is unavailable: {exc}")
+
+        self.source.write_text(
+            "int value() { return 0; }\n"
+            "void* ptr() { return nullptr; }\n"
+        )
+        compile_db = [
+            {
+                "directory": str(self.repo),
+                "command": "clang++ -std=c++17 -c sample.cpp -o sample.o",
+                "file": str(self.source),
+            }
+        ]
+        (self.repo / "compile_commands.json").write_text(json.dumps(compile_db))
+        self._git("add", "sample.cpp", "compile_commands.json")
+        self._git(
+            "-c",
+            "user.name=stryker-cxx",
+            "-c",
+            "user.email=stryker-cxx@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "clang-ast-literal-fixture",
+        )
+        report = self.repo / "clang-ast-literals.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "false",
+            "--skip-initial-test",
+            "--report",
+            str(report),
+            "--mutators",
+            "IntegerLiteral,NullLiteral",
+            "--mode",
+            "clang-ast",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["totalMutants"], 2)
+        for mut in payload["mutants"]:
+            self.assertEqual(mut["rewriteStrategy"], "clang-ast-direct-literal")
+            self.assertIn(mut["nodeKind"], {"INTEGER_LITERAL", "CXX_NULL_PTR_LITERAL_EXPR", "GNU_NULL_EXPR", "DECL_REF_EXPR"})
+        int_mut = next(m for m in payload["mutants"] if m["mutator"] == "IntegerLiteral")
+        null_mut = next(m for m in payload["mutants"] if m["mutator"] == "NullLiteral")
+        self.assertEqual(int_mut["original"], "0")
+        self.assertEqual(int_mut["mutated"], "1")
+        self.assertEqual(null_mut["original"], "nullptr")
+        self.assertEqual(null_mut["mutated"], "NULL")
+
+    def test_clang_ast_mode_generates_direct_character_floating_and_string_literals_when_available(self) -> None:
+        try:
+            from clang import cindex  # type: ignore
+            cindex.Index.create()
+        except Exception as exc:
+            self.skipTest(f"optional libclang binding is unavailable: {exc}")
+
+        self.source.write_text(
+            "char c = 'A';\n"
+            "const char* s = \"x\";\n"
+            "double d = 0.5;\n"
+        )
+        compile_db = [
+            {
+                "directory": str(self.repo),
+                "command": "clang++ -std=c++17 -c sample.cpp -o sample.o",
+                "file": str(self.source),
+            }
+        ]
+        (self.repo / "compile_commands.json").write_text(json.dumps(compile_db))
+        self._git("add", "sample.cpp", "compile_commands.json")
+        self._git(
+            "-c",
+            "user.name=stryker-cxx",
+            "-c",
+            "user.email=stryker-cxx@example.invalid",
+            "commit",
+            "-q",
+            "clang-ast-extra-literal-fixture",
+        )
+        report = self.repo / "clang-ast-extra-literals.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "false",
+            "--skip-initial-test",
+            "--report",
+            str(report),
+            "--mutators",
+            "CharacterLiteral,FloatingPointLiteral,StringLiteral",
+            "--mode",
+            "clang-ast",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["totalMutants"], 3)
+        for mut in payload["mutants"]:
+            self.assertEqual(mut["rewriteStrategy"], "clang-ast-direct-literal")
+            self.assertIn(mut["nodeKind"], {"CHARACTER_LITERAL", "STRING_LITERAL", "FLOATING_LITERAL", "CXX_CHAR_LITERAL", "OBJC_CHAR_LITERAL", "CXX_STRING_LITERAL", "OBJC_STRING_LITERAL", "CXX_FLOATING_LITERAL"})
+
+        char_mut = next(m for m in payload["mutants"] if m["mutator"] == "CharacterLiteral")
+        float_mut = next(m for m in payload["mutants"] if m["mutator"] == "FloatingPointLiteral")
+        string_mut = next(m for m in payload["mutants"] if m["mutator"] == "StringLiteral")
+        self.assertEqual(char_mut["original"].strip(), "'A'")
+        self.assertEqual(char_mut["mutated"].strip(), "'x'")
+        self.assertEqual(float_mut["original"].strip(), "0.5")
+        self.assertEqual(float_mut["mutated"].strip(), "1.0")
+        self.assertEqual(string_mut["original"].strip(), '"x"')
+        self.assertEqual(string_mut["mutated"].strip(), '""')
+
     def test_git_worktree_mode_runs_without_mutating_source(self) -> None:
         report = self.repo / "worktree.json"
         original = self.source.read_text()
@@ -1374,7 +2326,10 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(markdown.returncode, 2, markdown.stderr + markdown.stdout)
         markdown_artifact = self.repo / "human.json.md"
         self.assertTrue(markdown_artifact.exists())
-        self.assertIn("# stryker-cxx report", markdown_artifact.read_text())
+        markdown_text = markdown_artifact.read_text()
+        self.assertIn("# stryker-cxx report", markdown_text)
+        self.assertIn("## Mutator summary", markdown_text)
+        self.assertIn("| mutator | total | killed | survived | build errors | check errors | no coverage | timeouts | ignored | score |", markdown_text)
 
         sarif_report = self.repo / "code-scanning.json"
         sarif = self._cli(
@@ -1424,6 +2379,31 @@ class CliContractTests(unittest.TestCase):
         annotations_artifact = self.repo / "annotations.json.github-annotations"
         self.assertTrue(annotations_artifact.exists())
         self.assertIn("::warning file=sample.cpp,line=1,", annotations_artifact.read_text())
+
+        error_annotations_report = self.repo / "error-annotations.json"
+        error_annotations = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "false",
+            "--test-command",
+            "true",
+            "--skip-initial-test",
+            "--report",
+            str(error_annotations_report),
+            "--max-mutants",
+            "1",
+            "--format",
+            "github-annotations",
+            "--quiet",
+        )
+        self.assertEqual(error_annotations.returncode, 2, error_annotations.stderr + error_annotations.stdout)
+        error_annotations_artifact = self.repo / "error-annotations.json.github-annotations"
+        self.assertTrue(error_annotations_artifact.exists())
+        self.assertIn("::error file=sample.cpp,line=1,", error_annotations_artifact.read_text())
 
         html_report = self.repo / "page.json"
         html = self._cli(
@@ -1536,6 +2516,14 @@ class CliContractTests(unittest.TestCase):
             "1",
             "--dashboard-retention-days",
             "14",
+            "--dashboard-project",
+            "openclaw/stryker-cxx-fixture",
+            "--dashboard-branch",
+            "feature/dashboard",
+            "--dashboard-commit",
+            "abc123",
+            "--dashboard-build-url",
+            "https://ci.example/build/123",
             "--dashboard-auth-token-env",
             "STRYKER_CXX_DASHBOARD_TOKEN",
             "--max-mutants",
@@ -1548,8 +2536,19 @@ class CliContractTests(unittest.TestCase):
         payload = json.loads(dashboard.read_text())
         self.assertEqual(payload["schemaVersion"], "stryker-cxx.dashboard.v1")
         self.assertEqual(payload["dashboardVersion"], "1")
+        self.assertEqual(payload["toolVersion"], "0.1.0")
         self.assertEqual(payload["retention"]["days"], 14)
+        self.assertFalse(payload["privacy"]["sourceFilesIncluded"])
+        self.assertTrue(payload["privacy"]["secretValuesRedacted"])
+        self.assertEqual(payload["project"], "openclaw/stryker-cxx-fixture")
+        self.assertEqual(payload["branch"], "feature/dashboard")
+        self.assertEqual(payload["commit"], "abc123")
+        self.assertIn("runId", payload)
+        self.assertEqual(payload["buildUrl"], "https://ci.example/build/123")
+        self.assertEqual(payload["provenance"]["ci"]["buildUrl"], "https://ci.example/build/123")
         self.assertEqual(payload["provenance"]["upload"]["authTokenEnv"], "STRYKER_CXX_DASHBOARD_TOKEN")
+        self.assertEqual(payload["provenance"]["upload"]["status"], "disabled")
+        self.assertIn(payload["thresholdStatus"], {"high", "low", "break"})
         self.assertEqual(payload["counts"]["totalMutants"], 1)
 
     def test_check_command_failure_is_reported_separately(self) -> None:

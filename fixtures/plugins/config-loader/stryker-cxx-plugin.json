@@ -1,0 +1,9 @@
+{
+  "name": "config-loader-fixture",
+  "version": "0.1.0",
+  "capabilities": {
+    "configLoader": {
+      "command": "python3 -c \"import json; print(json.dumps({'execution': {'maxMutants': 1, 'skipInitialTest': True}}))\""
+    }
+  }
+}

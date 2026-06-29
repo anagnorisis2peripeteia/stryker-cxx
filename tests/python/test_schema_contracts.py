@@ -150,6 +150,7 @@ class TestContracts(unittest.TestCase):
         rep = self._base_report()
         payload = _report_dict(rep)
         self.assertEqual(payload["schemaVersion"], "stryker-cxx.report.v1")
+        self.assertEqual(payload["toolVersion"], "0.1.0")
         self.assertEqual(payload["dryRun"]["status"], "PASSED")
         self.assertEqual(payload["execution"]["effectiveTimeoutMs"], 6200)
         self.assertEqual(payload["thresholds"]["break"], 0.7)
@@ -188,10 +189,19 @@ class TestContracts(unittest.TestCase):
 
         self.assertEqual(payload["schemaVersion"], "stryker-cxx.dashboard.v1")
         self.assertEqual(payload["dashboardVersion"], "1")
+        self.assertEqual(payload["toolVersion"], "0.1.0")
         self.assertEqual(payload["retention"]["days"], 14)
         self.assertEqual(payload["retention"]["policy"], "delete-after-14-days")
+        self.assertFalse(payload["privacy"]["sourceFilesIncluded"])
+        self.assertTrue(payload["privacy"]["mutantSourceSnippetsIncluded"])
+        self.assertTrue(payload["privacy"]["secretValuesRedacted"])
         self.assertEqual(payload["provenance"]["configHash"], "abc123")
+        self.assertEqual(payload["provenance"]["toolVersion"], "0.1.0")
         self.assertEqual(payload["provenance"]["upload"]["authTokenEnv"], "STRYKER_CXX_DASHBOARD_TOKEN")
+        self.assertEqual(payload["thresholdStatus"], "high")
+        self.assertEqual(payload["thresholds"]["status"], "high")
+        self.assertIn("runId", payload)
+        self.assertEqual(payload["provenance"]["upload"]["status"], "notAttempted")
 
     def test_build_system_adapter_commands(self) -> None:
         cmake = _adapter_commands("cmake", "build", "all", None, "Foo.*")
@@ -289,6 +299,13 @@ class TestContracts(unittest.TestCase):
         payload.pop("totalMutants")
         errors = validate_report(payload)
         self.assertTrue(any("totalMutants" in item for item in errors))
+
+    def test_report_validator_catches_missing_tool_version(self) -> None:
+        rep = self._base_report()
+        payload = _report_dict(rep)
+        payload.pop("toolVersion")
+        errors = validate_report(payload)
+        self.assertTrue(any("toolVersion" in item for item in errors))
 
     def test_require_report_guard(self) -> None:
         rep = self._base_report()
@@ -410,8 +427,23 @@ class TestPersistence(unittest.TestCase):
 class TestClangAstConfirmation(unittest.TestCase):
     def test_ast_classifier_confirms_mutator_specific_cursor_kinds(self) -> None:
         self.assertTrue(_clang_mutation_is_ast_confirmed("EqualityOperator", ["UNEXPOSED_EXPR", "BINARY_OPERATOR"]))
+        self.assertTrue(_clang_mutation_is_ast_confirmed("ShiftOperator", ["UNEXPOSED_EXPR", "BINARY_OPERATOR"]))
+        self.assertTrue(_clang_mutation_is_ast_confirmed("UpdateOperator", ["UNEXPOSED_EXPR", "UNARY_OPERATOR"]))
         self.assertTrue(_clang_mutation_is_ast_confirmed("CallRemoval", ["CALL_EXPR", "COMPOUND_STMT"]))
+        self.assertTrue(_clang_mutation_is_ast_confirmed("StatementRemoval", ["EXPR_STMT", "COMPOUND_STMT"]))
+        self.assertTrue(_clang_mutation_is_ast_confirmed("BlockRemoval", ["COMPOUND_STMT", "STMT_EXPR"]))
         self.assertTrue(_clang_mutation_is_ast_confirmed("ReturnValue", ["RETURN_STMT", "FUNCTION_DECL"]))
+        self.assertTrue(_clang_mutation_is_ast_confirmed("ConditionalExpression", ["COMPOUND_STMT", "CONDITIONAL_OPERATOR"]))
+        self.assertTrue(_clang_mutation_is_ast_confirmed("LoopBoundary", ["FOR_STMT", "BINARY_OPERATOR"]))
+        self.assertTrue(_clang_mutation_is_ast_confirmed("LoopCondition", ["WHILE_STMT", "BINARY_OPERATOR"]))
+        self.assertTrue(_clang_mutation_is_ast_confirmed("StandardLibraryCall", ["CALL_EXPR", "DECL_REF_EXPR"]))
+        self.assertTrue(_clang_mutation_is_ast_confirmed("MemoryOrder", ["CALL_EXPR", "DECL_REF_EXPR"]))
+        self.assertTrue(_clang_mutation_is_ast_confirmed("MemberAccessOperator", ["MEMBER_REF_EXPR", "UNEXPOSED_EXPR"]))
+        self.assertTrue(_clang_mutation_is_ast_confirmed("ExceptionHandling", ["CXX_THROW_EXPR", "COMPOUND_STMT"]))
+        self.assertTrue(_clang_mutation_is_ast_confirmed("ObjCMessageSend", ["OBJC_MESSAGE_EXPR", "COMPOUND_STMT"]))
+        self.assertTrue(_clang_mutation_is_ast_confirmed("ObjCBoolLiteral", ["OBJC_BOOL_LITERAL_EXPR"]))
+        self.assertTrue(_clang_mutation_is_ast_confirmed("MetalThreadPosition", ["PARM_DECL", "UNEXPOSED_ATTR"]))
+        self.assertTrue(_clang_mutation_is_ast_confirmed("MetalAddressSpace", ["PARM_DECL", "TYPE_REF"]))
         self.assertFalse(_clang_mutation_is_ast_confirmed("EqualityOperator", ["TEMPLATE_REF", "TYPE_REF"]))
         self.assertEqual(_clang_primary_node_kind("EqualityOperator", ["UNEXPOSED_EXPR", "BINARY_OPERATOR"]), "BINARY_OPERATOR")
 
@@ -453,6 +485,161 @@ class TestClangAstConfirmation(unittest.TestCase):
             self.assertEqual(mutants[0].nodeKind, "BINARY_OPERATOR")
             self.assertEqual(mutants[0].rewriteStrategy, "clang-ast-source-range")
             self.assertEqual(mutants[0].sourceRange["kind"], "BINARY_OPERATOR")
+
+    def test_clang_ast_first_discovery_generates_direct_conditional_expression_mutant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "sample.cpp"
+            source.write_text("int choose(bool flag) { return flag ? 1 : 2; }\n")
+            ranges = [
+                {
+                    "kind": "CONDITIONAL_OPERATOR",
+                    "startLine": 1,
+                    "startColumn": 1,
+                    "endLine": 1,
+                    "endColumn": 48,
+                }
+            ]
+
+            mutants = _discover_clang_ast_first(
+                tmp,
+                "sample.cpp",
+                None,
+                ["ConditionalExpression"],
+                ranges,
+            )
+
+            conditional_mutants = [mut for mut in mutants if mut.mutator == "ConditionalExpression"]
+            self.assertTrue(
+                any(mut.original == "flag ? 1 : 2" and mut.mutated == "flag ? 2 : 1" for mut in conditional_mutants)
+            )
+            self.assertTrue(all(mut.nodeKind == "CONDITIONAL_OPERATOR" for mut in conditional_mutants))
+            self.assertTrue(all(mut.rewriteStrategy == "clang-ast-direct-conditional" for mut in conditional_mutants))
+            self.assertTrue(all(mut.sourceRange["kind"] == "CONDITIONAL_OPERATOR" for mut in conditional_mutants))
+
+    def test_clang_ast_first_discovery_handles_loop_boundary_and_condition(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "sample.cpp"
+            source.write_text("for (int i = 0; i < 10; ++i) {}\nwhile (i >= 0) {}\n")
+            ranges = [
+                {
+                    "kind": "FOR_STMT",
+                    "startLine": 1,
+                    "startColumn": 1,
+                    "endLine": 1,
+                    "endColumn": 31,
+                },
+                {
+                    "kind": "WHILE_STMT",
+                    "startLine": 2,
+                    "startColumn": 1,
+                    "endLine": 2,
+                    "endColumn": 18,
+                },
+            ]
+
+            loop_boundary_mutants = _discover_clang_ast_first(
+                tmp,
+                "sample.cpp",
+                None,
+                ["LoopBoundary"],
+                ranges,
+            )
+            self.assertTrue(any(mut.mutator == "LoopBoundary" and mut.original == "<" for mut in loop_boundary_mutants))
+            self.assertTrue(any(mut.nodeKind == "FOR_STMT" for mut in loop_boundary_mutants))
+
+            loop_condition_mutants = _discover_clang_ast_first(
+                tmp,
+                "sample.cpp",
+                None,
+                ["LoopCondition"],
+                ranges,
+            )
+            self.assertTrue(any(mut.mutator == "LoopCondition" and mut.original == "i < 10" for mut in loop_condition_mutants))
+            self.assertTrue(any(mut.mutator == "LoopCondition" and mut.original == "i >= 0" for mut in loop_condition_mutants))
+            self.assertEqual(all(mut.rewriteStrategy == "clang-ast-source-range" for mut in loop_boundary_mutants + loop_condition_mutants), True)
+
+    def test_clang_ast_first_discovery_handles_expanded_source_range_mutators(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "sample.cpp"
+            source.write_text("void f(Node node, bool fail) { node.value; if (fail) { throw; } }\n")
+            ranges = [
+                {
+                    "kind": "MEMBER_REF_EXPR",
+                    "startLine": 1,
+                    "startColumn": 1,
+                    "endLine": 1,
+                    "endColumn": 68,
+                },
+                {
+                    "kind": "CXX_THROW_EXPR",
+                    "startLine": 1,
+                    "startColumn": 1,
+                    "endLine": 1,
+                    "endColumn": 68,
+                },
+            ]
+
+            member_mutants = _discover_clang_ast_first(
+                tmp,
+                "sample.cpp",
+                None,
+                ["MemberAccessOperator"],
+                ranges,
+            )
+            self.assertTrue(any(mut.mutator == "MemberAccessOperator" and mut.original == "." for mut in member_mutants))
+            self.assertEqual(all(mut.rewriteStrategy == "clang-ast-source-range" for mut in member_mutants), True)
+
+            exception_mutants = _discover_clang_ast_first(
+                tmp,
+                "sample.cpp",
+                None,
+                ["ExceptionHandling"],
+                ranges,
+            )
+            self.assertTrue(any(mut.mutator == "ExceptionHandling" and mut.mutated == "(void)0;" for mut in exception_mutants))
+            self.assertEqual(all(mut.rewriteStrategy == "clang-ast-source-range" for mut in exception_mutants), True)
+
+            objc_source = Path(tmp) / "sample.mm"
+            objc_source.write_text("BOOL enabled() { return YES; }\n")
+            objc_ranges = [
+                {
+                    "kind": "OBJC_BOOL_LITERAL_EXPR",
+                    "startLine": 1,
+                    "startColumn": 1,
+                    "endLine": 1,
+                    "endColumn": 31,
+                }
+            ]
+            objc_mutants = _discover_clang_ast_first(
+                tmp,
+                "sample.mm",
+                None,
+                ["ObjCBoolLiteral"],
+                objc_ranges,
+            )
+            self.assertTrue(any(mut.mutator == "ObjCBoolLiteral" and mut.original == "YES" for mut in objc_mutants))
+            self.assertEqual(all(mut.rewriteStrategy == "clang-ast-source-range" for mut in objc_mutants), True)
+
+            metal_source = Path(tmp) / "shader.metal"
+            metal_source.write_text("kernel void shade(device float* out) {}\n")
+            metal_ranges = [
+                {
+                    "kind": "PARM_DECL",
+                    "startLine": 1,
+                    "startColumn": 1,
+                    "endLine": 1,
+                    "endColumn": 41,
+                }
+            ]
+            metal_mutants = _discover_clang_ast_first(
+                tmp,
+                "shader.metal",
+                None,
+                ["MetalAddressSpace"],
+                metal_ranges,
+            )
+            self.assertTrue(any(mut.mutator == "MetalAddressSpace" and mut.original == "device" for mut in metal_mutants))
+            self.assertEqual(all(mut.rewriteStrategy == "clang-ast-source-range" for mut in metal_mutants), True)
 
 
 if __name__ == "__main__":

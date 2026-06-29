@@ -48,12 +48,18 @@
       "properties": {
         "buildCommand": { "type": "string" },
         "checkCommand": { "type": "string" },
-        "checkSystem": { "enum": ["clang-tidy", "cppcheck"] },
+        "checkSystem": { "enum": ["clang", "clang++", "clang-tidy", "cppcheck"] },
         "checkArgs": { "type": "string" },
         "testCommand": { "type": "string" },
-        "buildSystem": { "enum": ["cmake", "ctest", "ninja", "make", "meson", "bazel"] },
+        "buildSystem": { "enum": ["cmake", "ctest", "ninja", "make", "meson", "bazel", "xcodebuild"] },
         "buildDir": { "type": "string" },
         "buildTarget": { "type": "string" },
+        "xcodeWorkspace": { "type": "string" },
+        "xcodeProject": { "type": "string" },
+        "xcodeScheme": { "type": "string" },
+        "xcodeConfiguration": { "type": "string" },
+        "xcodeSdk": { "type": "string" },
+        "xcodeDestination": { "type": "string" },
         "testTarget": { "type": "string" },
         "testFilter": { "type": "string" },
         "testFramework": { "enum": ["gtest", "googletest", "catch2", "doctest", "xctest"] },
@@ -117,6 +123,7 @@
           ]
         },
         "workerTmpDir": { "type": "string" },
+        "workerLabel": { "type": "string" },
         "env": {
           "oneOf": [
             { "type": "object", "additionalProperties": { "type": "string" } },
@@ -156,12 +163,17 @@
             { "type": "array", "items": { "type": "string" } }
           ]
         },
+        "equivalentSuppression": { "enum": ["off", "conservative", "aggressive"] },
         "plugins": { "type": "array", "items": { "type": "string" } },
         "pluginDirs": { "type": "array", "items": { "type": "string" } },
         "reporters": { "type": "array", "items": { "type": "string" } },
         "dashboardExport": { "type": "string" },
         "dashboardUploadUrl": { "type": "string", "format": "uri" },
         "dashboardVersion": { "type": "string" },
+        "dashboardProject": { "type": "string" },
+        "dashboardBranch": { "type": "string" },
+        "dashboardCommit": { "type": "string" },
+        "dashboardBuildUrl": { "type": "string" },
         "dashboardRetentionDays": {
           "oneOf": [
             { "type": "integer", "minimum": 1 },

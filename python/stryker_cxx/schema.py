@@ -6,6 +6,7 @@ from typing import Any, Iterable
 
 REPORT_SCHEMA_VERSION = "stryker-cxx.report.v1"
 MTE_SCHEMA_VERSION = "2.0"
+TOOL_VERSION = "0.1.0"
 
 
 def _expect(obj: Any, key: str, kind: type | tuple[type, ...] | None = None, *, require: bool = True) -> bool:
@@ -42,6 +43,7 @@ def validate_report(payload: dict[str, Any]) -> list[str]:
 
     required_scalar = {
         "tool": str,
+        "toolVersion": str,
         "repo": str,
         "base": (str, type(None)),
         "startedAt": str,
@@ -50,7 +52,7 @@ def validate_report(payload: dict[str, Any]) -> list[str]:
         "timeoutSeconds": (int, type(None)),
     }
     for key, expected in required_scalar.items():
-        if not _expect(payload, key, expected, require=False):
+        if not _expect(payload, key, expected):
             errors.append(_collect(key, f"expected type {expected}"))
 
     required_ints = {
@@ -108,6 +110,31 @@ def validate_report(payload: dict[str, Any]) -> list[str]:
         for key, expected in optional_exec_types.items():
             if key in exec_ctx and not isinstance(exec_ctx.get(key), expected):
                 errors.append(_collect(f"execution.{key}", f"expected type {expected}"))
+        analysis = exec_ctx.get("analysis")
+        if analysis is not None:
+            if not isinstance(analysis, dict):
+                errors.append(_collect("execution.analysis", "expected object"))
+            else:
+                if "engine" in analysis and not isinstance(analysis.get("engine"), str):
+                    errors.append(_collect("execution.analysis.engine", "expected string"))
+                if "macroRejectedMutants" in analysis and not isinstance(analysis.get("macroRejectedMutants"), int):
+                    errors.append(_collect("execution.analysis.macroRejectedMutants", "expected integer"))
+                if "macroRejections" in analysis and not isinstance(analysis.get("macroRejections"), list):
+                    errors.append(_collect("execution.analysis.macroRejections", "expected array"))
+                suppression = analysis.get("equivalentSuppression")
+                if suppression is not None:
+                    if not isinstance(suppression, dict):
+                        errors.append(_collect("execution.analysis.equivalentSuppression", "expected object"))
+                    else:
+                        mode = suppression.get("mode")
+                        if not isinstance(mode, str):
+                            errors.append(_collect("execution.analysis.equivalentSuppression.mode", "expected string"))
+                        elif mode not in {"off", "conservative", "aggressive"}:
+                            errors.append(_collect("execution.analysis.equivalentSuppression.mode", f"unexpected mode {mode!r}"))
+                        if "suppressedMutants" in suppression and not isinstance(suppression.get("suppressedMutants"), int):
+                            errors.append(_collect("execution.analysis.equivalentSuppression.suppressedMutants", "expected integer"))
+                        if "suppressions" in suppression and not isinstance(suppression.get("suppressions"), list):
+                            errors.append(_collect("execution.analysis.equivalentSuppression.suppressions", "expected array"))
         batching = exec_ctx.get("batching")
         if batching is not None:
             if not isinstance(batching, dict):
@@ -123,7 +150,7 @@ def validate_report(payload: dict[str, Any]) -> list[str]:
             if not isinstance(dashboard, dict):
                 errors.append(_collect("execution.dashboard", "expected object"))
             else:
-                for key in ("version", "exportPath"):
+                for key in ("version", "exportPath", "project", "branch", "commit", "buildUrl"):
                     if key in dashboard and not isinstance(dashboard.get(key), (str, type(None))):
                         errors.append(
                             _collect(f"execution.dashboard.{key}", "expected string or null")
@@ -186,7 +213,7 @@ def validate_report(payload: dict[str, Any]) -> list[str]:
                             "expected object",
                         )
                     )
-                for key in ("worktreeMode", "artifactDir", "workerTmpDir", "network"):
+                for key in ("worktreeMode", "artifactDir", "workerTmpDir", "workerLabel", "network"):
                     if key in resource and not isinstance(resource.get(key), (str, type(None))):
                         errors.append(_collect(f"execution.resourceIsolation.{key}", "expected string or null"))
                 if "environmentKeys" in resource:

@@ -12,7 +12,11 @@
   "reporters": [
     {
       "name": "copy-json",
-      "command": "cp \"$STRYKER_CXX_REPORT\" stryker-cxx-plugin-report.json"
+      "command": "cp \"$STRYKER_CXX_REPORT\" stryker-cxx-plugin-report.json",
+      "metadata": {
+        "format": "json",
+        "source": "fixture"
+      }
     }
   ]
 }

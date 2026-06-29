@@ -37,4 +37,6 @@ The JS adapter accepts both:
 - `RuntimeError`
 
 `Ignored` mutants remain visible in the MTE payload but are excluded from
-adapter summary score calculation.
+adapter summary score calculation. A mutant can become ignored through
+Stryker-style source comments or through native equivalent/noise suppression
+recorded under `execution.analysis.equivalentSuppression` in the wrapper report.

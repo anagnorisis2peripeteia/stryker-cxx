@@ -32,6 +32,15 @@ npm test
 The clang fixture is skipped when the binding is unavailable and exercised in
 CI by the `optional libclang fixture` job.
 
+## CI and release coverage
+
+Pull requests and pushes run the cross-platform full-spec validation matrix on
+Ubuntu and macOS with Node.js 20 and 22, plus an optional libclang fixture job.
+
+Release tags named `v*` run the same validation before publishing to npm with
+provenance. Manual release workflow runs default to a dry-run package publish
+unless the repository maintainer intentionally dispatches a real publish.
+
 ## Compatibility contract
 
 Changes must preserve the first-parity contract in `docs/spec.md`:

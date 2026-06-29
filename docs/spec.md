@@ -44,6 +44,7 @@ Marmorkrebs provider. That requires the additional components listed in
 - `--skip-initial-test`
 - `--dry-run-only`
 - `--timeout-factor`, `--timeout-constant-ms`
+- `--equivalent-suppression off|conservative|aggressive`
 - `--check-command`
 - `--check-system clang-tidy|cppcheck`, `--check-args`
 - `--skip-tests`
@@ -55,14 +56,16 @@ Marmorkrebs provider. That requires the additional components listed in
 - local plugin manifests via `--plugin` / `--plugin-dir`
 - plugin-contributed token mutators
 - reporter selection metadata via `--reporter`
-- build/test adapter synthesis via `--build-system cmake|ctest|ninja|make|meson|bazel`
+- build/test adapter synthesis via
+  `--build-system cmake|ctest|ninja|make|meson|bazel|xcodebuild`
 - adapter controls: `--build-dir`, `--build-target`, `--test-target`,
-  `--test-filter`
+  `--test-filter`, `--xcode-workspace`, `--xcode-project`, `--xcode-scheme`,
+  `--xcode-configuration`, `--xcode-sdk`, `--xcode-destination`
 - framework adapter controls: `--test-framework gtest|catch2|doctest|xctest`,
   `--test-binary`, `--xctest-bundle`, `--xctest-destination`,
   `--xctest-only-testing`, `--xctest-skip-testing`
-- baseline maintenance commands: `baseline-info`, `baseline-merge`,
-  `baseline-prune`
+- baseline maintenance commands: `baseline-info`, `baseline-history`,
+  `baseline-merge`, `baseline-prune`
 - dashboard export/upload: `--dashboard-export`, `--dashboard-upload-url`
 - executable plugin hooks: `preRun`, `postRun`, reporter commands
 - plugin provider hooks for build/check/test runner phases and coverage files
@@ -152,6 +155,7 @@ Required top-level fields:
 
 - `schemaVersion = "stryker-cxx.report.v1"`
 - `tool = "stryker-cxx"`
+- `toolVersion`
 - `repo`, `base`
 - `startedAt`, `completedAt`
 - `threshold`
@@ -253,26 +257,46 @@ Additional implemented mutators:
 - `ArithmeticOperator`
 - `AssignmentOperator`
 - `BitwiseOperator`
+- `ShiftOperator`
+- `UpdateOperator`
+- `ConditionalExpression`
 - `UnaryOperator`
 - `ReturnValue`
 - `IntegerLiteral`
 - `NullLiteral`
+- `CharacterLiteral`
+- `FloatingPointLiteral`
+- `StringLiteral`
 - `CallRemoval`
+- `StatementRemoval`
+- `BlockRemoval`
+- `LoopBoundary`
+- `LoopCondition`
+- `StandardLibraryCall`
+- `MemoryOrder`
+- `MemberAccessOperator`
+- `ExceptionHandling`
+- `PreprocessorGuard`
+- `ObjCMessageSend`
+- `ObjCBoolLiteral`
+- `MetalThreadPosition`
+- `MetalAddressSpace`
 - clang-ast direct source-range candidates for single-line boolean literals and
-  boolean return statements
+  boolean returns, ternary conditional-expression branch swaps,
+  loop-boundary/condition rewrites, statement removals, and block removals
 
 Remaining for parity:
 
-- richer baseline visualization and history UX beyond the current
-  info/merge/prune commands;
-- richer mixed-mutant batching heuristics beyond current overlap grouping,
-  split attribution, and isolated parallel batch probes;
-- larger C/C++ mutator catalog beyond current operator, call, integer, null,
-  and boolean-return mutators;
+- richer mixed-mutant batching heuristics beyond current source-proximity,
+  source-structure isolation, split attribution, and isolated parallel batch
+  probes;
+- richer C/C++ mutator catalog variants beyond the current conditional-boundary,
+  operator, statement, literal, standard-library, memory-order, member-access,
+  preprocessor, ObjC++, and Metal families;
 - richer AST-first source rewrite coverage and macro-safe rewrites;
 - richer plugin compatibility surface beyond local command-provider hooks;
-- richer checker/build-system adapters beyond the current generic, checker, and
-  provider hooks;
+- richer checker/build-system adapters beyond the current generic, Xcode,
+  checker, and provider hooks;
 - richer hosted-dashboard service protocol and CI annotation polish beyond the
   current explicit upload auth/provenance/retention conventions;
 - deeper project integrations beyond generic build/test framework adapters;
@@ -307,23 +331,30 @@ surface that still needs work for `full parity` mode.
   sharding, coverage selection, checker phase, and threshold bands.
 - Plugin surfaces for token mutators, reporter hooks, and runner/checker/test
   providers.
+- Config-loader plugin capability via `capabilities.configLoader`, applying
+  JSON manifests before defaults are finalized.
 - Basic dashboard upload/export policy plus explicit auth/env redaction metadata.
 - PR/CI-facing reporting including Markdown/HTML/SARIF/GitHub annotations and
   mutation element projection.
 - Core mutator families and ignore-comment support used by `stryker-cxx`/Marmorkrebs.
+- Conservative equivalent/noise suppression for generated-code markers,
+  duplicate logical/bitwise operands, duplicate conditional branches,
+  arithmetic identity rewrites, and duplicate-operand standard-library min/max
+  calls, with explicit `off` and `aggressive` modes.
 - Concrete CI validation workflow entry (`npm run validate:full-spec`) and
   contract-schema checks in-repo without network.
 
 ### ⚠️ remaining for parity to mimic upstream Stryker family behavior
 
-- Full mutator breadth (e.g. richer control-flow, statement/block, loop, and
-  standard-library style mutations) is not complete.
-- Equivalent-mutant and deeper equivalent-noise suppression is limited to
-  scoped ignore-comment controls.
+- Full mutator breadth beyond the implemented focused families is not complete.
+- Equivalent-mutant and deeper equivalent-noise suppression includes conservative
+  built-in filters, but perfect equivalent-mutant detection is not claimed.
 - Advanced test orchestration features beyond local command synthesis are still
   minimal (no built-in multi-process distributed runner framework).
-- Objective-C++ and Metal AST-native candidate synthesis is intentionally partial and
-  still follows the token-path default for most runs.
+- Objective-C++ and Metal AST-native candidate synthesis covers selected message
+  sends, Objective-C boolean literals, thread-position attributes, and Metal
+  address-space qualifiers, but remains partial and still follows the token-path
+  default for most runs.
 - External ecosystem parity items that are tool-family dependent (for example
   full StrykerJS/Stryker.NET reporter ecosystems, plugin hosts, and hosted dashboard
   orchestration semantics) remain intentionally outside this repo’s responsibility.
@@ -456,8 +487,8 @@ Implemented CLI/config:
 - `--baseline-branch`;
 - `--write-baseline`;
 - `--clear-baseline`;
-- `baseline-info`, `baseline-merge`, and `baseline-prune` maintenance
-  commands;
+- `baseline-info`, `baseline-history`, `baseline-merge`, and
+  `baseline-prune` maintenance commands;
 
 The native report should include:
 
@@ -476,6 +507,9 @@ Baseline maintenance output should include:
 
 - entry counts by status;
 - entry counts by branch;
+- newest-first history entries with update timestamps, branch, file, line,
+  mutator, and status;
+- by-day status buckets for cache age/history visualization;
 - oldest/newest update timestamps;
 - optional repo file-existence diagnostics for stale entries.
 
@@ -505,7 +539,10 @@ Current constraints:
 - batching requires `--worktree-mode copy` or `--worktree-mode git-worktree`;
 - batch probes can run in parallel, but report entries are emitted in stable
   batch order for deterministic attribution;
-- same-line mutants are not batched;
+- same-line and adjacent-line mutants in the same file are not batched;
+- source-structure mutators such as statement/block/call removal, preprocessor
+  guard flips, exception removal, and Objective-C message-send removal are
+  isolated from mixed batches;
 - failed/killed batches are rerun as individual mutants.
 
 ### Expanded C/C++ mutator catalog
@@ -513,19 +550,31 @@ Current constraints:
 The current mutators cover the first useful set. Full parity requires broader
 C/C++ semantics.
 
-Additional mutator targets:
+Implemented opt-in mutator targets:
 
-- integer, floating-point, character, string, and null literal replacement;
-- update operator replacement and removal;
-- ternary/conditional-expression mutation;
-- statement and block removal where syntactically safe;
-- loop boundary and loop condition mutation;
-- member access and pointer/member-access variants where safe;
-- exception and error-path mutation;
-- preprocessor-guard mutation for simple `#if`/`#ifdef` cases;
-- standard-library call substitutions where low-noise rules exist;
-- Objective-C++ message-send mutation where source parsing supports it;
-- Metal shader numeric, comparison, and thread-position mutations.
+- `ConditionalBoundary` for Stryker-style `<`/`<=` and `>`/`>=` boundary
+  changes outside loop-header-specific handling;
+- `StandardLibraryCall` for low-noise standard-library call substitutions such as
+  `std::min`/`std::max`, selected algorithm predicates,
+  `std::lower_bound`/`std::upper_bound`, `std::begin`/`std::end`,
+  `std::sort`/`std::stable_sort`, `std::partition`/`std::stable_partition`,
+  and `std::is_sorted`/`std::is_heap`;
+- `MemoryOrder` for C++ atomic `std::memory_order_*` and
+  `std::memory_order::*` constant substitutions, with clang confirmation for
+  enum-reference cursor spans;
+- `MemberAccessOperator` for pointer/value member-access variants;
+- `ExceptionHandling` for single-line throw-statement removal;
+- `PreprocessorGuard` for simple `#if 0`/`#if 1` and `#ifdef`/`#ifndef` cases;
+- `ObjCMessageSend` for simple statement-level Objective-C++ message sends;
+- `ObjCBoolLiteral` for Objective-C `YES`/`NO` literals;
+- `MetalThreadPosition` for selected Metal thread-position attributes;
+- `MetalAddressSpace` for selected Metal `device`/`constant`/`threadgroup`
+  address-space qualifiers.
+
+Remaining catalog work is deeper breadth inside those families, richer
+language-specific AST generation, and more equivalent-mutant reduction beyond
+the current generated-code, duplicate-logical/bitwise, duplicate-conditional,
+arithmetic-identity, and duplicate standard-library operand filters.
 
 Each mutator must document:
 
@@ -563,9 +612,12 @@ The report should include:
 
 Remaining work:
 
-- broader AST cursor coverage beyond direct boolean literal/return ranges and
-  token replacements inside cursor spans;
-- Objective-C++ and Metal AST-specific candidate generation.
+- broader AST cursor coverage beyond direct boolean literal/return,
+  ternary conditional-expression, loop, statement, block, and literal ranges
+  plus token replacements inside cursor spans;
+- broader Objective-C++ and Metal AST-specific candidate generation beyond the
+  current selected message-send, boolean-literal, thread-position, and
+  address-space cases.
 
 ### Compile/checker phase
 
@@ -606,7 +658,10 @@ Implemented generic adapters:
 - Make build invocation;
 - Bazel targets;
 - Meson test/build;
-- checker command synthesis for `clang-tidy` and `cppcheck`;
+- Xcode workspace/project build and test command synthesis through
+  `xcodebuild`, including scheme, configuration, SDK, and destination controls;
+- checker command synthesis for `clang`/`clang++ -fsyntax-only`, `clang-tidy`,
+  and `cppcheck`;
 
 Implemented framework adapters:
 
@@ -655,12 +710,17 @@ Implemented executable hooks:
 - `hooks.preRun`;
 - `hooks.postRun`;
 - reporter command hooks selected by `--reporter`;
+- reporter metadata capture from plugin `reporters[].metadata` into
+  `execution.reporterMetadata`;
 - build/check/test provider commands via `capabilities.runner`,
   `capabilities.buildRunner`, `capabilities.checker`, or
   `capabilities.testRunner`;
 - coverage file generation/loading via `capabilities.coverageProvider`.
+- configuration synthesis via `capabilities.configLoader` JSON output merged into base
+  execution config before defaults.
 - compatibility fixture tests for plugin directories, provider hooks, reporter
-  hooks, coverage-provider hooks, and plugin-contributed token mutators.
+  hooks, coverage-provider hooks, config-loader manifests, and plugin-contributed
+  token mutators.
 
 ### Reporter and dashboard maturity
 
@@ -671,7 +731,8 @@ Dashboard JSON can be exported or explicitly uploaded by URL.
 Required behavior:
 
 - HTML report with sortable/filterable mutants;
-- per-file and per-mutator score breakdowns;
+- per-file and per-mutator score breakdowns, including a CI-friendly Markdown
+  mutator summary table;
 - machine-readable summary optimized for CI annotations;
 - SARIF locations for survivors and timeouts;
 - optional dashboard upload/export format;
@@ -687,14 +748,19 @@ The native report should include:
 
 Implemented artifact formats:
 
-- Markdown;
+- Markdown with totals, per-mutator status summary, survivors, and ignored
+  mutants;
 - HTML local dashboard;
 - SARIF;
-- GitHub Actions log annotations via `--format github-annotations`;
+- GitHub Actions log annotations via `--format github-annotations`, using
+  warnings for survivors, notices for no-coverage mutants, and errors for
+  build/check/timeout failures;
 - direct Mutation Testing Elements JSON.
 - dashboard export/upload policy with explicit upload URL, optional
   `--dashboard-auth-token-env`, dashboard payload version metadata, provenance
-  fields, and caller-managed retention metadata.
+  fields, threshold-band status, CI project/branch/commit/run/build URL
+  metadata, caller-managed retention metadata, privacy/redaction metadata, and
+  upload outcome metadata.
 
 ### Threshold model
 
@@ -738,13 +804,16 @@ Implemented behavior:
   `STRYKER_CXX_REPO`;
 - native reports include `execution.resourceIsolation` with worktree mode,
   worker count, artifact directory, retained-worktree mode, worker temp root,
-  injected environment keys, and whether workers are parallel-safe;
+  optional worker label, injected environment keys, and whether workers are
+  parallel-safe;
 - report artifacts redact explicit `--env` values from `config.effective`, scrub
   shell-style sensitive assignments such as `TOKEN=value` from serialized
   command/plugin strings, and record the policy under
   `execution.resourceIsolation.redaction`;
 - `--worker-tmp-dir` selects the parent directory for `copy` and `git-worktree`
   worker checkouts;
+- `--worker-label pr-96205-proof` labels retained worker paths and report
+  metadata for CI/proof grouping;
 - `--retain-worktrees` leaves generated `copy` and `git-worktree` workspaces in
   place in their mutated state for debugging and records the retained path per
   mutant/batch.
@@ -835,6 +904,20 @@ are comma-separated and use `stryker-cxx` mutator names. Ignored mutants remain
 in native and MTE reports with status `IGNORED` / `Ignored`, carry
 `ignoreReason`, do not execute, and are excluded from score calculation.
 
+`--equivalent-suppression` controls built-in high-confidence suppression:
+
+- `conservative` (default): generated-code markers, duplicate pure
+  logical/bitwise operands, duplicate conditional branches, arithmetic identity
+  rewrites, and duplicate-operand standard-library min/max calls become
+  `IGNORED`;
+- `off`: every discovered mutant remains executable unless comments, coverage,
+  or other explicit controls suppress it;
+- `aggressive`: includes conservative rules plus generated-looking paths and
+  style-equivalent null literal rewrites.
+
+Native reports record this under `execution.analysis.equivalentSuppression`,
+including `mode`, `suppressedMutants`, and per-mutant suppression reasons.
+
 ## Analysis modes
 
 Token mode is the production path today. It must stay deterministic, skip
@@ -871,7 +954,11 @@ The test suite must prove:
 - `copy` and `git-worktree` modes;
 - sharding behavior;
 - markdown, SARIF, and HTML artifact generation;
-- dashboard payload version, retention, provenance, and upload-auth metadata;
+- native report schema-required `toolVersion`, `summary.byStatus`,
+  `summary.byFile`, and `summary.byMutator` buckets;
+- dashboard payload version, retention, privacy/redaction metadata,
+  tool version provenance, threshold-band status, CI provenance, upload-auth
+  metadata, and upload outcome metadata;
 - Stryker ignore comments and ignored MTE/native statuses;
 - plugin runner/checker/test provider hooks;
 - plugin coverage-provider hooks;
@@ -879,19 +966,33 @@ The test suite must prove:
   and token-mutator manifests;
 - helper-generated test-level coverage selection;
 - report-level `execution.resourceIsolation` metadata;
+- report-level `execution.analysis.equivalentSuppression` metadata;
 - `CallRemoval` statement-level discovery;
-- opt-in `IntegerLiteral` and `NullLiteral` catalog entries;
+- `StatementRemoval` and `BlockRemoval` statement/block discovery;
+- `LoopBoundary` and `LoopCondition` loop-header discovery;
+- `ConditionalBoundary`, `StandardLibraryCall`, `MemoryOrder`,
+  `MemberAccessOperator`, `ExceptionHandling`, `PreprocessorGuard`,
+  `ObjCMessageSend`, `ObjCBoolLiteral`, `MetalThreadPosition`, and
+  `MetalAddressSpace` catalog entries;
+- opt-in `IntegerLiteral`, `NullLiteral`, `CharacterLiteral`,
+  `FloatingPointLiteral`, and `StringLiteral` catalog entries;
 - clang-mode behavior on compile-database fixtures;
-- clang-ast direct source-range behavior for parenthesized boolean returns;
+- clang-ast direct source-range behavior for parenthesized boolean returns,
+  ternary conditional-expression branch swaps,
+  loop-boundary and loop-condition rewrites,
+  integer, null, character, floating-point, and string rewrites;
 - macro-expansion rejection diagnostics for clang-backed candidate filtering.
 
 Current tests cover CLI/report basics, timeout, copy mode, git-worktree mode,
 dirty refusal, resume, direct MTE output, sharding, markdown/SARIF/HTML
-artifacts, source ignore comments, `CallRemoval`, clang AST classifier behavior,
-opt-in literal mutators, checker failures, coverage-driven `NO_COVERAGE`, an
-optional real-libclang fixture, helper-generated test-level coverage,
-plugin-directory compatibility, clang-ast direct return source-range mutation,
-and JS MTE adapter behavior.
+artifacts, source ignore comments, `CallRemoval`, `LoopBoundary`,
+`LoopCondition`, expanded opt-in C++/ObjC++/Metal catalog mutators,
+clang AST classifier behavior, opt-in literal mutators,
+conservative equivalent/noise suppression and disabled-suppression mode,
+checker failures, coverage-driven `NO_COVERAGE`, an optional real-libclang
+fixture, helper-generated test-level coverage, plugin-directory compatibility,
+clang-ast direct return source-range mutation, clang-ast direct loop boundary
+and condition source-range mutation, and JS MTE adapter behavior.
 
 ### Completion evidence for full parity (required before claiming full spec)
 

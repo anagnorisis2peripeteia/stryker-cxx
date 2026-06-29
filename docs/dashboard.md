@@ -24,16 +24,29 @@ defaults to `Authorization`; custom header names receive the raw token value.
 `--dashboard-version <v>` records a hosted-dashboard compatibility version in
 the payload. `--dashboard-retention-days <n>` records caller-managed retention
 metadata so a hosted service can reject or expire uploads consistently.
+`--dashboard-project`, `--dashboard-branch`, `--dashboard-commit`, and
+`--dashboard-build-url` record explicit CI/project provenance when environment
+variables are unavailable or ambiguous.
 
 Dashboard payloads include:
 
 - `dashboardVersion`;
+- `toolVersion`;
 - `generatedAt`;
 - `retention.days` and `retention.policy`;
+- `privacy.sourceFilesIncluded`, `privacy.mutantSourceSnippetsIncluded`,
+  `privacy.secretValuesRedacted`, and `privacy.environmentValuesRedacted`;
 - `provenance.reportSchemaVersion`;
+- `provenance.toolVersion`;
 - `provenance.configHash` and `provenance.configPath`;
-- CI commit/run IDs when exposed by common CI environment variables;
-- upload auth metadata containing the env var/header names, never token values.
+- `score`, `thresholds`, and `thresholdStatus` for CI gating without
+  recomputing threshold-band policy;
+- explicit or environment-derived CI project, branch, commit, top-level
+  `runId`, and build URL metadata;
+- upload auth metadata containing the env var/header names, never token values;
+- upload status metadata under `provenance.upload.status`, with `disabled`,
+  `notAttempted`, `attempting`, `succeeded`, or `failed` states and HTTP
+  status/error detail when available.
 
 Recommended hosted-service requirements:
 

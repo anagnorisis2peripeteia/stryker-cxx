@@ -11,14 +11,17 @@ import json
 import os
 import re
 import shlex
+import subprocess
 from datetime import datetime, timezone
 from typing import Any
 
 from . import engine
+from .schema import TOOL_VERSION
 
 DEFAULT_CONFIG_FILES = ["stryker-cxx.yml", ".stryker-cxx.yml"]
-VERSION = "0.1.0"
+VERSION = TOOL_VERSION
 REDACTED_VALUE = "[REDACTED]"
+PLUGIN_MANIFEST = "stryker-cxx-plugin.json"
 SENSITIVE_KEY_RE = re.compile(
     r"(^|_)(TOKEN|SECRET|PASSWORD|PASSWD|PWD|CREDENTIAL|API_?KEY|"
     r"ACCESS_?KEY|PRIVATE_?KEY|AUTH|BEARER)($|_)",
@@ -48,9 +51,16 @@ thresholds:
   break: 0.6
 execution:
   mode: token
+  equivalentSuppression: conservative
   buildSystem: cmake
   buildDir: build
   buildTarget: ""
+  xcodeWorkspace: ""
+  xcodeProject: ""
+  xcodeScheme: ""
+  xcodeConfiguration: ""
+  xcodeSdk: ""
+  xcodeDestination: ""
   checkSystem: ""
   checkArgs: ""
   testFilter: ""
@@ -68,6 +78,7 @@ execution:
   retainWorktreesFor: []
   retainedWorktreeTtlHours: null
   workerTmpDir: ""
+  workerLabel: ""
   env: {}
   envInherit: []
   envBlock: []
@@ -85,6 +96,10 @@ execution:
   reporters: []
   dashboardVersion: "1"
   dashboardRetentionDays: null
+  dashboardProject: ""
+  dashboardBranch: ""
+  dashboardCommit: ""
+  dashboardBuildUrl: ""
   dashboardAuthTokenEnv: ""
   dashboardAuthHeader: "Authorization"
 report:
@@ -161,6 +176,13 @@ CONFIG_PRESETS: dict[str, dict[str, str]] = {
         "testTarget": "//...",
         "testFramework": "gtest",
         "testFilter": "",
+    },
+    "xcodebuild": {
+        "buildSystem": "xcodebuild",
+        "xcodeScheme": "",
+        "xcodeConfiguration": "Debug",
+        "xcodeDestination": "",
+        "testFramework": "xctest",
     },
 }
 
@@ -248,6 +270,7 @@ CONFIG_ALLOWED_NESTED = {
         "retainWorktreesFor",
         "retainedWorktreeTtlHours",
         "workerTmpDir",
+        "workerLabel",
         "env",
         "envInherit",
         "envBlock",
@@ -266,9 +289,16 @@ CONFIG_ALLOWED_NESTED = {
         "coverageTestCommandTemplate",
         "coverageHelperCommandTemplate",
         "coverageHelperTests",
+        "equivalentSuppression",
         "buildSystem",
         "buildDir",
         "buildTarget",
+        "xcodeWorkspace",
+        "xcodeProject",
+        "xcodeScheme",
+        "xcodeConfiguration",
+        "xcodeSdk",
+        "xcodeDestination",
         "testTarget",
         "testFilter",
         "testFramework",
@@ -284,6 +314,10 @@ CONFIG_ALLOWED_NESTED = {
         "dashboardUploadUrl",
         "dashboardVersion",
         "dashboardRetentionDays",
+        "dashboardProject",
+        "dashboardBranch",
+        "dashboardCommit",
+        "dashboardBuildUrl",
         "dashboardAuthTokenEnv",
         "dashboardAuthHeader",
         "batchMutants",
@@ -454,7 +488,7 @@ def _parse_yaml_text(path: str) -> dict[str, Any]:
     return root if isinstance(root, dict) else {}
 
 
-def _load_config(path: str | None) -> dict[str, Any]:
+def _load_config(path: str | None, validate: bool = True) -> dict[str, Any]:
     if not path:
         return {}
     if not os.path.exists(path):
@@ -465,7 +499,8 @@ def _load_config(path: str | None) -> dict[str, Any]:
         with open(path) as f:
             raw = json.load(f)
         cfg = raw if isinstance(raw, dict) else {}
-        _validate_config_shape(cfg, path)
+        if validate:
+            _validate_config_shape(cfg, path)
         return cfg
 
     try:
@@ -477,8 +512,84 @@ def _load_config(path: str | None) -> dict[str, Any]:
             data = yaml.safe_load(f)
 
     cfg = data if isinstance(data, dict) else {}
-    _validate_config_shape(cfg, path)
+    if validate:
+        _validate_config_shape(cfg, path)
     return cfg
+
+
+def _collect_manifest_payloads(
+    plugin_paths: list[str],
+    plugin_dirs: list[str],
+) -> list[dict[str, Any]]:
+    manifests: list[dict[str, Any]] = []
+    for path in plugin_paths:
+        if not path:
+            continue
+        with open(path) as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            raise ValueError(f"plugin manifest must be an object: {path}")
+        manifests.append(payload)
+
+    for directory in plugin_dirs:
+        if not directory:
+            continue
+        manifest = os.path.join(directory, PLUGIN_MANIFEST)
+        if not os.path.exists(manifest):
+            raise ValueError(f"plugin directory missing {PLUGIN_MANIFEST}: {directory}")
+        with open(manifest) as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            raise ValueError(f"plugin manifest must be an object: {manifest}")
+        manifests.append(payload)
+    return manifests
+
+
+def _run_config_loader(
+    command: str,
+    plugin_name: str,
+    repo: str | None,
+) -> dict[str, Any]:
+    env = os.environ.copy()
+    if repo:
+        env["STRYKER_CXX_REPO"] = repo
+    env["STRYKER_CXX_PLUGIN"] = plugin_name
+    proc = subprocess.run(
+        command,
+        cwd=repo,
+        shell=True,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+    if proc.returncode != 0:
+        detail = proc.stderr or proc.stdout
+        raise ValueError(
+            f"plugin {plugin_name} configLoader command failed: "
+            f"exit {proc.returncode}: {detail}".strip()
+        )
+    raw = proc.stdout.strip()
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"plugin {plugin_name} configLoader command did not emit JSON: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"plugin {plugin_name} configLoader output must be a JSON object")
+    return payload
+
+
+def _merge_configs(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+            merged[key] = _merge_configs(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def _pick_config_path(explicit: str | None, repo_root: str | None = None) -> str:
@@ -503,6 +614,41 @@ def _coerce_list(value: Any) -> list[str]:
     if isinstance(value, str):
         return [v.strip() for v in value.split(",") if v.strip()]
     return []
+
+
+def _apply_config_loader_plugins(
+    base_config: dict[str, Any],
+    cli_plugins: list[str],
+    cli_plugin_dirs: list[str],
+    repo: str | None,
+) -> dict[str, Any]:
+    execution = base_config.get("execution", {}) if isinstance(base_config.get("execution"), dict) else {}
+    config_plugin_paths = list(
+        dict.fromkeys(_coerce_list(base_config.get("plugins")) + _coerce_list(execution.get("plugins")))
+    )
+    config_plugin_dirs = list(
+        dict.fromkeys(_coerce_list(base_config.get("pluginDirs")) + _coerce_list(execution.get("pluginDirs")))
+    )
+    manifests = _collect_manifest_payloads(
+        list(dict.fromkeys(cli_plugins + config_plugin_paths)),
+        list(dict.fromkeys(cli_plugin_dirs + config_plugin_dirs)),
+    )
+    merged = base_config
+    for manifest in manifests:
+        capabilities = manifest.get("capabilities")
+        if not isinstance(capabilities, dict):
+            continue
+        loader = capabilities.get("configLoader")
+        if not isinstance(loader, dict):
+            continue
+        command = loader.get("command")
+        if not isinstance(command, str) or not command.strip():
+            continue
+        merged = _merge_configs(
+            merged,
+            _run_config_loader(command, str(manifest.get("name", "plugin")), repo),
+        )
+    return merged
 
 
 def _coerce_env_args(value: Any) -> list[str]:
@@ -622,6 +768,12 @@ def _adapter_commands(
     xctest_destination: str | None = None,
     xctest_only_testing: list[str] | None = None,
     xctest_skip_testing: list[str] | None = None,
+    xcode_workspace: str | None = None,
+    xcode_project: str | None = None,
+    xcode_scheme: str | None = None,
+    xcode_configuration: str | None = None,
+    xcode_sdk: str | None = None,
+    xcode_destination: str | None = None,
 ) -> dict[str, str]:
     out: dict[str, str] = {}
     framework_test = _framework_test_command(
@@ -670,8 +822,59 @@ def _adapter_commands(
     elif system == "bazel":
         out["build"] = " ".join(["bazel", "build", _shell_quote(build_target or "//...")])
         out["test"] = framework_test or " ".join(["bazel", "test", _shell_quote(test_target or build_target or "//...")])
+    elif system == "xcodebuild":
+        common = _xcodebuild_args(
+            xcode_workspace,
+            xcode_project,
+            xcode_scheme,
+            build_target,
+            xcode_configuration,
+            xcode_sdk,
+            xcode_destination,
+        )
+        out["build"] = " ".join(["xcodebuild", "build", *common])
+        if framework_test:
+            out["test"] = framework_test
+        else:
+            test = ["xcodebuild", "test", *common]
+            for item in xctest_only_testing or ([test_filter] if test_filter else []):
+                test.append(_shell_quote(f"-only-testing:{item}"))
+            for item in xctest_skip_testing or []:
+                test.append(_shell_quote(f"-skip-testing:{item}"))
+            out["test"] = " ".join(test)
     else:
         raise ValueError(f"unknown --build-system: {build_system}")
+    return out
+
+
+def _xcodebuild_args(
+    workspace: str | None,
+    project: str | None,
+    scheme: str | None,
+    target: str | None,
+    configuration: str | None,
+    sdk: str | None,
+    destination: str | None,
+) -> list[str]:
+    if workspace and project:
+        raise ValueError("--build-system xcodebuild accepts --xcode-workspace or --xcode-project, not both")
+    if not scheme and not target:
+        raise ValueError("--build-system xcodebuild requires --xcode-scheme or --build-target")
+    out: list[str] = []
+    if workspace:
+        out.extend(["-workspace", _shell_quote(workspace)])
+    if project:
+        out.extend(["-project", _shell_quote(project)])
+    if scheme:
+        out.extend(["-scheme", _shell_quote(scheme)])
+    else:
+        out.extend(["-target", _shell_quote(target or "")])
+    if configuration:
+        out.extend(["-configuration", _shell_quote(configuration)])
+    if sdk:
+        out.extend(["-sdk", _shell_quote(sdk)])
+    if destination:
+        out.extend(["-destination", _shell_quote(destination)])
     return out
 
 
@@ -689,6 +892,8 @@ def _checker_command(
     quoted_files = [_shell_quote(file_name) for file_name in file_list]
     args = shlex.split(check_args or "")
     quoted_args = [_shell_quote(arg) for arg in args]
+    if system in {"clang", "clang++"}:
+        return " ".join([system, "-fsyntax-only", *quoted_args, *quoted_files])
     if system == "clang-tidy":
         return " ".join(["clang-tidy", *quoted_args, *quoted_files])
     if system == "cppcheck":
@@ -846,7 +1051,15 @@ def _build_parser() -> argparse.ArgumentParser:
     baseline_info.add_argument("--baseline-file", required=True)
     baseline_info.add_argument("--repo", default=None)
 
+    baseline_history = subparsers.add_parser("baseline-history", help="show baseline cache update history")
+    baseline_history.add_argument("--baseline-file", required=True)
+    baseline_history.add_argument("--repo", default=None)
+    baseline_history.add_argument("--limit", type=int, default=20)
+    baseline_history.add_argument("--status", default=None)
+    baseline_history.add_argument("--branch", default=None)
+
     run = subparsers.add_parser("run", help="discover, mutate, build, and run tests")
+    run.add_argument("--config", default=None, help="Optional YAML/JSON config file")
     run.add_argument("--repo", required=True)
     run.add_argument("--files", required=False)
     run.add_argument("--base", default=None)
@@ -854,10 +1067,16 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--build-command", required=False, dest="build_command")
     run.add_argument("--check-command", required=False, dest="check_command")
     run.add_argument("--test-command", required=False, dest="test_command")
-    run.add_argument("--build-system", choices=["cmake", "ctest", "ninja", "make", "meson", "bazel"], default=None)
+    run.add_argument("--build-system", choices=["cmake", "ctest", "ninja", "make", "meson", "bazel", "xcodebuild"], default=None)
     run.add_argument("--build-dir", default=None)
     run.add_argument("--build-target", default=None)
-    run.add_argument("--check-system", choices=["clang-tidy", "cppcheck"], default=None, dest="check_system")
+    run.add_argument("--xcode-workspace", default=None, dest="xcode_workspace")
+    run.add_argument("--xcode-project", default=None, dest="xcode_project")
+    run.add_argument("--xcode-scheme", default=None, dest="xcode_scheme")
+    run.add_argument("--xcode-configuration", default=None, dest="xcode_configuration")
+    run.add_argument("--xcode-sdk", default=None, dest="xcode_sdk")
+    run.add_argument("--xcode-destination", default=None, dest="xcode_destination")
+    run.add_argument("--check-system", choices=["clang", "clang++", "clang-tidy", "cppcheck"], default=None, dest="check_system")
     run.add_argument("--check-args", default=None, dest="check_args")
     run.add_argument("--test-target", default=None)
     run.add_argument("--test-filter", default=None)
@@ -886,6 +1105,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--output-format", choices=["legacy", "stryker-cxx"], default="stryker-cxx")
     run.add_argument("--format", choices=["json", "markdown", "html", "sarif", "github-annotations", "mutation-testing-elements"], default="json")
     run.add_argument("--mode", choices=["token", "clang", "clang-ast"], default=None)
+    run.add_argument("--equivalent-suppression", choices=["off", "conservative", "aggressive"], default=None, dest="equivalent_suppression")
     run.add_argument("--jobs", type=int, default=None, help="Parallel mutant execution with isolated worktrees.")
     run.add_argument("--batch-mutants", action="store_true", dest="batch_mutants")
     run.add_argument("--batch-size", type=int, default=None, dest="batch_size")
@@ -913,6 +1133,10 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--dashboard-export", default=None, dest="dashboard_export")
     run.add_argument("--dashboard-upload-url", default=None, dest="dashboard_upload_url")
     run.add_argument("--dashboard-version", default=None, dest="dashboard_version")
+    run.add_argument("--dashboard-project", default=None, dest="dashboard_project")
+    run.add_argument("--dashboard-branch", default=None, dest="dashboard_branch")
+    run.add_argument("--dashboard-commit", default=None, dest="dashboard_commit")
+    run.add_argument("--dashboard-build-url", default=None, dest="dashboard_build_url")
     run.add_argument(
         "--dashboard-retention-days",
         type=int,
@@ -941,6 +1165,7 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="retained_worktree_ttl_hours",
     )
     run.add_argument("--worker-tmp-dir", default=None, dest="worker_tmp_dir")
+    run.add_argument("--worker-label", default=None, dest="worker_label")
     run.add_argument("--env", action="append", default=[], dest="env")
     run.add_argument("--env-inherit", action="append", default=[], dest="env_inherit")
     run.add_argument("--env-block", action="append", default=[], dest="env_block")
@@ -950,6 +1175,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--shard-total", type=int, default=None)
 
     list_mutants = subparsers.add_parser("list-mutants", help="list mutants without running build/tests")
+    list_mutants.add_argument("--config", default=None, help="Optional YAML/JSON config file")
     list_mutants.add_argument("--repo", required=True)
     list_mutants.add_argument("--files", required=False)
     list_mutants.add_argument("--base", default=None)
@@ -960,20 +1186,28 @@ def _build_parser() -> argparse.ArgumentParser:
     list_mutants.add_argument("--exclude", default=None)
     list_mutants.add_argument("--mutators", default=None)
     list_mutants.add_argument("--mode", choices=["token", "clang", "clang-ast"], default=None)
+    list_mutants.add_argument("--equivalent-suppression", choices=["off", "conservative", "aggressive"], default=None, dest="equivalent_suppression")
     list_mutants.add_argument("--plugin", action="append", default=[])
     list_mutants.add_argument("--plugin-dir", action="append", default=[])
     list_mutants.add_argument("--format", choices=["json"], default="json")
 
     run_mutant = subparsers.add_parser("run-mutant", help="run a single mutant by stable ID")
+    run_mutant.add_argument("--config", default=None, help="Optional YAML/JSON config file")
     run_mutant.add_argument("--repo", required=True)
     run_mutant.add_argument("--id", required=True)
     run_mutant.add_argument("--build-command", required=False, dest="build_command")
     run_mutant.add_argument("--check-command", required=False, dest="check_command")
     run_mutant.add_argument("--test-command", required=False, dest="test_command")
-    run_mutant.add_argument("--build-system", choices=["cmake", "ctest", "ninja", "make", "meson", "bazel"], default=None)
+    run_mutant.add_argument("--build-system", choices=["cmake", "ctest", "ninja", "make", "meson", "bazel", "xcodebuild"], default=None)
     run_mutant.add_argument("--build-dir", default=None)
     run_mutant.add_argument("--build-target", default=None)
-    run_mutant.add_argument("--check-system", choices=["clang-tidy", "cppcheck"], default=None, dest="check_system")
+    run_mutant.add_argument("--xcode-workspace", default=None, dest="xcode_workspace")
+    run_mutant.add_argument("--xcode-project", default=None, dest="xcode_project")
+    run_mutant.add_argument("--xcode-scheme", default=None, dest="xcode_scheme")
+    run_mutant.add_argument("--xcode-configuration", default=None, dest="xcode_configuration")
+    run_mutant.add_argument("--xcode-sdk", default=None, dest="xcode_sdk")
+    run_mutant.add_argument("--xcode-destination", default=None, dest="xcode_destination")
+    run_mutant.add_argument("--check-system", choices=["clang", "clang++", "clang-tidy", "cppcheck"], default=None, dest="check_system")
     run_mutant.add_argument("--check-args", default=None, dest="check_args")
     run_mutant.add_argument("--test-target", default=None)
     run_mutant.add_argument("--test-filter", default=None)
@@ -1015,6 +1249,10 @@ def _build_parser() -> argparse.ArgumentParser:
     run_mutant.add_argument("--dashboard-export", default=None, dest="dashboard_export")
     run_mutant.add_argument("--dashboard-upload-url", default=None, dest="dashboard_upload_url")
     run_mutant.add_argument("--dashboard-version", default=None, dest="dashboard_version")
+    run_mutant.add_argument("--dashboard-project", default=None, dest="dashboard_project")
+    run_mutant.add_argument("--dashboard-branch", default=None, dest="dashboard_branch")
+    run_mutant.add_argument("--dashboard-commit", default=None, dest="dashboard_commit")
+    run_mutant.add_argument("--dashboard-build-url", default=None, dest="dashboard_build_url")
     run_mutant.add_argument(
         "--dashboard-retention-days",
         type=int,
@@ -1043,6 +1281,7 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="retained_worktree_ttl_hours",
     )
     run_mutant.add_argument("--worker-tmp-dir", default=None, dest="worker_tmp_dir")
+    run_mutant.add_argument("--worker-label", default=None, dest="worker_label")
     run_mutant.add_argument("--env", action="append", default=[], dest="env")
     run_mutant.add_argument("--env-inherit", action="append", default=[], dest="env_inherit")
     run_mutant.add_argument("--env-block", action="append", default=[], dest="env_block")
@@ -1053,6 +1292,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_mutant.add_argument("--threshold-low", type=float, default=None, dest="threshold_low")
     run_mutant.add_argument("--threshold-break", type=float, default=None, dest="threshold_break")
     run_mutant.add_argument("--mode", choices=["token", "clang", "clang-ast"], default=None)
+    run_mutant.add_argument("--equivalent-suppression", choices=["off", "conservative", "aggressive"], default=None, dest="equivalent_suppression")
     run_mutant.add_argument("--worktree-mode", dest="worktree_mode", choices=["inplace", "git-worktree", "copy"], default=None)
     run_mutant.add_argument("--allow-dirty", action="store_true")
     run_mutant.add_argument("--quiet", action="store_true")
@@ -1177,6 +1417,66 @@ def _baseline_info(args: argparse.Namespace) -> int:
     return 0
 
 
+def _baseline_entry_summary(key: str, value: Any, repo: str | None = None) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    mutant = value.get("mutant") if isinstance(value.get("mutant"), dict) else {}
+    updated = value.get("updatedAt")
+    branch = str(value.get("branch") or mutant.get("baselineBranch") or "none")
+    status = str(mutant.get("status") or "UNKNOWN").upper()
+    out: dict[str, Any] = {
+        "key": key,
+        "updatedAt": updated if isinstance(updated, str) else None,
+        "status": status,
+        "branch": branch,
+        "file": mutant.get("file"),
+        "line": mutant.get("line"),
+        "mutator": mutant.get("mutator"),
+        "id": mutant.get("id"),
+    }
+    if repo is not None:
+        out["fileExists"] = _baseline_entry_file_exists(repo, value)
+    return out
+
+
+def _baseline_history(args: argparse.Namespace) -> int:
+    if args.limit < 1:
+        raise ValueError("--limit must be >= 1")
+    status_filter = args.status.upper() if args.status else None
+    payload = _read_baseline_payload(args.baseline_file)
+    entries = payload.get("entries", {})
+    repo = os.path.abspath(args.repo) if args.repo else None
+    rows: list[dict[str, Any]] = []
+    by_day: dict[str, dict[str, int]] = {}
+
+    for key, value in entries.items():
+        row = _baseline_entry_summary(str(key), value, repo)
+        if row is None:
+            continue
+        if status_filter and row["status"] != status_filter:
+            continue
+        if args.branch and row["branch"] != args.branch:
+            continue
+        rows.append(row)
+        day = str(row.get("updatedAt") or "unknown")[:10]
+        bucket = by_day.setdefault(day, {"entries": 0})
+        bucket["entries"] += 1
+        status = str(row["status"])
+        bucket[status] = bucket.get(status, 0) + 1
+
+    rows.sort(key=lambda row: str(row.get("updatedAt") or ""), reverse=True)
+    out = {
+        "baselineFile": args.baseline_file,
+        "entries": len(entries),
+        "matchedEntries": len(rows),
+        "limit": args.limit,
+        "byDay": dict(sorted(by_day.items())),
+        "history": rows[: args.limit],
+    }
+    print(json.dumps(out, indent=2))
+    return 0
+
+
 def _baseline_entry_file_exists(repo: str, value: Any) -> bool:
     if not isinstance(value, dict):
         return False
@@ -1191,7 +1491,14 @@ def _baseline_entry_file_exists(repo: str, value: Any) -> bool:
 
 def _resolve_defaults(args: argparse.Namespace) -> dict[str, Any]:
     config_path = _pick_config_path(args.config, getattr(args, "repo", None))
-    cfg = _load_config(config_path) if config_path else {}
+    cfg = _load_config(config_path, validate=False) if config_path else {}
+    cfg = _apply_config_loader_plugins(
+        cfg,
+        _coerce_list(getattr(args, "plugin", None)),
+        _coerce_list(getattr(args, "plugin_dir", None)),
+        getattr(args, "repo", None),
+    )
+    _validate_config_shape(cfg, config_path or "config")
 
     execution = cfg.get("execution", {}) if isinstance(cfg.get("execution"), dict) else {}
     report_cfg = cfg.get("report", {}) if isinstance(cfg.get("report"), dict) else {}
@@ -1203,6 +1510,12 @@ def _resolve_defaults(args: argparse.Namespace) -> dict[str, Any]:
     build_system = getattr(args, "build_system", None) or execution.get("buildSystem")
     build_dir = getattr(args, "build_dir", None) or execution.get("buildDir")
     build_target = getattr(args, "build_target", None) or execution.get("buildTarget")
+    xcode_workspace = getattr(args, "xcode_workspace", None) or execution.get("xcodeWorkspace")
+    xcode_project = getattr(args, "xcode_project", None) or execution.get("xcodeProject")
+    xcode_scheme = getattr(args, "xcode_scheme", None) or execution.get("xcodeScheme")
+    xcode_configuration = getattr(args, "xcode_configuration", None) or execution.get("xcodeConfiguration")
+    xcode_sdk = getattr(args, "xcode_sdk", None) or execution.get("xcodeSdk")
+    xcode_destination = getattr(args, "xcode_destination", None) or execution.get("xcodeDestination")
     check_system = getattr(args, "check_system", None) or execution.get("checkSystem")
     check_args = getattr(args, "check_args", None) or execution.get("checkArgs")
     test_target = getattr(args, "test_target", None) or execution.get("testTarget")
@@ -1239,6 +1552,12 @@ def _resolve_defaults(args: argparse.Namespace) -> dict[str, Any]:
         xctest_destination,
         xctest_only_testing,
         xctest_skip_testing,
+        xcode_workspace,
+        xcode_project,
+        xcode_scheme,
+        xcode_configuration,
+        xcode_sdk,
+        xcode_destination,
     )
 
     defaults = {
@@ -1251,6 +1570,12 @@ def _resolve_defaults(args: argparse.Namespace) -> dict[str, Any]:
         "build_system": build_system,
         "build_dir": build_dir,
         "build_target": build_target,
+        "xcode_workspace": xcode_workspace,
+        "xcode_project": xcode_project,
+        "xcode_scheme": xcode_scheme,
+        "xcode_configuration": xcode_configuration,
+        "xcode_sdk": xcode_sdk,
+        "xcode_destination": xcode_destination,
         "check_system": check_system,
         "check_args": check_args,
         "test_target": test_target,
@@ -1328,6 +1653,10 @@ def _resolve_defaults(args: argparse.Namespace) -> dict[str, Any]:
             if getattr(args, "dashboard_retention_days", None) is not None
             else execution.get("dashboardRetentionDays")
         ),
+        "dashboard_project": getattr(args, "dashboard_project", None) or execution.get("dashboardProject"),
+        "dashboard_branch": getattr(args, "dashboard_branch", None) or execution.get("dashboardBranch"),
+        "dashboard_commit": getattr(args, "dashboard_commit", None) or execution.get("dashboardCommit"),
+        "dashboard_build_url": getattr(args, "dashboard_build_url", None) or execution.get("dashboardBuildUrl"),
         "dashboard_auth_token_env": (
             getattr(args, "dashboard_auth_token_env", None)
             or execution.get("dashboardAuthTokenEnv")
@@ -1358,12 +1687,17 @@ def _resolve_defaults(args: argparse.Namespace) -> dict[str, Any]:
             else execution.get("retainedWorktreeTtlHours")
         ),
         "worker_tmp_dir": getattr(args, "worker_tmp_dir", None) or execution.get("workerTmpDir"),
+        "worker_label": getattr(args, "worker_label", None) or execution.get("workerLabel"),
         "env": _coerce_env_args(getattr(args, "env", None)) or _coerce_env_args(execution.get("env")),
         "env_inherit": _coerce_list(getattr(args, "env_inherit", None))
         or _coerce_list(execution.get("envInherit")),
         "env_block": _coerce_list(getattr(args, "env_block", None))
         or _coerce_list(execution.get("envBlock")),
         "mode": getattr(args, "mode", None) if getattr(args, "mode", None) is not None else execution.get("mode", "token"),
+        "equivalent_suppression": (
+            getattr(args, "equivalent_suppression", None)
+            or execution.get("equivalentSuppression", "conservative")
+        ),
         "jobs": getattr(args, "jobs", None) if getattr(args, "jobs", None) is not None else execution.get("jobs", 1),
         "batch_mutants": bool(getattr(args, "batch_mutants", False) or execution.get("batchMutants", False)),
         "batch_size": (
@@ -1528,6 +1862,8 @@ def _run(args: argparse.Namespace) -> int:
         legacy_args.extend(["--timeout-constant-ms", str(cfg["timeout_constant_ms"])])
     if cfg["mode"] is not None:
         legacy_args.extend(["--mode", str(cfg["mode"])])
+    if cfg["equivalent_suppression"]:
+        legacy_args.extend(["--equivalent-suppression", str(cfg["equivalent_suppression"])])
     if cfg["jobs"] is not None:
         legacy_args.extend(["--jobs", str(cfg["jobs"])])
     if cfg["batch_mutants"]:
@@ -1552,6 +1888,8 @@ def _run(args: argparse.Namespace) -> int:
         legacy_args.extend(["--retained-worktree-ttl-hours", str(cfg["retained_worktree_ttl_hours"])])
     if cfg["worker_tmp_dir"]:
         legacy_args.extend(["--worker-tmp-dir", cfg["worker_tmp_dir"]])
+    if cfg["worker_label"]:
+        legacy_args.extend(["--worker-label", cfg["worker_label"]])
     for item in cfg["env"]:
         legacy_args.extend(["--env", item])
     for item in cfg["env_inherit"]:
@@ -1592,6 +1930,14 @@ def _run(args: argparse.Namespace) -> int:
         legacy_args.extend(["--dashboard-version", cfg["dashboard_version"]])
     if cfg["dashboard_retention_days"] is not None:
         legacy_args.extend(["--dashboard-retention-days", str(cfg["dashboard_retention_days"])])
+    if cfg["dashboard_project"]:
+        legacy_args.extend(["--dashboard-project", cfg["dashboard_project"]])
+    if cfg["dashboard_branch"]:
+        legacy_args.extend(["--dashboard-branch", cfg["dashboard_branch"]])
+    if cfg["dashboard_commit"]:
+        legacy_args.extend(["--dashboard-commit", cfg["dashboard_commit"]])
+    if cfg["dashboard_build_url"]:
+        legacy_args.extend(["--dashboard-build-url", cfg["dashboard_build_url"]])
     if cfg["dashboard_auth_token_env"]:
         legacy_args.extend(["--dashboard-auth-token-env", cfg["dashboard_auth_token_env"]])
     if cfg["dashboard_auth_header"]:
@@ -1640,7 +1986,14 @@ def _list_mutants(args: argparse.Namespace) -> int:
         if args.lines:
             lf = engine.parse_lines(args.lines)
             only = lf if only is None else (only & lf)
-        pending += engine._discover_mode(repo_root, path, only, [m for m in enabled if m], cfg["mode"])
+        pending += engine._discover_mode(
+            repo_root,
+            path,
+            only,
+            [m for m in enabled if m],
+            cfg["mode"],
+            equivalent_suppression=cfg["equivalent_suppression"],
+        )
 
     if cfg["max_mutants"]:
         pending = pending[: cfg["max_mutants"]]
@@ -1720,6 +2073,8 @@ def _run_mutant(args: argparse.Namespace) -> int:
         legacy_args.extend(["--timeout-constant-ms", str(cfg["timeout_constant_ms"])])
     if cfg["mode"] is not None:
         legacy_args.extend(["--mode", str(cfg["mode"])])
+    if cfg["equivalent_suppression"]:
+        legacy_args.extend(["--equivalent-suppression", str(cfg["equivalent_suppression"])])
     if cfg["jobs"] is not None:
         legacy_args.extend(["--jobs", str(cfg["jobs"])])
     if cfg["shard_index"] is not None:
@@ -1740,6 +2095,8 @@ def _run_mutant(args: argparse.Namespace) -> int:
         legacy_args.extend(["--retained-worktree-ttl-hours", str(cfg["retained_worktree_ttl_hours"])])
     if cfg["worker_tmp_dir"]:
         legacy_args.extend(["--worker-tmp-dir", cfg["worker_tmp_dir"]])
+    if cfg["worker_label"]:
+        legacy_args.extend(["--worker-label", cfg["worker_label"]])
     for item in cfg["env"]:
         legacy_args.extend(["--env", item])
     for item in cfg["env_inherit"]:
@@ -1778,6 +2135,14 @@ def _run_mutant(args: argparse.Namespace) -> int:
         legacy_args.extend(["--dashboard-version", cfg["dashboard_version"]])
     if cfg["dashboard_retention_days"] is not None:
         legacy_args.extend(["--dashboard-retention-days", str(cfg["dashboard_retention_days"])])
+    if cfg["dashboard_project"]:
+        legacy_args.extend(["--dashboard-project", cfg["dashboard_project"]])
+    if cfg["dashboard_branch"]:
+        legacy_args.extend(["--dashboard-branch", cfg["dashboard_branch"]])
+    if cfg["dashboard_commit"]:
+        legacy_args.extend(["--dashboard-commit", cfg["dashboard_commit"]])
+    if cfg["dashboard_build_url"]:
+        legacy_args.extend(["--dashboard-build-url", cfg["dashboard_build_url"]])
     if cfg["dashboard_auth_token_env"]:
         legacy_args.extend(["--dashboard-auth-token-env", cfg["dashboard_auth_token_env"]])
     if cfg["dashboard_auth_header"]:
@@ -1827,6 +2192,8 @@ def main(argv: list[str] | None = None) -> int:
             return _baseline_prune(args)
         if args.command == "baseline-info":
             return _baseline_info(args)
+        if args.command == "baseline-history":
+            return _baseline_history(args)
         parser.error(f"unsupported command: {args.command}")
     except Exception as exc:
         print(f"error: {exc}")

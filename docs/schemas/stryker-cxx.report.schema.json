@@ -3,11 +3,12 @@
   "$id": "https://github.com/anagnorisis2peripeteia/stryker-cxx/schemas/stryker-cxx.report.schema.json",
   "title": "stryker-cxx report",
   "type": "object",
-  "required": ["schemaVersion", "tool", "totalMutants", "killed", "survived", "score", "commands", "execution", "mutants", "mutationTestingElements"],
+  "required": ["schemaVersion", "tool", "toolVersion", "totalMutants", "killed", "survived", "score", "commands", "execution", "summary", "mutants", "mutationTestingElements"],
   "additionalProperties": true,
   "properties": {
     "schemaVersion": { "const": "stryker-cxx.report.v1" },
     "tool": { "const": "stryker-cxx" },
+    "toolVersion": { "type": "string" },
     "score": { "type": "number", "minimum": 0, "maximum": 1 },
     "totalMutants": { "type": "integer", "minimum": 0 },
     "killed": { "type": "integer", "minimum": 0 },
@@ -47,6 +48,22 @@
     "execution": {
       "type": "object",
       "properties": {
+        "analysis": {
+          "type": "object",
+          "properties": {
+            "engine": { "type": "string" },
+            "macroRejectedMutants": { "type": "integer", "minimum": 0 },
+            "macroRejections": { "type": "array" },
+            "equivalentSuppression": {
+              "type": "object",
+              "properties": {
+                "mode": { "enum": ["off", "conservative", "aggressive"] },
+                "suppressedMutants": { "type": "integer", "minimum": 0 },
+                "suppressions": { "type": "array" }
+              }
+            }
+          }
+        },
         "dashboard": {
           "type": "object",
           "properties": {
@@ -58,6 +75,12 @@
               "properties": {
                 "enabled": { "type": "boolean" },
                 "urlConfigured": { "type": "boolean" },
+                "status": {
+                  "type": "string",
+                  "enum": ["disabled", "notAttempted", "attempting", "succeeded", "failed"]
+                },
+                "statusCode": { "type": "integer" },
+                "error": { "type": "string" },
                 "authTokenEnv": { "type": ["string", "null"] },
                 "authHeader": { "type": ["string", "null"] }
               }
@@ -80,6 +103,24 @@
         }
       }
     },
+    "summary": {
+      "type": "object",
+      "required": ["byStatus", "byFile", "byMutator"],
+      "properties": {
+        "byStatus": {
+          "type": "object",
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        },
+        "byFile": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/summaryBucket" }
+        },
+        "byMutator": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/summaryBucket" }
+        }
+      }
+    },
     "mutants": {
       "type": "array",
       "items": {
@@ -90,6 +131,37 @@
             "enum": ["KILLED", "SURVIVED", "BUILD_ERROR", "CHECK_ERROR", "NO_COVERAGE", "TIMEOUT", "IGNORED", "PENDING", "RUNTIME_ERROR"]
           }
         }
+      }
+    }
+  },
+  "$defs": {
+    "summaryBucket": {
+      "type": "object",
+      "required": [
+        "total",
+        "killed",
+        "survived",
+        "buildErrors",
+        "checkErrors",
+        "noCoverage",
+        "timeouts",
+        "ignored",
+        "runtimeErrors",
+        "pending",
+        "score"
+      ],
+      "properties": {
+        "total": { "type": "integer", "minimum": 0 },
+        "killed": { "type": "integer", "minimum": 0 },
+        "survived": { "type": "integer", "minimum": 0 },
+        "buildErrors": { "type": "integer", "minimum": 0 },
+        "checkErrors": { "type": "integer", "minimum": 0 },
+        "noCoverage": { "type": "integer", "minimum": 0 },
+        "timeouts": { "type": "integer", "minimum": 0 },
+        "ignored": { "type": "integer", "minimum": 0 },
+        "runtimeErrors": { "type": "integer", "minimum": 0 },
+        "pending": { "type": "integer", "minimum": 0 },
+        "score": { "type": "number", "minimum": 0, "maximum": 1 }
       }
     }
   }

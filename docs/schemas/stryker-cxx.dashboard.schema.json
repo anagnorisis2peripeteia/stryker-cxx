@@ -8,9 +8,12 @@
     "dashboardVersion",
     "generatedAt",
     "tool",
+    "toolVersion",
     "retention",
+    "privacy",
     "provenance",
     "score",
+    "thresholdStatus",
     "summary",
     "counts",
     "mutants"
@@ -20,6 +23,16 @@
     "dashboardVersion": { "type": "string" },
     "generatedAt": { "type": "string" },
     "tool": { "const": "stryker-cxx" },
+    "toolVersion": { "type": "string" },
+    "repo": { "type": ["string", "null"] },
+    "base": { "type": ["string", "null"] },
+    "project": { "type": ["string", "null"] },
+    "branch": { "type": ["string", "null"] },
+    "commit": { "type": ["string", "null"] },
+    "runId": { "type": ["string", "null"] },
+    "buildUrl": { "type": ["string", "null"] },
+    "startedAt": { "type": "string" },
+    "completedAt": { "type": ["string", "null"] },
     "retention": {
       "type": "object",
       "required": ["days", "policy"],
@@ -28,18 +41,60 @@
         "policy": { "type": "string" }
       }
     },
+    "privacy": {
+      "type": "object",
+      "required": [
+        "sourceFilesIncluded",
+        "mutantSourceSnippetsIncluded",
+        "secretValuesRedacted",
+        "environmentValuesRedacted"
+      ],
+      "properties": {
+        "sourceFilesIncluded": { "type": "boolean" },
+        "mutantSourceSnippetsIncluded": { "type": "boolean" },
+        "secretValuesRedacted": { "type": "boolean" },
+        "environmentValuesRedacted": { "type": "boolean" }
+      }
+    },
     "provenance": {
       "type": "object",
-      "required": ["reportSchemaVersion", "configHash", "configPath", "ci", "upload"],
+      "required": ["reportSchemaVersion", "toolVersion", "configHash", "configPath", "ci", "upload"],
       "properties": {
         "reportSchemaVersion": { "type": "string" },
+        "toolVersion": { "type": "string" },
         "configHash": { "type": ["string", "null"] },
         "configPath": { "type": ["string", "null"] },
         "ci": { "type": "object" },
-        "upload": { "type": "object" }
+        "upload": {
+          "type": "object",
+          "required": ["status"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "urlConfigured": { "type": "boolean" },
+            "status": {
+              "type": "string",
+              "enum": ["disabled", "notAttempted", "attempting", "succeeded", "failed"]
+            },
+            "statusCode": { "type": "integer" },
+            "error": { "type": "string" },
+            "authTokenEnv": { "type": ["string", "null"] },
+            "authHeader": { "type": ["string", "null"] }
+          }
+        }
       }
     },
     "score": { "type": "number", "minimum": 0, "maximum": 1 },
+    "thresholds": {
+      "type": "object",
+      "required": ["high", "low", "break", "status"],
+      "properties": {
+        "high": { "type": "number" },
+        "low": { "type": "number" },
+        "break": { "type": "number" },
+        "status": { "enum": ["failed", "low", "acceptable", "high"] }
+      }
+    },
+    "thresholdStatus": { "enum": ["failed", "low", "acceptable", "high", null] },
     "summary": { "type": "object" },
     "counts": { "type": "object" },
     "mutants": {

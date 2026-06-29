@@ -55,33 +55,47 @@ explicit build/check/test environment keys recorded in the native report. Use
 `--retain-worktrees-for SURVIVED,TIMEOUT` to keep only workers whose final status
 matches the supplied native status list, and `--retained-worktree-ttl-hours 24`
 to remove older retained workers under the same worker temp root before a run.
+Use `--worker-label pr-96205-proof` to tag retained worker paths and report
+metadata for proof capture or CI artifact grouping.
 Use `--env-inherit PATH,HOME` or `--env-block GITHUB_TOKEN` when a gate needs an
 explicit inherited-environment allow/deny policy.
 With `--batch-mutants`, isolated `copy`/`git-worktree` runs can use `--jobs` to
 probe multiple compatible batches concurrently while preserving stable report
-ordering.
+ordering. Batching stays conservative: same-file adjacent-line edits and
+source-structure mutators are isolated from mixed batches.
 Reports record env keys for reproducibility, but redact explicit env values and
 shell-style sensitive assignments such as `TOKEN=value` from serialized report
 artifacts.
+Equivalent/noise suppression defaults to `--equivalent-suppression conservative`,
+which marks generated-code markers, duplicate logical operands, and arithmetic
+identity rewrites as `IGNORED` with report metadata. Use
+`--equivalent-suppression off` when a proof run needs every discovered mutant to
+execute.
 
 For incremental runs, `--baseline-max-age-days <n>` and
 `--baseline-branch <name>` bound cache reuse by freshness and branch lifecycle.
 Rejected cache entries are reported under `baseline.missReasons` and per-mutant
 `run.baselineMissReason`.
-Use `stryker-cxx baseline-info --baseline-file <path>` to inspect cache status,
-branch counts, update age, and optional repo file-existence diagnostics before
-or after merge/prune maintenance.
+Use `stryker-cxx baseline-info --baseline-file <path>` to inspect cache status
+and `stryker-cxx baseline-history --baseline-file <path>` to review newest
+entries, by-day status buckets, branches, mutant locations, and optional repo
+file-existence diagnostics before or after merge/prune maintenance.
 
 For dashboard uploads, `--dashboard-upload-url <url>` remains explicit and
 optional. Add `--dashboard-auth-token-env STRYKER_CXX_DASHBOARD_TOKEN`,
-`--dashboard-version 1`, and `--dashboard-retention-days 14` when a hosted
-collector needs bearer-token auth, compatibility metadata, and retention policy.
+`--dashboard-version 1`, `--dashboard-retention-days 14`,
+`--dashboard-project`, `--dashboard-branch`, `--dashboard-commit`, and
+`--dashboard-build-url` when a hosted collector needs bearer-token auth,
+compatibility metadata, CI provenance, and retention policy.
 
-For XCTest projects, `--test-framework xctest --xctest-bundle <path>` keeps the
-simple `xcrun xctest` path. Add `--xctest-destination`,
-`--xctest-only-testing`, or `--xctest-skip-testing` to synthesize
-`xcodebuild test-without-building -xctestrun ...` commands for simulator or
-targeted XCTest runs.
+For Xcode/XCTest projects, `--build-system xcodebuild --xcode-workspace <path>
+--xcode-scheme <name>` synthesizes `xcodebuild build` and `xcodebuild test`
+commands. Add `--xcode-project`, `--xcode-configuration`, `--xcode-sdk`, or
+`--xcode-destination` for project/simulator-specific runs. `--test-framework
+xctest --xctest-bundle <path>` keeps the simple `xcrun xctest` path, while
+`--xctest-destination`, `--xctest-only-testing`, or `--xctest-skip-testing`
+synthesize `xcodebuild test-without-building -xctestrun ...` commands for
+prebuilt bundles.
 
 For `--test-framework gtest|catch2|doctest`, `--test-binary` is optional when
 there is exactly one repo-local executable test binary under `--build-dir`,
@@ -146,6 +160,9 @@ Fixture projects and plugin compatibility manifests are documented in
 [`docs/fixtures.md`](docs/fixtures.md).
 Release signing/provenance and dashboard upload policies are documented in
 [`docs/signing.md`](docs/signing.md) and [`docs/dashboard.md`](docs/dashboard.md).
+The npm provenance release workflow lives in
+[`.github/workflows/release.yml`](.github/workflows/release.yml).
+Security reporting is documented in [`SECURITY.md`](SECURITY.md).
 Machine-readable schemas live under [`docs/schemas/`](docs/schemas/).
 Full-spec validation is documented in [`docs/validation.md`](docs/validation.md).
 
