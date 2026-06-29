@@ -1,14 +1,17 @@
 # stryker-cxx contract
 
-This repository should depend on `mutation-testing-elements` (`schemaVersion: 2.0`).
-It accepts both:
+`stryker-cxx` is the standalone C++ mutation command. Its primary machine-readable
+report is `stryker-cxx.report.v1`, and every native report embeds a
+`mutation-testing-elements` (`schemaVersion: 2.0`) projection.
+
+The JS adapter accepts both:
 
 - direct MTE payloads, and
-- full `cxx-mutant.report.v1` payloads that include a nested `mutationTestingElements`.
+- full `stryker-cxx.report.v1` payloads that include a nested `mutationTestingElements`.
 
 ## Required fields
 
-- `mutationTestingElements.schemaVersion = "2.0"` (inside `cxx-mutant` wrapper, if using wrapper mode)
+- `mutationTestingElements.schemaVersion = "2.0"` (inside the native wrapper, if using wrapper mode)
 - `mutationTestingElements.files` map
 - For each file, optional `source`
 - For each mutant:

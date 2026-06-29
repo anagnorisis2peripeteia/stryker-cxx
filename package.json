@@ -1,7 +1,7 @@
 {
   "name": "stryker-cxx",
   "version": "0.1.0",
-  "description": "Potential Stryker-style host/provider adapter for cxx-mutant mutation payloads",
+  "description": "Standalone Stryker-style C++/ObjC++ mutation CLI and mutation-testing-elements adapter",
   "type": "module",
   "license": "MIT",
   "private": false,
@@ -9,7 +9,7 @@
     "stryker-cxx": "./bin/stryker-cxx.js"
   },
   "scripts": {
-    "test": "node --test tests/*.test.mjs",
+    "test": "node --test tests/*.test.mjs && PYTHONPATH=python python3 -m unittest discover -s tests/python",
     "start": "node bin/stryker-cxx.js"
   },
   "keywords": [

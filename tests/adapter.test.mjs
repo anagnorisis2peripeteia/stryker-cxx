@@ -19,7 +19,7 @@ const sample = {
           replacement: "!=",
           status: "Killed",
           statusReason: "tests failed",
-          runCommand: "./cxx-mutant run-mutant --id ...",
+          runCommand: "./stryker-cxx run-mutant --id ...",
           location: {
             start: { line: 1, column: 1 },
             end: { line: 1, column: 3 },
@@ -44,7 +44,7 @@ const sample = {
 };
 
 const cxxReportWrapper = {
-  schemaVersion: "cxx-mutant.report.v1",
+  schemaVersion: "stryker-cxx.report.v1",
   mutationTestingElements: sample,
   repo: "/tmp/sample",
   targetFiles: ["src/foo.cpp"],
@@ -63,7 +63,7 @@ test("valid MTE shape parses and summarizes", () => {
   assert.equal(summary.score, 0.5);
 });
 
-test("valid cxx-mutant wrapper parses via mutationTestingElements", () => {
+test("valid stryker-cxx wrapper parses via mutationTestingElements", () => {
   const parsed = assertMteReport(cxxReportWrapper);
   assert.equal(parsed.schemaVersion, "2.0");
   const flat = toPlainMutationList(parsed);
