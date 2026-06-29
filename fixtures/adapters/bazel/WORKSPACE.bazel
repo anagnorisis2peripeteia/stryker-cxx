@@ -1,0 +1,1 @@
+workspace(name = "stryker_cxx_bazel_fixture")

@@ -1,0 +1,18 @@
+{
+  "name": "reporter-hook-fixture",
+  "version": "0.1.0",
+  "capabilities": {
+    "hooks": true,
+    "reporters": true
+  },
+  "hooks": {
+    "preRun": "printf preRun > stryker-cxx-plugin-pre.txt",
+    "postRun": "printf postRun > stryker-cxx-plugin-post.txt"
+  },
+  "reporters": [
+    {
+      "name": "copy-json",
+      "command": "cp \"$STRYKER_CXX_REPORT\" stryker-cxx-plugin-report.json"
+    }
+  ]
+}

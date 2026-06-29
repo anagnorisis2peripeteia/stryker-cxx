@@ -1,0 +1,16 @@
+{
+  "name": "provider-hooks-fixture",
+  "version": "0.1.0",
+  "capabilities": {
+    "runner": {
+      "name": "fixture-runner",
+      "buildCommand": "printf build-provider > stryker-cxx-provider-build.txt",
+      "checkCommand": "printf check-provider > stryker-cxx-provider-check.txt",
+      "testCommand": "printf test-provider > stryker-cxx-provider-test.txt"
+    },
+    "coverageProvider": {
+      "name": "fixture-coverage",
+      "command": "printf '{\"files\":{}}' > \"$STRYKER_CXX_COVERAGE_FILE\""
+    }
+  }
+}

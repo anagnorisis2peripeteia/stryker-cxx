@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/anagnorisis2peripeteia/stryker-cxx/schemas/stryker-cxx.baseline.schema.json",
+  "title": "stryker-cxx baseline cache",
+  "type": "object",
+  "required": ["schemaVersion", "tool", "entries"],
+  "properties": {
+    "schemaVersion": { "const": "stryker-cxx.baseline.v1" },
+    "tool": { "const": "stryker-cxx" },
+    "updatedAt": { "type": "string" },
+    "entries": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["status", "mutant"],
+        "properties": {
+          "status": { "type": "string" },
+          "updatedAt": { "type": "string" },
+          "branch": { "type": "string" },
+          "mutant": { "type": "object" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/anagnorisis2peripeteia/stryker-cxx/schemas/stryker-cxx.dashboard.schema.json",
+  "title": "stryker-cxx dashboard export",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "dashboardVersion",
+    "generatedAt",
+    "tool",
+    "retention",
+    "provenance",
+    "score",
+    "summary",
+    "counts",
+    "mutants"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "stryker-cxx.dashboard.v1" },
+    "dashboardVersion": { "type": "string" },
+    "generatedAt": { "type": "string" },
+    "tool": { "const": "stryker-cxx" },
+    "retention": {
+      "type": "object",
+      "required": ["days", "policy"],
+      "properties": {
+        "days": { "type": ["integer", "null"], "minimum": 1 },
+        "policy": { "type": "string" }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["reportSchemaVersion", "configHash", "configPath", "ci", "upload"],
+      "properties": {
+        "reportSchemaVersion": { "type": "string" },
+        "configHash": { "type": ["string", "null"] },
+        "configPath": { "type": ["string", "null"] },
+        "ci": { "type": "object" },
+        "upload": { "type": "object" }
+      }
+    },
+    "score": { "type": "number", "minimum": 0, "maximum": 1 },
+    "summary": { "type": "object" },
+    "counts": { "type": "object" },
+    "mutants": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["file", "line", "mutator", "status"],
+        "properties": {
+          "file": { "type": "string" },
+          "line": { "type": "integer" },
+          "mutator": { "type": "string" },
+          "status": { "type": "string" }
+        }
+      }
+    }
+  }
+}

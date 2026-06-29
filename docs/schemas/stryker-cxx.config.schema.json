@@ -1,0 +1,205 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/anagnorisis2peripeteia/stryker-cxx/schemas/stryker-cxx.config.schema.json",
+  "title": "stryker-cxx config",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "const": "stryker-cxx.config.v1" },
+    "base": { "type": "string" },
+    "files": {
+      "oneOf": [
+        { "type": "string" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "include": { "type": "array", "items": { "type": "string" } },
+            "exclude": { "type": "array", "items": { "type": "string" } }
+          }
+        }
+      ]
+    },
+    "mutators": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "array", "items": { "type": "string" } },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "array", "items": { "type": "string" } }
+          }
+        }
+      ]
+    },
+    "thresholds": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "high": { "type": "number", "minimum": 0, "maximum": 1 },
+        "low": { "type": "number", "minimum": 0, "maximum": 1 },
+        "break": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "buildCommand": { "type": "string" },
+        "checkCommand": { "type": "string" },
+        "checkSystem": { "enum": ["clang-tidy", "cppcheck"] },
+        "checkArgs": { "type": "string" },
+        "testCommand": { "type": "string" },
+        "buildSystem": { "enum": ["cmake", "ctest", "ninja", "make", "meson", "bazel"] },
+        "buildDir": { "type": "string" },
+        "buildTarget": { "type": "string" },
+        "testTarget": { "type": "string" },
+        "testFilter": { "type": "string" },
+        "testFramework": { "enum": ["gtest", "googletest", "catch2", "doctest", "xctest"] },
+        "testBinary": { "type": "string" },
+        "xctestBundle": { "type": "string" },
+        "xctestDestination": { "type": "string" },
+        "xctestOnlyTesting": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "string" } }
+          ]
+        },
+        "xctestSkipTesting": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "string" } }
+          ]
+        },
+        "maxMutants": { "type": "integer", "minimum": 1 },
+        "includeMetal": { "type": "boolean" },
+        "mutators": {},
+        "threshold": { "type": "number", "minimum": 0, "maximum": 1 },
+        "thresholdHigh": { "type": "number", "minimum": 0, "maximum": 1 },
+        "thresholdLow": { "type": "number", "minimum": 0, "maximum": 1 },
+        "thresholdBreak": { "type": "number", "minimum": 0, "maximum": 1 },
+        "timeoutSeconds": { "type": "integer", "minimum": 1 },
+        "timeoutFactor": { "type": "number", "minimum": 0 },
+        "timeoutConstantMs": { "type": "integer", "minimum": 0 },
+        "artifactDir": { "type": "string" },
+        "retainWorktrees": { "type": "boolean" },
+        "retainWorktreesFor": {
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^(ALL|NONE|KILLED|SURVIVED|BUILD_ERROR|CHECK_ERROR|NO_COVERAGE|TIMEOUT|IGNORED|RUNTIME_ERROR|PENDING)(,(ALL|NONE|KILLED|SURVIVED|BUILD_ERROR|CHECK_ERROR|NO_COVERAGE|TIMEOUT|IGNORED|RUNTIME_ERROR|PENDING))*$"
+            },
+            {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "ALL",
+                  "NONE",
+                  "KILLED",
+                  "SURVIVED",
+                  "BUILD_ERROR",
+                  "CHECK_ERROR",
+                  "NO_COVERAGE",
+                  "TIMEOUT",
+                  "IGNORED",
+                  "RUNTIME_ERROR",
+                  "PENDING"
+                ]
+              }
+            }
+          ]
+        },
+        "retainedWorktreeTtlHours": {
+          "oneOf": [
+            { "type": "number", "minimum": 0 },
+            { "type": "null" }
+          ]
+        },
+        "workerTmpDir": { "type": "string" },
+        "env": {
+          "oneOf": [
+            { "type": "object", "additionalProperties": { "type": "string" } },
+            { "type": "array", "items": { "type": "string", "pattern": "^[^=]+=.*$" } }
+          ]
+        },
+        "envInherit": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "string" } }
+          ]
+        },
+        "envBlock": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "string" } }
+          ]
+        },
+        "mode": { "enum": ["token", "clang", "clang-ast"] },
+        "jobs": { "type": "integer", "minimum": 1 },
+        "batchMutants": { "type": "boolean" },
+        "batchSize": { "type": "integer", "minimum": 1 },
+        "worktreeMode": { "enum": ["inplace", "copy", "git-worktree"] },
+        "format": { "enum": ["json", "markdown", "html", "sarif", "github-annotations", "mutation-testing-elements"] },
+        "outputFormat": { "enum": ["legacy", "stryker-cxx"] },
+        "skipInitialTest": { "type": "boolean" },
+        "initialTest": { "type": "boolean" },
+        "dryRunOnly": { "type": "boolean" },
+        "skipTests": { "type": "boolean" },
+        "coverageFile": { "type": "string" },
+        "coverageProvider": { "type": "string" },
+        "coverageTestCommandTemplate": { "type": "string" },
+        "coverageHelperCommandTemplate": { "type": "string" },
+        "coverageHelperTests": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "string" } }
+          ]
+        },
+        "plugins": { "type": "array", "items": { "type": "string" } },
+        "pluginDirs": { "type": "array", "items": { "type": "string" } },
+        "reporters": { "type": "array", "items": { "type": "string" } },
+        "dashboardExport": { "type": "string" },
+        "dashboardUploadUrl": { "type": "string", "format": "uri" },
+        "dashboardVersion": { "type": "string" },
+        "dashboardRetentionDays": {
+          "oneOf": [
+            { "type": "integer", "minimum": 1 },
+            { "type": "null" }
+          ]
+        },
+        "dashboardAuthTokenEnv": { "type": "string" },
+        "dashboardAuthHeader": { "type": "string" },
+        "incremental": { "type": "boolean" },
+        "baselineFile": { "type": "string" },
+        "baselineMaxAgeDays": { "type": "integer", "minimum": 1 },
+        "baselineBranch": { "type": "string" },
+        "writeBaseline": { "type": "string" },
+        "clearBaseline": { "type": "boolean" }
+      }
+    },
+    "report": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "threshold": { "type": "number", "minimum": 0, "maximum": 1 },
+        "thresholdBreak": { "type": "number", "minimum": 0, "maximum": 1 },
+        "failOnEmpty": { "type": "boolean" },
+        "fail_on_empty": { "type": "boolean" }
+      }
+    },
+    "coverageFile": { "type": "string" },
+    "coverageProvider": { "type": "string" },
+    "coverageHelperCommandTemplate": { "type": "string" },
+    "coverageHelperTests": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "array", "items": { "type": "string" } }
+      ]
+    },
+    "baselineFile": { "type": "string" },
+    "writeBaseline": { "type": "string" },
+    "plugins": { "type": "array", "items": { "type": "string" } },
+    "pluginDirs": { "type": "array", "items": { "type": "string" } }
+  }
+}

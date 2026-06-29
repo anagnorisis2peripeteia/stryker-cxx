@@ -5,11 +5,29 @@
   "type": "module",
   "license": "MIT",
   "private": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "python/",
+    "docs/",
+    "fixtures/",
+    "README.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "LICENSE"
+  ],
   "bin": {
     "stryker-cxx": "./bin/stryker-cxx.js"
   },
   "scripts": {
-    "test": "node --test tests/*.test.mjs && PYTHONPATH=python python3 -m unittest discover -s tests/python",
+    "test": "node scripts/run-tests.mjs",
+    "schema:check": "node scripts/check-config-schema.mjs",
+    "validate:full-spec": "node scripts/validate-full-spec.mjs",
+    "lint": "node scripts/lint.mjs",
+    "release:dry-run": "npm publish --dry-run --provenance --access public",
     "start": "node bin/stryker-cxx.js"
   },
   "keywords": [

@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/anagnorisis2peripeteia/stryker-cxx/schemas/stryker-cxx.report.schema.json",
+  "title": "stryker-cxx report",
+  "type": "object",
+  "required": ["schemaVersion", "tool", "totalMutants", "killed", "survived", "score", "commands", "execution", "mutants", "mutationTestingElements"],
+  "additionalProperties": true,
+  "properties": {
+    "schemaVersion": { "const": "stryker-cxx.report.v1" },
+    "tool": { "const": "stryker-cxx" },
+    "score": { "type": "number", "minimum": 0, "maximum": 1 },
+    "totalMutants": { "type": "integer", "minimum": 0 },
+    "killed": { "type": "integer", "minimum": 0 },
+    "survived": { "type": "integer", "minimum": 0 },
+    "buildErrors": { "type": "integer", "minimum": 0 },
+    "checkErrors": { "type": "integer", "minimum": 0 },
+    "noCoverage": { "type": "integer", "minimum": 0 },
+    "timeouts": { "type": "integer", "minimum": 0 },
+    "ignored": { "type": "integer", "minimum": 0 },
+    "thresholds": {
+      "type": "object",
+      "required": ["high", "low", "break", "status"],
+      "properties": {
+        "high": { "type": "number" },
+        "low": { "type": "number" },
+        "break": { "type": "number" },
+        "status": { "enum": ["failed", "low", "acceptable", "high"] }
+      }
+    },
+    "commands": {
+      "type": "object",
+      "required": ["build", "check", "test"],
+      "properties": {
+        "build": { "type": ["string", "null"] },
+        "check": { "type": ["string", "null"] },
+        "test": { "type": ["string", "null"] }
+      }
+    },
+    "config": {
+      "type": "object",
+      "properties": {
+        "path": { "type": ["string", "null"] },
+        "hash": { "type": ["string", "null"] },
+        "effective": { "type": "object" }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "properties": {
+        "dashboard": {
+          "type": "object",
+          "properties": {
+            "version": { "type": "string" },
+            "retentionDays": { "type": ["integer", "null"], "minimum": 1 },
+            "exportPath": { "type": ["string", "null"] },
+            "upload": {
+              "type": "object",
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "urlConfigured": { "type": "boolean" },
+                "authTokenEnv": { "type": ["string", "null"] },
+                "authHeader": { "type": ["string", "null"] }
+              }
+            }
+          }
+        },
+        "resourceIsolation": {
+          "type": "object",
+          "properties": {
+            "redaction": {
+              "type": "object",
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "environmentValues": { "type": "boolean" },
+                "secretAssignmentPatterns": { "type": "boolean" },
+                "replacement": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "mutants": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["file", "line", "mutator", "status", "original", "mutated"],
+        "properties": {
+          "status": {
+            "enum": ["KILLED", "SURVIVED", "BUILD_ERROR", "CHECK_ERROR", "NO_COVERAGE", "TIMEOUT", "IGNORED", "PENDING", "RUNTIME_ERROR"]
+          }
+        }
+      }
+    }
+  }
+}

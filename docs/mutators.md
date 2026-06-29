@@ -112,7 +112,31 @@ Rewrites boolean returns:
 
 Use it for predicate functions and status helpers. Noise is low for predicates
 with direct tests, but generated stubs and defensive defaults can be equivalent
-for a local test scope. Clang mode confirms the mutation under a `RETURN_STMT`.
+for a local test scope. Clang mode confirms the mutation under a `RETURN_STMT`;
+`clang-ast` mode can also use the return statement source range directly for
+single-line parenthesized boolean returns such as `return (true)`.
+
+### IntegerLiteral
+
+Rewrites basic integer literals:
+
+- `0` -> `1`
+- `1` -> `0`
+
+Use it for sentinel values, boundary defaults, and simple branch fixtures. It is
+opt-in rather than default because numeric literal mutation is noisy in
+generated code, formatting constants, array sizes, and test scaffolding.
+
+### NullLiteral
+
+Rewrites null pointer literals:
+
+- `nullptr` -> `NULL`
+- `NULL` -> `nullptr`
+
+Use it for old/new C++ nullability interop and platform code that still carries
+`NULL`. It is opt-in because many projects treat these forms as equivalent
+style choices rather than behavioral differences.
 
 ### CallRemoval
 

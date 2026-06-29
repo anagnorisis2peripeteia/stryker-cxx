@@ -22,6 +22,16 @@ npm install --save-dev stryker-cxx
 
 ## Usage
 
+Create a starter config:
+
+```bash
+stryker-cxx init --preset cmake-gtest
+```
+
+Supported presets include `cmake`, `ctest`, `ninja`, `make`, `meson`, `bazel`,
+`cmake-gtest`, `cmake-catch2`, `cmake-doctest`, `ninja-gtest`,
+`meson-catch2`, and `bazel-gtest`.
+
 Run mutation testing directly:
 
 ```bash
@@ -33,6 +43,63 @@ stryker-cxx run \
   --test-command "./build/bin/target_test" \
   --report mutation.json
 ```
+
+For common static-check phases, use `--check-system clang-tidy|cppcheck` with
+optional `--check-args` to synthesize a check command from the current
+`--files`. Explicit `--check-command` still takes precedence.
+
+For isolated or debuggable workers, add `--worktree-mode copy` or
+`--worktree-mode git-worktree`. `--retain-worktrees --worker-tmp-dir <path>`
+keeps mutated worker directories for inspection, and `--env KEY=VALUE` injects
+explicit build/check/test environment keys recorded in the native report. Use
+`--retain-worktrees-for SURVIVED,TIMEOUT` to keep only workers whose final status
+matches the supplied native status list, and `--retained-worktree-ttl-hours 24`
+to remove older retained workers under the same worker temp root before a run.
+Use `--env-inherit PATH,HOME` or `--env-block GITHUB_TOKEN` when a gate needs an
+explicit inherited-environment allow/deny policy.
+With `--batch-mutants`, isolated `copy`/`git-worktree` runs can use `--jobs` to
+probe multiple compatible batches concurrently while preserving stable report
+ordering.
+Reports record env keys for reproducibility, but redact explicit env values and
+shell-style sensitive assignments such as `TOKEN=value` from serialized report
+artifacts.
+
+For incremental runs, `--baseline-max-age-days <n>` and
+`--baseline-branch <name>` bound cache reuse by freshness and branch lifecycle.
+Rejected cache entries are reported under `baseline.missReasons` and per-mutant
+`run.baselineMissReason`.
+Use `stryker-cxx baseline-info --baseline-file <path>` to inspect cache status,
+branch counts, update age, and optional repo file-existence diagnostics before
+or after merge/prune maintenance.
+
+For dashboard uploads, `--dashboard-upload-url <url>` remains explicit and
+optional. Add `--dashboard-auth-token-env STRYKER_CXX_DASHBOARD_TOKEN`,
+`--dashboard-version 1`, and `--dashboard-retention-days 14` when a hosted
+collector needs bearer-token auth, compatibility metadata, and retention policy.
+
+For XCTest projects, `--test-framework xctest --xctest-bundle <path>` keeps the
+simple `xcrun xctest` path. Add `--xctest-destination`,
+`--xctest-only-testing`, or `--xctest-skip-testing` to synthesize
+`xcodebuild test-without-building -xctestrun ...` commands for simulator or
+targeted XCTest runs.
+
+For `--test-framework gtest|catch2|doctest`, `--test-binary` is optional when
+there is exactly one repo-local executable test binary under `--build-dir`,
+`build`, `cmake-build-*`, `out`, or `bin`. Pass `--test-binary` to disambiguate.
+
+Report artifacts include `--format markdown`, `html`, `sarif`,
+`github-annotations`, and `mutation-testing-elements`.
+
+Coverage JSON may include per-line covering tests. With
+`--coverage-test-command-template`, `stryker-cxx` substitutes `{tests}`,
+`{tests_csv}`, `{tests_space}`, or `{first_test}` and runs the selected command
+for mutants whose line has test-level coverage metadata.
+When native test-level coverage is not already available, pair
+`--coverage-helper-command-template` with `--coverage-helper-tests` to run a
+coverage export command once per named test. The helper template receives
+`{test}` and `{coverage_file}` placeholders plus `STRYKER_CXX_COVERAGE_TEST`
+and `STRYKER_CXX_COVERAGE_FILE` environment variables; each generated JSON or
+LCOV file is merged into the same `coveredBy` mapping.
 
 List or reproduce individual mutants:
 
@@ -75,6 +142,12 @@ Mutator behavior and noise profiles are documented in
 [`docs/mutators.md`](docs/mutators.md).
 Contribution and CI expectations are documented in
 [`CONTRIBUTING.md`](CONTRIBUTING.md).
+Fixture projects and plugin compatibility manifests are documented in
+[`docs/fixtures.md`](docs/fixtures.md).
+Release signing/provenance and dashboard upload policies are documented in
+[`docs/signing.md`](docs/signing.md) and [`docs/dashboard.md`](docs/dashboard.md).
+Machine-readable schemas live under [`docs/schemas/`](docs/schemas/).
+Full-spec validation is documented in [`docs/validation.md`](docs/validation.md).
 
 ## Project map
 
@@ -84,3 +157,4 @@ Contribution and CI expectations are documented in
 - `python/stryker_cxx/`: C++ mutation engine
 - `tests/adapter.test.mjs`: JS API and schema tests
 - `tests/python/`: engine contract tests
+- `fixtures/`: adapter projects and plugin compatibility manifests

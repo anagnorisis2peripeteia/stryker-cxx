@@ -73,6 +73,11 @@ class CliContractTests(unittest.TestCase):
         payload = json.loads(report.read_text())
         self.assertEqual(payload["schemaVersion"], "stryker-cxx.report.v1")
         self.assertEqual(payload["tool"], "stryker-cxx")
+        self.assertEqual(payload["dryRun"]["status"], "PASSED")
+        self.assertTrue(payload["execution"]["initialTest"])
+        self.assertGreaterEqual(payload["execution"]["effectiveTimeoutMs"], 5000)
+        self.assertIn("config", payload)
+        self.assertIn("effective", payload["config"])
         self.assertEqual(payload["totalMutants"], 1)
         self.assertEqual(payload["survived"], 1)
         self.assertEqual(payload["score"], 0)
@@ -80,6 +85,99 @@ class CliContractTests(unittest.TestCase):
         first = payload["mutationTestingElements"]["files"]["sample.cpp"]["mutants"][0]
         self.assertEqual(first["status"], "Survived")
         self.assertIn("stryker-cxx run-mutant", first["runCommand"])
+
+    def test_init_writes_default_config_and_refuses_overwrite(self) -> None:
+        config = self.repo / "stryker-cxx.yml"
+
+        created = self._cli("init", "--path", str(config))
+        refused = self._cli("init", "--path", str(config))
+
+        self.assertEqual(created.returncode, 0, created.stderr + created.stdout)
+        self.assertIn("schemaVersion: stryker-cxx.config.v1", config.read_text())
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("config already exists", refused.stdout)
+
+    def test_init_can_write_build_system_preset_config(self) -> None:
+        config = self.repo / "cmake-stryker-cxx.yml"
+
+        created = self._cli("init", "--path", str(config), "--preset", "cmake")
+
+        self.assertEqual(created.returncode, 0, created.stderr + created.stdout)
+        text = config.read_text()
+        self.assertIn('buildSystem: "cmake"', text)
+        self.assertIn('buildCommand: ""', text)
+
+    def test_init_can_write_framework_preset_config(self) -> None:
+        config = self.repo / "cmake-gtest-stryker-cxx.yml"
+
+        created = self._cli("init", "--path", str(config), "--preset", "cmake-gtest")
+
+        self.assertEqual(created.returncode, 0, created.stderr + created.stdout)
+        text = config.read_text()
+        self.assertIn('buildSystem: "cmake"', text)
+        self.assertIn('testFramework: "gtest"', text)
+        self.assertIn('testBinary: ""', text)
+
+    def test_config_unknown_keys_are_rejected(self) -> None:
+        config = self.repo / "stryker-cxx.yml"
+        config.write_text("schemaVersion: stryker-cxx.config.v1\nunknownThing: true\n")
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "true",
+            "--report",
+            str(self.repo / "bad-config.json"),
+            "--max-mutants",
+            "1",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unknown config keys", result.stdout)
+
+    def test_baseline_merge_and_prune_commands(self) -> None:
+        first = self.repo / "first-baseline.json"
+        second = self.repo / "second-baseline.json"
+        merged = self.repo / "merged-baseline.json"
+        first.write_text(json.dumps({
+            "schemaVersion": "stryker-cxx.baseline.v1",
+            "entries": {
+                "a": {
+                    "updatedAt": "2026-01-01T00:00:00Z",
+                    "mutant": {"file": "sample.cpp", "status": "KILLED"},
+                }
+            },
+        }))
+        second.write_text(json.dumps({
+            "schemaVersion": "stryker-cxx.baseline.v1",
+            "entries": {
+                "b": {
+                    "updatedAt": "2026-01-02T00:00:00Z",
+                    "mutant": {"file": "missing.cpp", "status": "SURVIVED"},
+                }
+            },
+        }))
+
+        merge = self._cli("baseline-merge", "--output", str(merged), str(first), str(second))
+        info = self._cli("baseline-info", "--baseline-file", str(merged), "--repo", str(self.repo))
+        prune = self._cli("baseline-prune", "--baseline-file", str(merged), "--repo", str(self.repo))
+
+        self.assertEqual(merge.returncode, 0, merge.stderr + merge.stdout)
+        self.assertEqual(info.returncode, 0, info.stderr + info.stdout)
+        self.assertEqual(prune.returncode, 0, prune.stderr + prune.stdout)
+        info_payload = json.loads(info.stdout)
+        self.assertEqual(info_payload["entries"], 2)
+        self.assertEqual(info_payload["byStatus"], {"KILLED": 1, "SURVIVED": 1})
+        self.assertEqual(info_payload["fileExistence"], {"present": 1, "missing": 1})
+        payload = json.loads(merged.read_text())
+        self.assertEqual(list(payload["entries"].keys()), ["a"])
 
     def test_list_mutants_and_run_mutant_reproduce_a_survivor(self) -> None:
         listed = self._cli(
@@ -116,6 +214,226 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(payload["mutants"][0]["id"], mutant_id)
         self.assertEqual(payload["mutants"][0]["status"], "SURVIVED")
 
+    def test_plugin_mutator_is_available_to_list_mutants(self) -> None:
+        plugin = self.repo / "literal-plugin.json"
+        plugin.write_text(json.dumps({
+            "name": "literal-plugin",
+            "version": "0.1.0",
+            "mutators": [
+                {
+                    "name": "IntegerOneToZero",
+                    "description": "replace integer one with zero",
+                    "replacements": [["1", "0"]],
+                }
+            ],
+            "reporters": [{"name": "plugin-json"}],
+        }))
+
+        listed = self._cli(
+            "list-mutants",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--mutators",
+            "IntegerOneToZero",
+            "--plugin",
+            str(plugin),
+        )
+
+        self.assertEqual(listed.returncode, 0, listed.stderr + listed.stdout)
+        payload = json.loads(listed.stdout)
+        self.assertEqual(payload[0]["mutator"], "IntegerOneToZero")
+
+    def test_plugin_hooks_and_reporter_commands_run_locally(self) -> None:
+        plugin = self.repo / "hook-plugin.json"
+        plugin.write_text(json.dumps({
+            "name": "hook-plugin",
+            "version": "0.1.0",
+            "hooks": {
+                "preRun": "printf pre > hook-pre.txt",
+                "postRun": "printf post > hook-post.txt",
+            },
+            "reporters": [
+                {
+                    "name": "copy-json",
+                    "command": "cp \"$STRYKER_CXX_REPORT\" hook-report.json",
+                }
+            ],
+        }))
+        report = self.repo / "hook.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "true",
+            "--report",
+            str(report),
+            "--plugin",
+            str(plugin),
+            "--reporter",
+            "copy-json",
+            "--dry-run-only",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual((self.repo / "hook-pre.txt").read_text(), "pre")
+        self.assertEqual((self.repo / "hook-post.txt").read_text(), "post")
+        self.assertTrue((self.repo / "hook-report.json").exists())
+
+    def test_plugin_runner_provider_commands_override_build_check_test_phases(self) -> None:
+        plugin = self.repo / "runner-plugin.json"
+        plugin.write_text(json.dumps({
+            "name": "runner-plugin",
+            "version": "0.1.0",
+            "capabilities": {
+                "runner": {
+                    "name": "local-runner",
+                    "buildCommand": "printf build-provider > provider-build.txt",
+                    "checkCommand": "printf check-provider > provider-check.txt",
+                    "testCommand": "printf test-provider > provider-test.txt",
+                }
+            },
+        }))
+        report = self.repo / "runner-provider.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "false",
+            "--check-command",
+            "false",
+            "--test-command",
+            "false",
+            "--report",
+            str(report),
+            "--plugin",
+            str(plugin),
+            "--dry-run-only",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual((self.repo / "provider-build.txt").read_text(), "build-provider")
+        self.assertEqual((self.repo / "provider-check.txt").read_text(), "check-provider")
+        self.assertEqual((self.repo / "provider-test.txt").read_text(), "test-provider")
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["dryRun"]["build"]["provider"], "local-runner")
+        self.assertEqual(payload["dryRun"]["check"]["provider"], "local-runner")
+        self.assertEqual(payload["dryRun"]["test"]["provider"], "local-runner")
+        self.assertEqual(payload["execution"]["providers"]["phases"]["build"], "local-runner")
+
+    def test_plugin_coverage_provider_can_generate_coverage_file(self) -> None:
+        plugin = self.repo / "coverage-plugin.json"
+        plugin.write_text(json.dumps({
+            "name": "coverage-plugin",
+            "version": "0.1.0",
+            "capabilities": {
+                "coverageProvider": {
+                    "name": "plugin-json",
+                    "command": "printf '{\"files\":{\"sample.cpp\":{\"coveredLines\":[]}}}' > \"$STRYKER_CXX_COVERAGE_FILE\"",
+                }
+            },
+        }))
+        report = self.repo / "coverage-provider.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "true",
+            "--plugin",
+            str(plugin),
+            "--skip-initial-test",
+            "--report",
+            str(report),
+            "--max-mutants",
+            "1",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["coverage"]["provider"], "plugin-json")
+        self.assertEqual(payload["coverage"]["plugin"]["plugin"], "coverage-plugin")
+        self.assertEqual(payload["noCoverage"], 1)
+        self.assertEqual(payload["mutants"][0]["status"], "NO_COVERAGE")
+
+    def test_fixture_plugin_directories_cover_compatibility_surface(self) -> None:
+        fixture_root = Path(__file__).resolve().parents[2] / "fixtures" / "plugins"
+        token_plugin = fixture_root / "token-mutator"
+        provider_plugin = fixture_root / "provider-hooks"
+        reporter_plugin = fixture_root / "reporter-hook"
+
+        listed = self._cli(
+            "list-mutants",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--plugin-dir",
+            str(token_plugin),
+            "--mutators",
+            "IntegerOneToZero",
+        )
+
+        self.assertEqual(listed.returncode, 0, listed.stderr + listed.stdout)
+        mutants = json.loads(listed.stdout)
+        self.assertTrue(any(mut["mutator"] == "IntegerOneToZero" for mut in mutants))
+
+        report = self.repo / "fixture-plugins.json"
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "false",
+            "--check-command",
+            "false",
+            "--test-command",
+            "false",
+            "--plugin-dir",
+            str(provider_plugin),
+            "--plugin-dir",
+            str(reporter_plugin),
+            "--reporter",
+            "copy-json",
+            "--dry-run-only",
+            "--report",
+            str(report),
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual((self.repo / "stryker-cxx-provider-build.txt").read_text(), "build-provider")
+        self.assertEqual((self.repo / "stryker-cxx-provider-check.txt").read_text(), "check-provider")
+        self.assertEqual((self.repo / "stryker-cxx-provider-test.txt").read_text(), "test-provider")
+        self.assertEqual((self.repo / "stryker-cxx-plugin-pre.txt").read_text(), "preRun")
+        self.assertEqual((self.repo / "stryker-cxx-plugin-post.txt").read_text(), "postRun")
+        self.assertTrue((self.repo / "stryker-cxx-plugin-report.json").exists())
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["coverage"]["provider"], "fixture-coverage")
+        self.assertEqual(payload["coverage"]["plugin"]["plugin"], "provider-hooks-fixture")
+        self.assertEqual(payload["dryRun"]["build"]["provider"], "fixture-runner")
+
     def test_killed_mutant_meets_default_threshold(self) -> None:
         report = self.repo / "killed.json"
 
@@ -129,6 +447,7 @@ class CliContractTests(unittest.TestCase):
             "true",
             "--test-command",
             "false",
+            "--skip-initial-test",
             "--report",
             str(report),
             "--max-mutants",
@@ -220,6 +539,7 @@ class CliContractTests(unittest.TestCase):
             "true",
             "--test-command",
             "false",
+            "--skip-initial-test",
             "--report",
             str(report),
             "--resume",
@@ -234,6 +554,223 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(payload["survived"], 1)
         self.assertEqual(payload["killed"], 0)
         self.assertEqual(payload["mutants"][0]["status"], "SURVIVED")
+
+    def test_incremental_baseline_reuses_compatible_result(self) -> None:
+        first_report = self.repo / "baseline-first.json"
+        second_report = self.repo / "baseline-second.json"
+        baseline = self.repo / "stryker-baseline.json"
+
+        first = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "true",
+            "--report",
+            str(first_report),
+            "--max-mutants",
+            "1",
+            "--skip-initial-test",
+            "--write-baseline",
+            str(baseline),
+            "--quiet",
+        )
+        self.assertEqual(first.returncode, 2, first.stderr + first.stdout)
+
+        second = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "true",
+            "--report",
+            str(second_report),
+            "--max-mutants",
+            "1",
+            "--skip-initial-test",
+            "--incremental",
+            "--baseline-file",
+            str(baseline),
+            "--quiet",
+        )
+
+        self.assertEqual(second.returncode, 2, second.stderr + second.stdout)
+        payload = json.loads(second_report.read_text())
+        self.assertEqual(payload["baseline"]["cacheHits"], 1)
+        self.assertEqual(payload["baseline"]["cacheMisses"], 0)
+        self.assertEqual(payload["mutants"][0]["resultSource"], "baseline")
+        self.assertEqual(payload["mutants"][0]["status"], "SURVIVED")
+
+    def test_incremental_baseline_branch_policy_reports_miss_reason(self) -> None:
+        first_report = self.repo / "baseline-branch-first.json"
+        second_report = self.repo / "baseline-branch-second.json"
+        baseline = self.repo / "stryker-branch-baseline.json"
+
+        first = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "true",
+            "--report",
+            str(first_report),
+            "--max-mutants",
+            "1",
+            "--skip-initial-test",
+            "--write-baseline",
+            str(baseline),
+            "--baseline-branch",
+            "main",
+            "--quiet",
+        )
+        self.assertEqual(first.returncode, 2, first.stderr + first.stdout)
+
+        second = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "true",
+            "--report",
+            str(second_report),
+            "--max-mutants",
+            "1",
+            "--skip-initial-test",
+            "--incremental",
+            "--baseline-file",
+            str(baseline),
+            "--baseline-branch",
+            "feature",
+            "--quiet",
+        )
+
+        self.assertEqual(second.returncode, 2, second.stderr + second.stdout)
+        payload = json.loads(second_report.read_text())
+        self.assertEqual(payload["baseline"]["cacheHits"], 0)
+        self.assertEqual(payload["baseline"]["cacheMisses"], 1)
+        self.assertEqual(payload["baseline"]["missReasons"], {"branch mismatch main": 1})
+        self.assertEqual(payload["mutants"][0]["run"]["baselineMissReason"], "branch mismatch main")
+        self.assertEqual(payload["mutants"][0]["resultSource"], "executed")
+
+    def test_incremental_baseline_max_age_policy_reports_miss_reason(self) -> None:
+        first_report = self.repo / "baseline-age-first.json"
+        second_report = self.repo / "baseline-age-second.json"
+        baseline = self.repo / "stryker-age-baseline.json"
+
+        first = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "true",
+            "--report",
+            str(first_report),
+            "--max-mutants",
+            "1",
+            "--skip-initial-test",
+            "--write-baseline",
+            str(baseline),
+            "--quiet",
+        )
+        self.assertEqual(first.returncode, 2, first.stderr + first.stdout)
+        payload = json.loads(baseline.read_text())
+        for entry in payload["entries"].values():
+            entry["updatedAt"] = "2000-01-01T00:00:00Z"
+        baseline.write_text(json.dumps(payload))
+
+        second = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "true",
+            "--report",
+            str(second_report),
+            "--max-mutants",
+            "1",
+            "--skip-initial-test",
+            "--incremental",
+            "--baseline-file",
+            str(baseline),
+            "--baseline-max-age-days",
+            "1",
+            "--quiet",
+        )
+
+        self.assertEqual(second.returncode, 2, second.stderr + second.stdout)
+        payload = json.loads(second_report.read_text())
+        self.assertEqual(payload["baseline"]["cacheHits"], 0)
+        self.assertEqual(payload["baseline"]["cacheMisses"], 1)
+        self.assertEqual(payload["baseline"]["missReasons"], {"older than 1d": 1})
+        self.assertEqual(payload["mutants"][0]["run"]["baselineMissReason"], "older than 1d")
+
+    def test_batch_mutants_marks_surviving_batch_with_batch_source(self) -> None:
+        self.source.write_text(
+            "int a() { return 1 == 1; }\n"
+            "int b() { return 2 == 2; }\n"
+            "int c() { return 3 == 3; }\n"
+            "int d() { return 4 == 4; }\n"
+        )
+        self._git("add", "sample.cpp")
+        self._git("-c", "user.name=stryker-cxx", "-c", "user.email=stryker-cxx@example.invalid", "commit", "-q", "-m", "batch-mutants")
+        report = self.repo / "batch.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "true",
+            "--report",
+            str(report),
+            "--mutators",
+            "EqualityOperator",
+            "--batch-mutants",
+            "--batch-size",
+            "2",
+            "--jobs",
+            "2",
+            "--worktree-mode",
+            "copy",
+            "--skip-initial-test",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["execution"]["batching"]["batches"], 2)
+        self.assertEqual(payload["execution"]["batching"]["batchedMutants"], 4)
+        self.assertEqual(payload["execution"]["batching"]["parallelWorkers"], 2)
+        self.assertEqual(payload["execution"]["batching"]["splitBatches"], 0)
+        self.assertEqual([m["resultSource"] for m in payload["mutants"]], ["batch", "batch", "batch", "batch"])
 
     def test_timeout_maps_to_canonical_mte_timeout(self) -> None:
         report = self.repo / "timeout.json"
@@ -250,6 +787,7 @@ class CliContractTests(unittest.TestCase):
             'python3 -c "import time; time.sleep(2)"',
             "--timeout",
             "1",
+            "--skip-initial-test",
             "--report",
             str(report),
             "--max-mutants",
@@ -278,6 +816,7 @@ class CliContractTests(unittest.TestCase):
             "true",
             "--test-command",
             "false",
+            "--skip-initial-test",
             "--report",
             str(report),
             "--max-mutants",
@@ -291,7 +830,152 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(self.source.read_text(), original)
         payload = json.loads(report.read_text())
         self.assertEqual(payload["execution"]["worktreeMode"], "copy")
+        self.assertTrue(payload["execution"]["resourceIsolation"]["workspacePerMutant"])
+        self.assertTrue(payload["execution"]["resourceIsolation"]["parallelSafe"])
         self.assertEqual(payload["killed"], 1)
+
+    def test_worker_tmp_env_and_retained_worktree_are_reported(self) -> None:
+        report = self.repo / "retained-copy.json"
+        old_blocked = os.environ.get("STRYKER_CXX_BLOCKED")
+        os.environ["STRYKER_CXX_BLOCKED"] = "secret"
+
+        try:
+            with tempfile.TemporaryDirectory() as worker_tmp:
+                stale = Path(worker_tmp) / "stryker-cxx-copy-stale"
+                stale.mkdir()
+                os.utime(stale, (1, 1))
+                result = self._cli(
+                    "run",
+                    "--repo",
+                    str(self.repo),
+                    "--files",
+                    "sample.cpp",
+                    "--build-command",
+                    "true",
+                    "--test-command",
+                    'test "$STRYKER_CXX_FLAG" = "yes" && test -z "$STRYKER_CXX_BLOCKED"',
+                    "--skip-initial-test",
+                    "--report",
+                    str(report),
+                    "--max-mutants",
+                    "1",
+                    "--worktree-mode",
+                    "copy",
+                    "--worker-tmp-dir",
+                    worker_tmp,
+                    "--retained-worktree-ttl-hours",
+                    "0",
+                    "--retain-worktrees",
+                    "--env",
+                    "STRYKER_CXX_FLAG=yes",
+                    "--env",
+                    "SECRET_TOKEN=topsecret123",
+                    "--env-inherit",
+                    "PATH",
+                    "--env-block",
+                    "STRYKER_CXX_BLOCKED",
+                    "--quiet",
+                )
+
+                self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+                report_text = report.read_text()
+                self.assertNotIn("topsecret123", report_text)
+                payload = json.loads(report_text)
+                isolation = payload["execution"]["resourceIsolation"]
+                self.assertTrue(isolation["retainWorktrees"])
+                self.assertEqual(isolation["retainWorktreesFor"], ["ALL"])
+                self.assertEqual(isolation["retainedWorktreeTtlHours"], 0.0)
+                self.assertGreaterEqual(isolation["retainedWorktreeCleanup"]["removed"], 1)
+                self.assertFalse(stale.exists())
+                self.assertEqual(isolation["workerTmpDir"], worker_tmp)
+                self.assertEqual(isolation["environmentKeys"], ["SECRET_TOKEN", "STRYKER_CXX_FLAG"])
+                self.assertEqual(isolation["environmentInheritedKeys"], ["PATH"])
+                self.assertEqual(isolation["environmentBlockedKeys"], ["STRYKER_CXX_BLOCKED"])
+                self.assertTrue(isolation["redaction"]["enabled"])
+                self.assertEqual(
+                    payload["config"]["effective"]["env"],
+                    ["STRYKER_CXX_FLAG=[REDACTED]", "SECRET_TOKEN=[REDACTED]"],
+                )
+                retained = payload["mutants"][0]["run"]["retainedWorktree"]
+                self.assertTrue(retained.startswith(worker_tmp))
+                self.assertIn("!=", (Path(retained) / "sample.cpp").read_text())
+                self.assertEqual(
+                    payload["mutants"][0]["run"]["environmentKeys"],
+                    ["SECRET_TOKEN", "STRYKER_CXX_FLAG"],
+                )
+                self.assertEqual(payload["mutants"][0]["run"]["environmentInheritedKeys"], ["PATH"])
+                self.assertEqual(payload["mutants"][0]["run"]["environmentBlockedKeys"], ["STRYKER_CXX_BLOCKED"])
+                self.assertEqual(payload["mutants"][0]["status"], "SURVIVED")
+        finally:
+            if old_blocked is None:
+                os.environ.pop("STRYKER_CXX_BLOCKED", None)
+            else:
+                os.environ["STRYKER_CXX_BLOCKED"] = old_blocked
+
+    def test_retain_worktrees_for_keeps_only_selected_statuses(self) -> None:
+        survived_report = self.repo / "retained-survivor.json"
+        killed_report = self.repo / "retained-killed.json"
+
+        with tempfile.TemporaryDirectory() as worker_tmp:
+            survived = self._cli(
+                "run",
+                "--repo",
+                str(self.repo),
+                "--files",
+                "sample.cpp",
+                "--build-command",
+                "true",
+                "--test-command",
+                "true",
+                "--skip-initial-test",
+                "--report",
+                str(survived_report),
+                "--max-mutants",
+                "1",
+                "--worktree-mode",
+                "copy",
+                "--worker-tmp-dir",
+                worker_tmp,
+                "--retain-worktrees-for",
+                "SURVIVED",
+                "--quiet",
+            )
+
+            self.assertEqual(survived.returncode, 2, survived.stderr + survived.stdout)
+            survived_payload = json.loads(survived_report.read_text())
+            isolation = survived_payload["execution"]["resourceIsolation"]
+            self.assertTrue(isolation["retainWorktrees"])
+            self.assertEqual(isolation["retainWorktreesFor"], ["SURVIVED"])
+            self.assertIn("retainedWorktree", survived_payload["mutants"][0]["run"])
+
+            killed = self._cli(
+                "run",
+                "--repo",
+                str(self.repo),
+                "--files",
+                "sample.cpp",
+                "--build-command",
+                "true",
+                "--test-command",
+                "false",
+                "--skip-initial-test",
+                "--report",
+                str(killed_report),
+                "--max-mutants",
+                "1",
+                "--worktree-mode",
+                "copy",
+                "--worker-tmp-dir",
+                worker_tmp,
+                "--retain-worktrees-for",
+                "SURVIVED",
+                "--quiet",
+            )
+
+            self.assertEqual(killed.returncode, 0, killed.stderr + killed.stdout)
+            killed_payload = json.loads(killed_report.read_text())
+            self.assertEqual(killed_payload["mutants"][0]["status"], "KILLED")
+            self.assertNotIn("retainedWorktree", killed_payload["mutants"][0]["run"])
 
     def test_mutation_testing_elements_format_writes_direct_mte_payload(self) -> None:
         report = self.repo / "mte.json"
@@ -306,6 +990,7 @@ class CliContractTests(unittest.TestCase):
             "true",
             "--test-command",
             "false",
+            "--skip-initial-test",
             "--report",
             str(report),
             "--max-mutants",
@@ -340,6 +1025,7 @@ class CliContractTests(unittest.TestCase):
             "true",
             "--test-command",
             "false",
+            "--skip-initial-test",
             "--report",
             str(report),
             "--mutators",
@@ -381,6 +1067,7 @@ class CliContractTests(unittest.TestCase):
             "true",
             "--test-command",
             "false",
+            "--skip-initial-test",
             "--report",
             str(report),
             "--mutators",
@@ -427,6 +1114,7 @@ class CliContractTests(unittest.TestCase):
             "true",
             "--test-command",
             "false",
+            "--skip-initial-test",
             "--report",
             str(report),
             "--mutators",
@@ -441,6 +1129,49 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(payload["mutants"][0]["mutator"], "CallRemoval")
         self.assertEqual(payload["mutants"][0]["original"], "touched()")
         self.assertEqual(payload["mutants"][0]["mutated"], "(void)0")
+
+    def test_literal_mutators_are_available_as_opt_in_catalog_entries(self) -> None:
+        self.source.write_text(
+            "#include <cstddef>\n"
+            "int value() { return 1; }\n"
+            "void* ptr() { return nullptr; }\n"
+        )
+        self._git("add", "sample.cpp")
+        self._git(
+            "-c",
+            "user.name=stryker-cxx",
+            "-c",
+            "user.email=stryker-cxx@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "literal-mutators",
+        )
+        report = self.repo / "literal-mutators.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "false",
+            "--skip-initial-test",
+            "--report",
+            str(report),
+            "--mutators",
+            "IntegerLiteral,NullLiteral",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        mutators = {mut["mutator"] for mut in payload["mutants"]}
+        self.assertIn("IntegerLiteral", mutators)
+        self.assertIn("NullLiteral", mutators)
 
     def test_clang_mode_runs_compile_database_fixture_when_bindings_are_available(self) -> None:
         try:
@@ -477,6 +1208,7 @@ class CliContractTests(unittest.TestCase):
             "true",
             "--test-command",
             "false",
+            "--skip-initial-test",
             "--report",
             str(report),
             "--mutators",
@@ -493,6 +1225,66 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(payload["killed"], 1)
         self.assertEqual(payload["mutants"][0]["nodeKind"], "BINARY_OPERATOR")
 
+    def test_clang_ast_mode_generates_direct_return_range_mutant_when_available(self) -> None:
+        try:
+            from clang import cindex  # type: ignore
+            cindex.Index.create()
+        except Exception as exc:
+            self.skipTest(f"optional libclang binding is unavailable: {exc}")
+
+        self.source.write_text(
+            "bool flag() { return (true); }\n"
+            "int main() { return flag() ? 0 : 1; }\n"
+        )
+        compile_db = [
+            {
+                "directory": str(self.repo),
+                "command": "clang++ -std=c++17 -c sample.cpp -o sample.o",
+                "file": str(self.source),
+            }
+        ]
+        (self.repo / "compile_commands.json").write_text(json.dumps(compile_db))
+        self._git("add", "sample.cpp", "compile_commands.json")
+        self._git(
+            "-c",
+            "user.name=stryker-cxx",
+            "-c",
+            "user.email=stryker-cxx@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "clang-ast-return-fixture",
+        )
+        report = self.repo / "clang-ast-return.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "false",
+            "--skip-initial-test",
+            "--report",
+            str(report),
+            "--mutators",
+            "ReturnValue",
+            "--mode",
+            "clang-ast",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["totalMutants"], 1)
+        self.assertEqual(payload["mutants"][0]["original"], "return (true)")
+        self.assertEqual(payload["mutants"][0]["mutated"], "return (false)")
+        self.assertEqual(payload["mutants"][0]["nodeKind"], "RETURN_STMT")
+        self.assertEqual(payload["mutants"][0]["rewriteStrategy"], "clang-ast-direct-return")
+
     def test_git_worktree_mode_runs_without_mutating_source(self) -> None:
         report = self.repo / "worktree.json"
         original = self.source.read_text()
@@ -507,6 +1299,7 @@ class CliContractTests(unittest.TestCase):
             "true",
             "--test-command",
             "false",
+            "--skip-initial-test",
             "--report",
             str(report),
             "--max-mutants",
@@ -540,6 +1333,7 @@ class CliContractTests(unittest.TestCase):
             "true",
             "--test-command",
             "false",
+            "--skip-initial-test",
             "--report",
             str(report),
             "--mutators",
@@ -593,6 +1387,7 @@ class CliContractTests(unittest.TestCase):
             "true",
             "--test-command",
             "false",
+            "--skip-initial-test",
             "--report",
             str(sarif_report),
             "--max-mutants",
@@ -605,6 +1400,30 @@ class CliContractTests(unittest.TestCase):
         sarif_artifact = self.repo / "code-scanning.json.sarif"
         self.assertTrue(sarif_artifact.exists())
         self.assertEqual(json.loads(sarif_artifact.read_text())["version"], "2.1.0")
+
+        annotations_report = self.repo / "annotations.json"
+        annotations = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "true",
+            "--report",
+            str(annotations_report),
+            "--max-mutants",
+            "1",
+            "--format",
+            "github-annotations",
+            "--quiet",
+        )
+        self.assertEqual(annotations.returncode, 2, annotations.stderr + annotations.stdout)
+        annotations_artifact = self.repo / "annotations.json.github-annotations"
+        self.assertTrue(annotations_artifact.exists())
+        self.assertIn("::warning file=sample.cpp,line=1,", annotations_artifact.read_text())
 
         html_report = self.repo / "page.json"
         html = self._cli(
@@ -625,10 +1444,293 @@ class CliContractTests(unittest.TestCase):
             "html",
             "--quiet",
         )
-        self.assertEqual(html.returncode, 0, html.stderr + html.stdout)
+        self.assertEqual(html.returncode, 1, html.stderr + html.stdout)
         html_artifact = self.repo / "page.json.html"
         self.assertTrue(html_artifact.exists())
         self.assertIn("<h1>stryker-cxx report</h1>", html_artifact.read_text())
+        self.assertIn("id='filter'", html_artifact.read_text())
+        self.assertIn("data-sort='status'", html_artifact.read_text())
+
+    def test_initial_dry_run_failure_stops_before_mutant_execution(self) -> None:
+        report = self.repo / "dry-run-failed.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "false",
+            "--report",
+            str(report),
+            "--max-mutants",
+            "1",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["dryRun"]["status"], "FAILED")
+        self.assertEqual(payload["dryRun"]["failureReason"], "initial tests failed")
+        self.assertEqual(payload["killed"], 0)
+        self.assertEqual(payload["survived"], 0)
+        self.assertEqual(payload["mutants"], [])
+
+    def test_dry_run_only_writes_lifecycle_report_without_mutating(self) -> None:
+        report = self.repo / "dry-run-only.json"
+        original = self.source.read_text()
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "true",
+            "--report",
+            str(report),
+            "--max-mutants",
+            "1",
+            "--dry-run-only",
+            "--timeout-factor",
+            "1.0",
+            "--timeout-constant-ms",
+            "250",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(self.source.read_text(), original)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["dryRun"]["status"], "PASSED")
+        self.assertTrue(payload["execution"]["dryRunOnly"])
+        self.assertGreaterEqual(payload["execution"]["effectiveTimeoutMs"], 250)
+        self.assertEqual(payload["totalMutants"], 1)
+        self.assertEqual(payload["mutants"], [])
+
+    def test_dashboard_export_writes_compact_dashboard_payload(self) -> None:
+        report = self.repo / "dashboard-run.json"
+        dashboard = self.repo / "dashboard-export.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "true",
+            "--report",
+            str(report),
+            "--dashboard-export",
+            str(dashboard),
+            "--dashboard-version",
+            "1",
+            "--dashboard-retention-days",
+            "14",
+            "--dashboard-auth-token-env",
+            "STRYKER_CXX_DASHBOARD_TOKEN",
+            "--max-mutants",
+            "1",
+            "--dry-run-only",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        payload = json.loads(dashboard.read_text())
+        self.assertEqual(payload["schemaVersion"], "stryker-cxx.dashboard.v1")
+        self.assertEqual(payload["dashboardVersion"], "1")
+        self.assertEqual(payload["retention"]["days"], 14)
+        self.assertEqual(payload["provenance"]["upload"]["authTokenEnv"], "STRYKER_CXX_DASHBOARD_TOKEN")
+        self.assertEqual(payload["counts"]["totalMutants"], 1)
+
+    def test_check_command_failure_is_reported_separately(self) -> None:
+        report = self.repo / "check-error.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--check-command",
+            "false",
+            "--test-command",
+            "true",
+            "--report",
+            str(report),
+            "--max-mutants",
+            "1",
+            "--skip-initial-test",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["checkErrors"], 1)
+        self.assertEqual(payload["mutants"][0]["status"], "CHECK_ERROR")
+        self.assertEqual(payload["commands"]["check"], "false")
+
+    def test_coverage_file_marks_uncovered_mutants_without_execution(self) -> None:
+        report = self.repo / "coverage.json"
+        coverage = self.repo / "coverage-input.json"
+        coverage.write_text(json.dumps({"files": {"sample.cpp": {"coveredLines": []}}}))
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "true",
+            "--coverage-file",
+            str(coverage),
+            "--report",
+            str(report),
+            "--max-mutants",
+            "1",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["noCoverage"], 1)
+        self.assertEqual(payload["coverage"]["noCoverageMutants"], 1)
+        self.assertEqual(payload["mutants"][0]["status"], "NO_COVERAGE")
+        first = payload["mutationTestingElements"]["files"]["sample.cpp"]["mutants"][0]
+        self.assertEqual(first["status"], "NoCoverage")
+
+    def test_coverage_file_can_select_per_mutant_test_command(self) -> None:
+        report = self.repo / "coverage-selected-tests.json"
+        coverage = self.repo / "coverage-tests-input.json"
+        coverage.write_text(json.dumps({
+            "files": {
+                "sample.cpp": {
+                    "coveredLines": [1],
+                    "coveredTests": {"1": ["MathTest.Basic"]},
+                }
+            }
+        }))
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "false",
+            "--coverage-file",
+            str(coverage),
+            "--coverage-test-command-template",
+            "test {first_test} = MathTest.Basic",
+            "--skip-initial-test",
+            "--report",
+            str(report),
+            "--max-mutants",
+            "1",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["coverage"]["testSelectedMutants"], 1)
+        self.assertEqual(payload["coverage"]["testSelectionMisses"], 0)
+        self.assertEqual(payload["mutants"][0]["run"]["coveredBy"], ["MathTest.Basic"])
+        self.assertEqual(payload["mutants"][0]["run"]["selectedTestCommand"], "test MathTest.Basic = MathTest.Basic")
+        self.assertEqual(payload["mutants"][0]["status"], "SURVIVED")
+        mte = payload["mutationTestingElements"]["files"]["sample.cpp"]["mutants"][0]
+        self.assertEqual(mte["coveredBy"], ["MathTest.Basic"])
+
+    def test_coverage_helper_generates_test_level_mapping(self) -> None:
+        report = self.repo / "coverage-helper-selected-tests.json"
+        helper = self.repo / "write_coverage.py"
+        helper.write_text(
+            "import json, os\n"
+            "with open(os.environ['STRYKER_CXX_COVERAGE_FILE'], 'w') as f:\n"
+            "    json.dump({'files': {'sample.cpp': {'coveredLines': [1]}}}, f)\n"
+        )
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "false",
+            "--coverage-helper-command-template",
+            f"{sys.executable} {helper}",
+            "--coverage-helper-tests",
+            "MathTest.Basic",
+            "--coverage-test-command-template",
+            "test {first_test}",
+            "--skip-initial-test",
+            "--report",
+            str(report),
+            "--max-mutants",
+            "1",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["coverage"]["helper"]["testCount"], 1)
+        self.assertEqual(payload["coverage"]["testSelectedMutants"], 1)
+        self.assertEqual(payload["mutants"][0]["run"]["coveredBy"], ["MathTest.Basic"])
+        self.assertEqual(payload["mutants"][0]["run"]["selectedTestCommand"], "test MathTest.Basic")
+
+    def test_threshold_bands_preserve_break_exit_behavior(self) -> None:
+        report = self.repo / "thresholds.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "true",
+            "--report",
+            str(report),
+            "--max-mutants",
+            "1",
+            "--threshold-high",
+            "0.9",
+            "--threshold-low",
+            "0.5",
+            "--threshold-break",
+            "0",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["score"], 0)
+        self.assertEqual(payload["threshold"], 0)
+        self.assertEqual(payload["thresholds"], {"high": 0.9, "low": 0.5, "break": 0.0, "status": "low"})
+        self.assertEqual(payload["summary"]["byStatus"]["SURVIVED"], 1)
+        self.assertEqual(payload["summary"]["byFile"]["sample.cpp"]["survived"], 1)
+        self.assertEqual(payload["summary"]["byMutator"]["EqualityOperator"]["survived"], 1)
 
 
 if __name__ == "__main__":

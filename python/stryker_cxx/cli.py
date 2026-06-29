@@ -4,14 +4,454 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import fnmatch
+import hashlib
 import json
 import os
+import re
+import shlex
+from datetime import datetime, timezone
 from typing import Any
 
 from . import engine
 
 DEFAULT_CONFIG_FILES = ["stryker-cxx.yml", ".stryker-cxx.yml"]
+VERSION = "0.1.0"
+REDACTED_VALUE = "[REDACTED]"
+SENSITIVE_KEY_RE = re.compile(
+    r"(^|_)(TOKEN|SECRET|PASSWORD|PASSWD|PWD|CREDENTIAL|API_?KEY|"
+    r"ACCESS_?KEY|PRIVATE_?KEY|AUTH|BEARER)($|_)",
+    re.IGNORECASE,
+)
+SHELL_ASSIGNMENT_RE = re.compile(
+    r"(?P<prefix>(^|[\s;])(?:export\s+)?)"
+    r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)="
+    r"(?P<value>'[^']*'|\"[^\"]*\"|[^\s;]+)"
+)
+
+
+DEFAULT_CONFIG = """schemaVersion: stryker-cxx.config.v1
+files:
+  include:
+    - "src/**/*.cpp"
+  exclude:
+    - "**/test/**"
+mutators:
+  - ConditionalBoundary
+  - EqualityOperator
+  - LogicalOperator
+  - BooleanLiteral
+thresholds:
+  high: 0.9
+  low: 0.7
+  break: 0.6
+execution:
+  mode: token
+  buildSystem: cmake
+  buildDir: build
+  buildTarget: ""
+  checkSystem: ""
+  checkArgs: ""
+  testFilter: ""
+  testFramework: ""
+  testBinary: ""
+  xctestBundle: ""
+  xctestDestination: ""
+  xctestOnlyTesting: []
+  xctestSkipTesting: []
+  worktreeMode: copy
+  jobs: 1
+  batchMutants: false
+  batchSize: 4
+  retainWorktrees: false
+  retainWorktreesFor: []
+  retainedWorktreeTtlHours: null
+  workerTmpDir: ""
+  env: {}
+  envInherit: []
+  envBlock: []
+  buildCommand: "ninja -C build"
+  checkCommand: ""
+  testCommand: "./build/tests"
+  coverageHelperCommandTemplate: ""
+  coverageHelperTests: []
+  timeoutFactor: 1.5
+  timeoutConstantMs: 5000
+  incremental: false
+  baselineFile: ".stryker-cxx-baseline.json"
+  plugins: []
+  pluginDirs: []
+  reporters: []
+  dashboardVersion: "1"
+  dashboardRetentionDays: null
+  dashboardAuthTokenEnv: ""
+  dashboardAuthHeader: "Authorization"
+report:
+  failOnEmpty: true
+"""
+
+
+CONFIG_PRESETS: dict[str, dict[str, str]] = {
+    "cmake": {
+        "buildSystem": "cmake",
+        "buildDir": "build",
+        "testFilter": "",
+    },
+    "cmake-gtest": {
+        "buildSystem": "cmake",
+        "buildDir": "build",
+        "testFramework": "gtest",
+        "testFilter": "",
+    },
+    "cmake-catch2": {
+        "buildSystem": "cmake",
+        "buildDir": "build",
+        "testFramework": "catch2",
+        "testFilter": "",
+    },
+    "cmake-doctest": {
+        "buildSystem": "cmake",
+        "buildDir": "build",
+        "testFramework": "doctest",
+        "testFilter": "",
+    },
+    "ctest": {
+        "buildSystem": "ctest",
+        "buildDir": "build",
+        "testFilter": "",
+    },
+    "ninja": {
+        "buildSystem": "ninja",
+        "buildDir": "build",
+        "testTarget": "test",
+    },
+    "ninja-gtest": {
+        "buildSystem": "ninja",
+        "buildDir": "build",
+        "testTarget": "test",
+        "testFramework": "gtest",
+        "testFilter": "",
+    },
+    "make": {
+        "buildSystem": "make",
+        "buildDir": ".",
+        "testTarget": "test",
+    },
+    "meson": {
+        "buildSystem": "meson",
+        "buildDir": "build",
+        "testTarget": "",
+    },
+    "meson-catch2": {
+        "buildSystem": "meson",
+        "buildDir": "build",
+        "testTarget": "",
+        "testFramework": "catch2",
+        "testFilter": "",
+    },
+    "bazel": {
+        "buildSystem": "bazel",
+        "buildTarget": "//...",
+        "testTarget": "//...",
+    },
+    "bazel-gtest": {
+        "buildSystem": "bazel",
+        "buildTarget": "//...",
+        "testTarget": "//...",
+        "testFramework": "gtest",
+        "testFilter": "",
+    },
+}
+
+
+def _config_for_preset(preset: str | None) -> str:
+    if not preset:
+        return DEFAULT_CONFIG
+    values = dict(CONFIG_PRESETS[preset])
+    values["buildCommand"] = ""
+    values["testCommand"] = ""
+    inserted: set[str] = set()
+    out: list[str] = []
+    in_execution = False
+
+    def scalar(value: str) -> str:
+        return json.dumps(value)
+
+    for line in DEFAULT_CONFIG.splitlines():
+        if line == "execution:":
+            in_execution = True
+            out.append(line)
+            continue
+        if in_execution and line and not line.startswith("  "):
+            for key, value in values.items():
+                if key not in inserted:
+                    out.append(f"  {key}: {scalar(value)}")
+                    inserted.add(key)
+            in_execution = False
+        if in_execution and line.startswith("  "):
+            key = line.strip().split(":", 1)[0]
+            if key in values:
+                out.append(f"  {key}: {scalar(values[key])}")
+                inserted.add(key)
+                continue
+        out.append(line)
+
+    if in_execution:
+        for key, value in values.items():
+            if key not in inserted:
+                out.append(f"  {key}: {scalar(value)}")
+                inserted.add(key)
+    return "\n".join(out) + "\n"
+
+
+CONFIG_ALLOWED_TOP_LEVEL = {
+    "schemaVersion",
+    "base",
+    "files",
+    "mutators",
+    "thresholds",
+    "execution",
+    "report",
+    "coverageFile",
+    "coverageProvider",
+    "coverageHelperCommandTemplate",
+    "coverageHelperTests",
+    "baselineFile",
+    "writeBaseline",
+    "plugins",
+    "pluginDirs",
+}
+CONFIG_ALLOWED_NESTED = {
+    "files": {"include", "exclude"},
+    "thresholds": {"high", "low", "break"},
+    "report": {"threshold", "thresholdBreak", "thresholds", "failOnEmpty", "fail_on_empty"},
+    "execution": {
+        "buildCommand",
+        "checkCommand",
+        "checkSystem",
+        "checkArgs",
+        "testCommand",
+        "maxMutants",
+        "includeMetal",
+        "mutators",
+        "mutationMutators",
+        "threshold",
+        "thresholdHigh",
+        "thresholdLow",
+        "thresholdBreak",
+        "timeoutSeconds",
+        "timeoutFactor",
+        "timeoutConstantMs",
+        "artifactDir",
+        "retainWorktrees",
+        "retainWorktreesFor",
+        "retainedWorktreeTtlHours",
+        "workerTmpDir",
+        "env",
+        "envInherit",
+        "envBlock",
+        "mode",
+        "jobs",
+        "worktreeMode",
+        "workTreeMode",
+        "format",
+        "outputFormat",
+        "skipInitialTest",
+        "initialTest",
+        "dryRunOnly",
+        "skipTests",
+        "coverageFile",
+        "coverageProvider",
+        "coverageTestCommandTemplate",
+        "coverageHelperCommandTemplate",
+        "coverageHelperTests",
+        "buildSystem",
+        "buildDir",
+        "buildTarget",
+        "testTarget",
+        "testFilter",
+        "testFramework",
+        "testBinary",
+        "xctestBundle",
+        "xctestDestination",
+        "xctestOnlyTesting",
+        "xctestSkipTesting",
+        "plugins",
+        "pluginDirs",
+        "reporters",
+        "dashboardExport",
+        "dashboardUploadUrl",
+        "dashboardVersion",
+        "dashboardRetentionDays",
+        "dashboardAuthTokenEnv",
+        "dashboardAuthHeader",
+        "batchMutants",
+        "batchSize",
+        "incremental",
+        "baselineFile",
+        "baselineMaxAgeDays",
+        "baselineBranch",
+        "writeBaseline",
+        "clearBaseline",
+    },
+}
+
+
+def _validate_config_shape(cfg: dict[str, Any], path: str) -> None:
+    unknown_top = sorted(set(cfg) - CONFIG_ALLOWED_TOP_LEVEL)
+    if unknown_top:
+        raise ValueError(f"{path}: unknown config keys: {', '.join(unknown_top)}")
+    for key, allowed in CONFIG_ALLOWED_NESTED.items():
+        section = cfg.get(key)
+        if section is None:
+            continue
+        if not isinstance(section, dict):
+            if key in {"files", "thresholds", "report", "execution"}:
+                if key == "files" and isinstance(section, (str, list)):
+                    continue
+                if key == "thresholds":
+                    raise ValueError(f"{path}: config section '{key}' must be an object")
+            continue
+        unknown = sorted(set(section) - allowed)
+        if unknown:
+            raise ValueError(f"{path}: unknown config keys in {key}: {', '.join(unknown)}")
+
+
+def _parse_yaml_scalar(value: str) -> Any:
+    raw = value.strip()
+    if raw == "null":
+        return None
+    if raw == "true":
+        return True
+    if raw == "false":
+        return False
+    try:
+        if raw == "":
+            return raw
+        if raw[0] in {"'", '"'} and raw[-1] == raw[0]:
+            return ast.literal_eval(raw)
+    except (ValueError, SyntaxError):
+        pass
+    if raw == "{}":
+        return {}
+    if raw == "[]":
+        return []
+    if raw.startswith("[") and raw.endswith("]"):
+        inner = raw[1:-1].strip()
+        if not inner:
+            return []
+        values: list[str] = []
+        current = []
+        in_single = False
+        in_double = False
+        escaped = False
+        for char in inner:
+            if escaped:
+                current.append(char)
+                escaped = False
+                continue
+            if char == "\\" and in_double:
+                escaped = True
+                current.append(char)
+                continue
+            if char == "'" and not in_double:
+                in_single = not in_single
+                current.append(char)
+                continue
+            if char == '"' and not in_single:
+                in_double = not in_double
+                current.append(char)
+                continue
+            if char == "," and not in_single and not in_double:
+                part = "".join(current).strip()
+                if part:
+                    values.append(part)
+                current = []
+                continue
+            current.append(char)
+        if current:
+            values.append("".join(current).strip())
+        return [_parse_yaml_scalar(item) for item in values]
+    try:
+        return int(raw)
+    except ValueError:
+        pass
+    try:
+        return float(raw)
+    except ValueError:
+        return raw
+
+
+def _parse_yaml_text(path: str) -> dict[str, Any]:
+    with open(path) as f:
+        lines = f.readlines()
+    root: dict[str, Any] = {}
+    stack: list[tuple[int, Any]] = [(-1, root)]
+
+    def next_significant(index: int) -> tuple[int, str] | None:
+        idx = index
+        while idx < len(lines):
+            candidate = lines[idx]
+            if candidate.strip() and not candidate.lstrip().startswith("#"):
+                return idx, candidate
+            idx += 1
+        return None
+
+    index = 0
+    while index < len(lines):
+        raw_line = lines[index]
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+            index += 1
+            continue
+
+        if "\t" in raw_line:
+            raise ValueError(f"{path}: YAML indentation cannot contain tabs")
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        line = raw_line.strip()
+
+        while indent < stack[-1][0]:
+            stack.pop()
+        container = stack[-1][1]
+
+        if line.startswith("- "):
+            if not isinstance(container, list):
+                raise ValueError(f"{path}: list item outside list at line {index + 1}: {line}")
+            item = line[2:].strip()
+            container.append(_parse_yaml_scalar(item))
+            index += 1
+            continue
+
+        if not isinstance(container, dict):
+            raise ValueError(f"{path}: invalid block at line {index + 1}: {line}")
+
+        key, _, remainder = line.partition(":")
+        if not key:
+            raise ValueError(f"{path}: invalid YAML line at {index + 1}: {line}")
+        value = remainder.strip()
+        if value:
+            container[key.strip()] = _parse_yaml_scalar(value)
+            index += 1
+            continue
+
+        next_line = next_significant(index + 1)
+        child: Any
+        child_indent = indent + 2
+        if next_line is None:
+            child = {}
+        else:
+            child_indent = len(next_line[1]) - len(next_line[1].lstrip(" "))
+            if child_indent <= indent:
+                child = {}
+            elif next_line[1].strip().startswith("- "):
+                child = []
+            else:
+                child = {}
+        container[key.strip()] = child
+        stack.append((child_indent, child))
+        index += 1
+
+    return root if isinstance(root, dict) else {}
 
 
 def _load_config(path: str | None) -> dict[str, Any]:
@@ -24,18 +464,21 @@ def _load_config(path: str | None) -> dict[str, Any]:
     if ext in {".json", ".js"}:
         with open(path) as f:
             raw = json.load(f)
-        return raw if isinstance(raw, dict) else {}
+        cfg = raw if isinstance(raw, dict) else {}
+        _validate_config_shape(cfg, path)
+        return cfg
 
     try:
         import yaml  # type: ignore
     except ModuleNotFoundError:
-        raise ValueError(
-            "yaml config requested but pyyaml is not installed; install PyYAML or use JSON"
-        )
+        data = _parse_yaml_text(path)
+    else:
+        with open(path) as f:
+            data = yaml.safe_load(f)
 
-    with open(path) as f:
-        data = yaml.safe_load(f)
-    return data if isinstance(data, dict) else {}
+    cfg = data if isinstance(data, dict) else {}
+    _validate_config_shape(cfg, path)
+    return cfg
 
 
 def _pick_config_path(explicit: str | None, repo_root: str | None = None) -> str:
@@ -62,6 +505,19 @@ def _coerce_list(value: Any) -> list[str]:
     return []
 
 
+def _coerce_env_args(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        return [f"{key}={val}" for key, val in value.items()]
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    if isinstance(value, str):
+        stripped = value.strip()
+        return [stripped] if stripped else []
+    return []
+
+
 def _coerce_mutator_list(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(v).strip() for v in value if str(v).strip()]
@@ -76,6 +532,278 @@ def _split_csv(value: str | None) -> list[str]:
     if not value:
         return []
     return [v.strip() for v in value.split(",") if v.strip()]
+
+
+def _looks_sensitive_key(key: str) -> bool:
+    return bool(SENSITIVE_KEY_RE.search(key))
+
+
+def _redact_shell_assignments(value: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        key = match.group("key")
+        raw_value = match.group("value")
+        if not _looks_sensitive_key(key):
+            return match.group(0)
+        if raw_value.startswith("'") and raw_value.endswith("'"):
+            redacted = f"'{REDACTED_VALUE}'"
+        elif raw_value.startswith('"') and raw_value.endswith('"'):
+            redacted = f'"{REDACTED_VALUE}"'
+        else:
+            redacted = REDACTED_VALUE
+        return f"{match.group('prefix')}{key}={redacted}"
+
+    return SHELL_ASSIGNMENT_RE.sub(replace, value)
+
+
+def _redact_env_entry(value: str) -> str:
+    key, separator, _ = value.partition("=")
+    if not separator:
+        return value
+    return f"{key}{separator}{REDACTED_VALUE}"
+
+
+def _redact_config_value(key: str, value: Any) -> Any:
+    if key == "dashboardUploadUrl":
+        return REDACTED_VALUE if value else value
+    if key == "env":
+        if isinstance(value, dict):
+            return {str(env_key): REDACTED_VALUE for env_key in value}
+        if isinstance(value, list):
+            return [
+                _redact_env_entry(str(item))
+                for item in value
+            ]
+        if isinstance(value, str):
+            return _redact_env_entry(value)
+    if _looks_sensitive_key(key):
+        return REDACTED_VALUE
+    if isinstance(value, dict):
+        return {
+            str(child_key): _redact_config_value(str(child_key), child_value)
+            for child_key, child_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_config_value(key, item) for item in value]
+    if isinstance(value, str):
+        return _redact_shell_assignments(value)
+    return value
+
+
+def _redact_effective_config_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: _redact_config_value(key, value)
+        for key, value in payload.items()
+    }
+
+
+def _stable_hash(payload: Any) -> str:
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _effective_config_payload(cfg: dict[str, Any]) -> dict[str, Any]:
+    redacted = {
+        key: value
+        for key, value in cfg.items()
+        if key not in {"effective_config_json", "config_hash"}
+    }
+    return redacted
+
+
+def _adapter_commands(
+    build_system: str | None,
+    build_dir: str | None,
+    build_target: str | None,
+    test_target: str | None,
+    test_filter: str | None,
+    test_framework: str | None = None,
+    test_binary: str | None = None,
+    xctest_bundle: str | None = None,
+    repo: str | None = None,
+    xctest_destination: str | None = None,
+    xctest_only_testing: list[str] | None = None,
+    xctest_skip_testing: list[str] | None = None,
+) -> dict[str, str]:
+    out: dict[str, str] = {}
+    framework_test = _framework_test_command(
+        test_framework,
+        test_binary,
+        test_filter,
+        xctest_bundle,
+        repo,
+        build_dir,
+        xctest_destination,
+        xctest_only_testing,
+        xctest_skip_testing,
+    )
+    if not build_system:
+        if framework_test:
+            out["test"] = framework_test
+        return out
+    system = build_system.lower()
+    build_dir = build_dir or "build"
+    if system == "cmake":
+        out["build"] = " ".join(["cmake", "--build", _shell_quote(build_dir)] + (["--target", _shell_quote(build_target)] if build_target else []))
+        test = ["ctest", "--test-dir", _shell_quote(build_dir), "--output-on-failure"]
+        if test_filter:
+            test.extend(["--tests-regex", _shell_quote(test_filter)])
+        out["test"] = framework_test or " ".join(test)
+    elif system == "ctest":
+        out["build"] = " ".join(["cmake", "--build", _shell_quote(build_dir)] + (["--target", _shell_quote(build_target)] if build_target else []))
+        test = ["ctest", "--test-dir", _shell_quote(build_dir), "--output-on-failure"]
+        if test_filter:
+            test.extend(["--tests-regex", _shell_quote(test_filter)])
+        out["test"] = framework_test or " ".join(test)
+    elif system == "ninja":
+        out["build"] = " ".join(["ninja", "-C", _shell_quote(build_dir)] + ([_shell_quote(build_target)] if build_target else []))
+        out["test"] = framework_test or " ".join(["ninja", "-C", _shell_quote(build_dir), _shell_quote(test_target or "test")])
+    elif system == "make":
+        out["build"] = " ".join(["make", "-C", _shell_quote(build_dir)] + ([_shell_quote(build_target)] if build_target else []))
+        out["test"] = framework_test or " ".join(["make", "-C", _shell_quote(build_dir), _shell_quote(test_target or "test")])
+    elif system == "meson":
+        out["build"] = " ".join(["meson", "compile", "-C", _shell_quote(build_dir)] + ([_shell_quote(build_target)] if build_target else []))
+        test = ["meson", "test", "-C", _shell_quote(build_dir)]
+        if test_filter:
+            test.extend(["--suite", _shell_quote(test_filter)])
+        elif test_target:
+            test.append(_shell_quote(test_target))
+        out["test"] = framework_test or " ".join(test)
+    elif system == "bazel":
+        out["build"] = " ".join(["bazel", "build", _shell_quote(build_target or "//...")])
+        out["test"] = framework_test or " ".join(["bazel", "test", _shell_quote(test_target or build_target or "//...")])
+    else:
+        raise ValueError(f"unknown --build-system: {build_system}")
+    return out
+
+
+def _checker_command(
+    check_system: str | None,
+    check_args: str | None,
+    files: str | None,
+) -> str | None:
+    if not check_system:
+        return None
+    file_list = _coerce_list(files)
+    if not file_list:
+        raise ValueError(f"--check-system {check_system} requires --files")
+    system = check_system.lower()
+    quoted_files = [_shell_quote(file_name) for file_name in file_list]
+    args = shlex.split(check_args or "")
+    quoted_args = [_shell_quote(arg) for arg in args]
+    if system == "clang-tidy":
+        return " ".join(["clang-tidy", *quoted_args, *quoted_files])
+    if system == "cppcheck":
+        return " ".join(["cppcheck", *quoted_args, *quoted_files])
+    raise ValueError(f"unknown --check-system: {check_system}")
+
+
+def _framework_test_command(
+    test_framework: str | None,
+    test_binary: str | None,
+    test_filter: str | None,
+    xctest_bundle: str | None,
+    repo: str | None = None,
+    build_dir: str | None = None,
+    xctest_destination: str | None = None,
+    xctest_only_testing: list[str] | None = None,
+    xctest_skip_testing: list[str] | None = None,
+) -> str | None:
+    if not test_framework:
+        return None
+    framework = test_framework.lower()
+    if framework in {"gtest", "googletest"}:
+        test_binary = test_binary or _discover_test_binary(repo, build_dir, framework)
+        if not test_binary:
+            raise ValueError("--test-framework gtest requires --test-binary or a single discoverable test binary under --build-dir/build")
+        cmd = [_shell_quote(test_binary)]
+        if test_filter:
+            cmd.append(f"--gtest_filter={_shell_quote(test_filter)}")
+        return " ".join(cmd)
+    if framework == "catch2":
+        test_binary = test_binary or _discover_test_binary(repo, build_dir, framework)
+        if not test_binary:
+            raise ValueError("--test-framework catch2 requires --test-binary or a single discoverable test binary under --build-dir/build")
+        cmd = [_shell_quote(test_binary), "--reporter", "compact"]
+        if test_filter:
+            cmd.append(_shell_quote(test_filter))
+        return " ".join(cmd)
+    if framework == "doctest":
+        test_binary = test_binary or _discover_test_binary(repo, build_dir, framework)
+        if not test_binary:
+            raise ValueError("--test-framework doctest requires --test-binary or a single discoverable test binary under --build-dir/build")
+        cmd = [_shell_quote(test_binary)]
+        if test_filter:
+            cmd.append(f"--test-case={_shell_quote(test_filter)}")
+        return " ".join(cmd)
+    if framework == "xctest":
+        bundle = xctest_bundle or test_binary
+        if not bundle:
+            raise ValueError("--test-framework xctest requires --xctest-bundle or --test-binary")
+        only_testing = xctest_only_testing or []
+        skip_testing = xctest_skip_testing or []
+        if xctest_destination or only_testing or skip_testing:
+            cmd = ["xcodebuild", "test-without-building", "-xctestrun", _shell_quote(bundle)]
+            if xctest_destination:
+                cmd.extend(["-destination", _shell_quote(xctest_destination)])
+            for item in only_testing or ([test_filter] if test_filter else []):
+                cmd.append(_shell_quote(f"-only-testing:{item}"))
+            for item in skip_testing:
+                cmd.append(_shell_quote(f"-skip-testing:{item}"))
+            return " ".join(cmd)
+        cmd = ["xcrun", "xctest", _shell_quote(bundle)]
+        if test_filter:
+            cmd.extend(["-XCTest", _shell_quote(test_filter)])
+        return " ".join(cmd)
+    raise ValueError(f"unknown --test-framework: {test_framework}")
+
+
+def _shell_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def _is_test_binary_candidate(path: str) -> bool:
+    name = os.path.basename(path).lower()
+    if name.startswith(".") or os.path.isdir(path):
+        return False
+    if not any(token in name for token in ("test", "spec")):
+        return False
+    if os.name == "nt":
+        return name.endswith((".exe", ".bat", ".cmd"))
+    return os.access(path, os.X_OK)
+
+
+def _discover_test_binary(repo: str | None, build_dir: str | None, test_framework: str | None) -> str | None:
+    if not repo or not test_framework:
+        return None
+    framework = test_framework.lower()
+    if framework not in {"gtest", "googletest", "catch2", "doctest"}:
+        return None
+
+    repo_root = os.path.abspath(repo)
+    search_roots: list[str] = []
+    for candidate in [build_dir, "build", "cmake-build-debug", "cmake-build-release", "out", "bin"]:
+        if not candidate:
+            continue
+        path = candidate if os.path.isabs(candidate) else os.path.join(repo_root, candidate)
+        if os.path.isdir(path) and path not in search_roots:
+            search_roots.append(path)
+
+    matches: list[str] = []
+    for root in search_roots:
+        for current, dirs, files in os.walk(root):
+            dirs[:] = sorted(d for d in dirs if d not in {".git", "CMakeFiles", "__pycache__"})
+            for file_name in sorted(files):
+                path = os.path.join(current, file_name)
+                if _is_test_binary_candidate(path):
+                    matches.append(path)
+
+    unique = sorted(dict.fromkeys(matches))
+    if not unique:
+        return None
+    if len(unique) > 1:
+        rel = ", ".join(os.path.relpath(path, repo_root) for path in unique[:5])
+        more = "" if len(unique) <= 5 else f", ... ({len(unique)} total)"
+        raise ValueError(f"multiple test binaries discovered for {test_framework}: {rel}{more}; pass --test-binary")
+    return unique[0]
 
 
 def _apply_file_filters(paths: list[str], includes: list[str], excludes: list[str]) -> list[str]:
@@ -95,9 +823,28 @@ def _to_linespec(base_files: list[str] | None, fallback: str | None = None) -> s
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="stryker-cxx")
+    parser.add_argument("--version", action="version", version=f"stryker-cxx {VERSION}")
     parser.add_argument("--config", default=None, help="Optional YAML/JSON config file")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    init = subparsers.add_parser("init", help="write a starter stryker-cxx.yml config")
+    init.add_argument("--path", default="stryker-cxx.yml")
+    init.add_argument("--preset", choices=sorted(CONFIG_PRESETS), default=None)
+    init.add_argument("--force", action="store_true")
+
+    baseline_merge = subparsers.add_parser("baseline-merge", help="merge baseline cache files")
+    baseline_merge.add_argument("--output", required=True)
+    baseline_merge.add_argument("inputs", nargs="+")
+
+    baseline_prune = subparsers.add_parser("baseline-prune", help="prune baseline cache entries")
+    baseline_prune.add_argument("--baseline-file", required=True)
+    baseline_prune.add_argument("--repo", default=None)
+    baseline_prune.add_argument("--max-entries", type=int, default=None)
+
+    baseline_info = subparsers.add_parser("baseline-info", help="summarize baseline cache entries")
+    baseline_info.add_argument("--baseline-file", required=True)
+    baseline_info.add_argument("--repo", default=None)
 
     run = subparsers.add_parser("run", help="discover, mutate, build, and run tests")
     run.add_argument("--repo", required=True)
@@ -105,7 +852,31 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--base", default=None)
     run.add_argument("--lines", default=None)
     run.add_argument("--build-command", required=False, dest="build_command")
+    run.add_argument("--check-command", required=False, dest="check_command")
     run.add_argument("--test-command", required=False, dest="test_command")
+    run.add_argument("--build-system", choices=["cmake", "ctest", "ninja", "make", "meson", "bazel"], default=None)
+    run.add_argument("--build-dir", default=None)
+    run.add_argument("--build-target", default=None)
+    run.add_argument("--check-system", choices=["clang-tidy", "cppcheck"], default=None, dest="check_system")
+    run.add_argument("--check-args", default=None, dest="check_args")
+    run.add_argument("--test-target", default=None)
+    run.add_argument("--test-filter", default=None)
+    run.add_argument("--test-framework", choices=["gtest", "googletest", "catch2", "doctest", "xctest"], default=None)
+    run.add_argument("--test-binary", default=None)
+    run.add_argument("--xctest-bundle", default=None)
+    run.add_argument("--xctest-destination", default=None, dest="xctest_destination")
+    run.add_argument(
+        "--xctest-only-testing",
+        action="append",
+        default=[],
+        dest="xctest_only_testing",
+    )
+    run.add_argument(
+        "--xctest-skip-testing",
+        action="append",
+        default=[],
+        dest="xctest_skip_testing",
+    )
     run.add_argument("--report", required=True)
     run.add_argument("--max-mutants", type=int, default=None)
     run.add_argument("--include-metal", action="store_true")
@@ -113,15 +884,66 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--exclude", default=None)
     run.add_argument("--mutators", default=None)
     run.add_argument("--output-format", choices=["legacy", "stryker-cxx"], default="stryker-cxx")
-    run.add_argument("--format", choices=["json", "markdown", "html", "sarif", "mutation-testing-elements"], default="json")
-    run.add_argument("--mode", choices=["token", "clang"], default=None)
+    run.add_argument("--format", choices=["json", "markdown", "html", "sarif", "github-annotations", "mutation-testing-elements"], default="json")
+    run.add_argument("--mode", choices=["token", "clang", "clang-ast"], default=None)
     run.add_argument("--jobs", type=int, default=None, help="Parallel mutant execution with isolated worktrees.")
+    run.add_argument("--batch-mutants", action="store_true", dest="batch_mutants")
+    run.add_argument("--batch-size", type=int, default=None, dest="batch_size")
     run.add_argument("--worktree-mode", dest="worktree_mode", choices=["inplace", "git-worktree", "copy"], default=None)
     run.add_argument("--allow-dirty", action="store_true")
     run.add_argument("--threshold", type=float, default=None)
+    run.add_argument("--threshold-high", type=float, default=None, dest="threshold_high")
+    run.add_argument("--threshold-low", type=float, default=None, dest="threshold_low")
+    run.add_argument("--threshold-break", type=float, default=None, dest="threshold_break")
     run.add_argument("--fail-on-empty", action="store_true", dest="fail_on_empty")
     run.add_argument("--timeout", type=int, default=None, dest="timeout", help="Per-mutant timeout in seconds")
+    run.add_argument("--timeout-factor", type=float, default=None, dest="timeout_factor")
+    run.add_argument("--timeout-constant-ms", type=int, default=None, dest="timeout_constant_ms")
+    run.add_argument("--skip-initial-test", action="store_true", dest="skip_initial_test")
+    run.add_argument("--dry-run-only", action="store_true", dest="dry_run_only")
+    run.add_argument("--skip-tests", action="store_true", dest="skip_tests")
+    run.add_argument("--coverage-file", default=None, dest="coverage_file")
+    run.add_argument("--coverage-provider", default=None, dest="coverage_provider")
+    run.add_argument("--coverage-test-command-template", default=None, dest="coverage_test_command_template")
+    run.add_argument("--coverage-helper-command-template", default=None, dest="coverage_helper_command_template")
+    run.add_argument("--coverage-helper-tests", action="append", default=[], dest="coverage_helper_tests")
+    run.add_argument("--plugin", action="append", default=[])
+    run.add_argument("--plugin-dir", action="append", default=[])
+    run.add_argument("--reporter", action="append", default=[])
+    run.add_argument("--dashboard-export", default=None, dest="dashboard_export")
+    run.add_argument("--dashboard-upload-url", default=None, dest="dashboard_upload_url")
+    run.add_argument("--dashboard-version", default=None, dest="dashboard_version")
+    run.add_argument(
+        "--dashboard-retention-days",
+        type=int,
+        default=None,
+        dest="dashboard_retention_days",
+    )
+    run.add_argument(
+        "--dashboard-auth-token-env",
+        default=None,
+        dest="dashboard_auth_token_env",
+    )
+    run.add_argument("--dashboard-auth-header", default=None, dest="dashboard_auth_header")
+    run.add_argument("--incremental", action="store_true")
+    run.add_argument("--baseline-file", default=None, dest="baseline_file")
+    run.add_argument("--baseline-max-age-days", type=int, default=None, dest="baseline_max_age_days")
+    run.add_argument("--baseline-branch", default=None, dest="baseline_branch")
+    run.add_argument("--write-baseline", default=None, dest="write_baseline")
+    run.add_argument("--clear-baseline", action="store_true", dest="clear_baseline")
     run.add_argument("--artifact-dir", default=None)
+    run.add_argument("--retain-worktrees", action="store_true", dest="retain_worktrees")
+    run.add_argument("--retain-worktrees-for", default=None, dest="retain_worktrees_for")
+    run.add_argument(
+        "--retained-worktree-ttl-hours",
+        type=float,
+        default=None,
+        dest="retained_worktree_ttl_hours",
+    )
+    run.add_argument("--worker-tmp-dir", default=None, dest="worker_tmp_dir")
+    run.add_argument("--env", action="append", default=[], dest="env")
+    run.add_argument("--env-inherit", action="append", default=[], dest="env_inherit")
+    run.add_argument("--env-block", action="append", default=[], dest="env_block")
     run.add_argument("--resume", default=None)
     run.add_argument("--quiet", action="store_true")
     run.add_argument("--shard-index", type=int, default=None)
@@ -137,25 +959,100 @@ def _build_parser() -> argparse.ArgumentParser:
     list_mutants.add_argument("--include", default=None)
     list_mutants.add_argument("--exclude", default=None)
     list_mutants.add_argument("--mutators", default=None)
-    list_mutants.add_argument("--mode", choices=["token", "clang"], default=None)
+    list_mutants.add_argument("--mode", choices=["token", "clang", "clang-ast"], default=None)
+    list_mutants.add_argument("--plugin", action="append", default=[])
+    list_mutants.add_argument("--plugin-dir", action="append", default=[])
     list_mutants.add_argument("--format", choices=["json"], default="json")
 
     run_mutant = subparsers.add_parser("run-mutant", help="run a single mutant by stable ID")
     run_mutant.add_argument("--repo", required=True)
     run_mutant.add_argument("--id", required=True)
     run_mutant.add_argument("--build-command", required=False, dest="build_command")
+    run_mutant.add_argument("--check-command", required=False, dest="check_command")
     run_mutant.add_argument("--test-command", required=False, dest="test_command")
+    run_mutant.add_argument("--build-system", choices=["cmake", "ctest", "ninja", "make", "meson", "bazel"], default=None)
+    run_mutant.add_argument("--build-dir", default=None)
+    run_mutant.add_argument("--build-target", default=None)
+    run_mutant.add_argument("--check-system", choices=["clang-tidy", "cppcheck"], default=None, dest="check_system")
+    run_mutant.add_argument("--check-args", default=None, dest="check_args")
+    run_mutant.add_argument("--test-target", default=None)
+    run_mutant.add_argument("--test-filter", default=None)
+    run_mutant.add_argument("--test-framework", choices=["gtest", "googletest", "catch2", "doctest", "xctest"], default=None)
+    run_mutant.add_argument("--test-binary", default=None)
+    run_mutant.add_argument("--xctest-bundle", default=None)
+    run_mutant.add_argument("--xctest-destination", default=None, dest="xctest_destination")
+    run_mutant.add_argument(
+        "--xctest-only-testing",
+        action="append",
+        default=[],
+        dest="xctest_only_testing",
+    )
+    run_mutant.add_argument(
+        "--xctest-skip-testing",
+        action="append",
+        default=[],
+        dest="xctest_skip_testing",
+    )
     run_mutant.add_argument("--report", required=True)
     run_mutant.add_argument("--base", default=None)
     run_mutant.add_argument("--lines", default=None)
     run_mutant.add_argument("--output-format", choices=["legacy", "stryker-cxx"], default="stryker-cxx")
-    run_mutant.add_argument("--format", choices=["json", "markdown", "html", "sarif", "mutation-testing-elements"], default="json")
+    run_mutant.add_argument("--format", choices=["json", "markdown", "html", "sarif", "github-annotations", "mutation-testing-elements"], default="json")
     run_mutant.add_argument("--timeout", type=int, default=None, dest="timeout")
+    run_mutant.add_argument("--timeout-factor", type=float, default=None, dest="timeout_factor")
+    run_mutant.add_argument("--timeout-constant-ms", type=int, default=None, dest="timeout_constant_ms")
+    run_mutant.add_argument("--skip-initial-test", action="store_true", dest="skip_initial_test")
+    run_mutant.add_argument("--dry-run-only", action="store_true", dest="dry_run_only")
+    run_mutant.add_argument("--skip-tests", action="store_true", dest="skip_tests")
+    run_mutant.add_argument("--coverage-file", default=None, dest="coverage_file")
+    run_mutant.add_argument("--coverage-provider", default=None, dest="coverage_provider")
+    run_mutant.add_argument("--coverage-test-command-template", default=None, dest="coverage_test_command_template")
+    run_mutant.add_argument("--coverage-helper-command-template", default=None, dest="coverage_helper_command_template")
+    run_mutant.add_argument("--coverage-helper-tests", action="append", default=[], dest="coverage_helper_tests")
+    run_mutant.add_argument("--plugin", action="append", default=[])
+    run_mutant.add_argument("--plugin-dir", action="append", default=[])
+    run_mutant.add_argument("--reporter", action="append", default=[])
+    run_mutant.add_argument("--dashboard-export", default=None, dest="dashboard_export")
+    run_mutant.add_argument("--dashboard-upload-url", default=None, dest="dashboard_upload_url")
+    run_mutant.add_argument("--dashboard-version", default=None, dest="dashboard_version")
+    run_mutant.add_argument(
+        "--dashboard-retention-days",
+        type=int,
+        default=None,
+        dest="dashboard_retention_days",
+    )
+    run_mutant.add_argument(
+        "--dashboard-auth-token-env",
+        default=None,
+        dest="dashboard_auth_token_env",
+    )
+    run_mutant.add_argument("--dashboard-auth-header", default=None, dest="dashboard_auth_header")
+    run_mutant.add_argument("--incremental", action="store_true")
+    run_mutant.add_argument("--baseline-file", default=None, dest="baseline_file")
+    run_mutant.add_argument("--baseline-max-age-days", type=int, default=None, dest="baseline_max_age_days")
+    run_mutant.add_argument("--baseline-branch", default=None, dest="baseline_branch")
+    run_mutant.add_argument("--write-baseline", default=None, dest="write_baseline")
+    run_mutant.add_argument("--clear-baseline", action="store_true", dest="clear_baseline")
     run_mutant.add_argument("--artifact-dir", default=None)
+    run_mutant.add_argument("--retain-worktrees", action="store_true", dest="retain_worktrees")
+    run_mutant.add_argument("--retain-worktrees-for", default=None, dest="retain_worktrees_for")
+    run_mutant.add_argument(
+        "--retained-worktree-ttl-hours",
+        type=float,
+        default=None,
+        dest="retained_worktree_ttl_hours",
+    )
+    run_mutant.add_argument("--worker-tmp-dir", default=None, dest="worker_tmp_dir")
+    run_mutant.add_argument("--env", action="append", default=[], dest="env")
+    run_mutant.add_argument("--env-inherit", action="append", default=[], dest="env_inherit")
+    run_mutant.add_argument("--env-block", action="append", default=[], dest="env_block")
     run_mutant.add_argument("--mutators", default=None)
     run_mutant.add_argument("--fail-on-empty", action="store_true", dest="fail_on_empty")
     run_mutant.add_argument("--threshold", type=float, default=None)
-    run_mutant.add_argument("--mode", choices=["token", "clang"], default=None)
+    run_mutant.add_argument("--threshold-high", type=float, default=None, dest="threshold_high")
+    run_mutant.add_argument("--threshold-low", type=float, default=None, dest="threshold_low")
+    run_mutant.add_argument("--threshold-break", type=float, default=None, dest="threshold_break")
+    run_mutant.add_argument("--mode", choices=["token", "clang", "clang-ast"], default=None)
     run_mutant.add_argument("--worktree-mode", dest="worktree_mode", choices=["inplace", "git-worktree", "copy"], default=None)
     run_mutant.add_argument("--allow-dirty", action="store_true")
     run_mutant.add_argument("--quiet", action="store_true")
@@ -165,22 +1062,205 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _init_config(args: argparse.Namespace) -> int:
+    path = args.path
+    if os.path.exists(path) and not args.force:
+        raise ValueError(f"config already exists: {path} (use --force to overwrite)")
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w") as f:
+        f.write(_config_for_preset(args.preset))
+    print(path)
+    return 0
+
+
+def _read_baseline_payload(path: str) -> dict[str, Any]:
+    if not os.path.exists(path):
+        return {"schemaVersion": "stryker-cxx.baseline.v1", "tool": "stryker-cxx", "entries": {}}
+    with open(path) as f:
+        payload = json.load(f)
+    if not isinstance(payload, dict):
+        raise ValueError(f"baseline must be an object: {path}")
+    payload.setdefault("schemaVersion", "stryker-cxx.baseline.v1")
+    payload.setdefault("tool", "stryker-cxx")
+    payload.setdefault("entries", {})
+    if not isinstance(payload["entries"], dict):
+        raise ValueError(f"baseline entries must be an object: {path}")
+    return payload
+
+
+def _write_baseline_payload(path: str, payload: dict[str, Any]) -> None:
+    payload["updatedAt"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+
+
+def _baseline_merge(args: argparse.Namespace) -> int:
+    merged: dict[str, Any] = {
+        "schemaVersion": "stryker-cxx.baseline.v1",
+        "tool": "stryker-cxx",
+        "entries": {},
+    }
+    for path in args.inputs:
+        payload = _read_baseline_payload(path)
+        merged["entries"].update(payload.get("entries", {}))
+    _write_baseline_payload(args.output, merged)
+    print(json.dumps({"output": args.output, "entries": len(merged["entries"])}, indent=2))
+    return 0
+
+
+def _baseline_prune(args: argparse.Namespace) -> int:
+    if args.max_entries is not None and args.max_entries < 1:
+        raise ValueError("--max-entries must be >= 1")
+    payload = _read_baseline_payload(args.baseline_file)
+    entries = payload.get("entries", {})
+    original_count = len(entries)
+    if args.repo:
+        repo = os.path.abspath(args.repo)
+        entries = {
+            key: value
+            for key, value in entries.items()
+            if _baseline_entry_file_exists(repo, value)
+        }
+    if args.max_entries is not None and len(entries) > args.max_entries:
+        ordered = sorted(
+            entries.items(),
+            key=lambda item: str(item[1].get("updatedAt", "")) if isinstance(item[1], dict) else "",
+            reverse=True,
+        )
+        entries = dict(ordered[: args.max_entries])
+    payload["entries"] = entries
+    _write_baseline_payload(args.baseline_file, payload)
+    print(json.dumps({"baselineFile": args.baseline_file, "before": original_count, "after": len(entries)}, indent=2))
+    return 0
+
+
+def _baseline_info(args: argparse.Namespace) -> int:
+    payload = _read_baseline_payload(args.baseline_file)
+    entries = payload.get("entries", {})
+    repo = os.path.abspath(args.repo) if args.repo else None
+    by_status: dict[str, int] = {}
+    by_branch: dict[str, int] = {}
+    updated_at: list[str] = []
+    file_existence = {"present": 0, "missing": 0} if repo else None
+
+    for value in entries.values():
+        if not isinstance(value, dict):
+            continue
+        mutant = value.get("mutant") if isinstance(value.get("mutant"), dict) else {}
+        status = str(mutant.get("status") or "UNKNOWN").upper()
+        by_status[status] = by_status.get(status, 0) + 1
+        branch = str(value.get("branch") or mutant.get("baselineBranch") or "none")
+        by_branch[branch] = by_branch.get(branch, 0) + 1
+        updated = value.get("updatedAt")
+        if isinstance(updated, str) and updated:
+            updated_at.append(updated)
+        if file_existence is not None:
+            key = "present" if _baseline_entry_file_exists(repo, value) else "missing"
+            file_existence[key] += 1
+
+    out: dict[str, Any] = {
+        "baselineFile": args.baseline_file,
+        "entries": len(entries),
+        "byStatus": dict(sorted(by_status.items())),
+        "byBranch": dict(sorted(by_branch.items())),
+        "oldestUpdatedAt": min(updated_at) if updated_at else None,
+        "newestUpdatedAt": max(updated_at) if updated_at else None,
+    }
+    if file_existence is not None:
+        out["fileExistence"] = file_existence
+    print(json.dumps(out, indent=2))
+    return 0
+
+
+def _baseline_entry_file_exists(repo: str, value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    mutant = value.get("mutant")
+    if not isinstance(mutant, dict):
+        return False
+    file_name = mutant.get("file")
+    if not isinstance(file_name, str) or not file_name:
+        return False
+    return os.path.exists(os.path.join(repo, file_name))
+
+
 def _resolve_defaults(args: argparse.Namespace) -> dict[str, Any]:
     config_path = _pick_config_path(args.config, getattr(args, "repo", None))
     cfg = _load_config(config_path) if config_path else {}
 
     execution = cfg.get("execution", {}) if isinstance(cfg.get("execution"), dict) else {}
     report_cfg = cfg.get("report", {}) if isinstance(cfg.get("report"), dict) else {}
+    thresholds_cfg = cfg.get("thresholds", {}) if isinstance(cfg.get("thresholds"), dict) else {}
+    report_thresholds_cfg = report_cfg.get("thresholds", {}) if isinstance(report_cfg.get("thresholds"), dict) else {}
     files_cfg = cfg.get("files") if isinstance(cfg.get("files"), dict) else {}
     cfg_mutators = _coerce_mutator_list(cfg.get("mutators"))
     exec_mutators = _coerce_mutator_list(execution.get("mutators"))
+    build_system = getattr(args, "build_system", None) or execution.get("buildSystem")
+    build_dir = getattr(args, "build_dir", None) or execution.get("buildDir")
+    build_target = getattr(args, "build_target", None) or execution.get("buildTarget")
+    check_system = getattr(args, "check_system", None) or execution.get("checkSystem")
+    check_args = getattr(args, "check_args", None) or execution.get("checkArgs")
+    test_target = getattr(args, "test_target", None) or execution.get("testTarget")
+    test_filter = getattr(args, "test_filter", None) or execution.get("testFilter")
+    test_framework = getattr(args, "test_framework", None) or execution.get("testFramework")
+    test_binary = getattr(args, "test_binary", None) or execution.get("testBinary")
+    xctest_bundle = getattr(args, "xctest_bundle", None) or execution.get("xctestBundle")
+    xctest_destination = (
+        getattr(args, "xctest_destination", None)
+        or execution.get("xctestDestination")
+    )
+    xctest_only_testing = _coerce_list(
+        getattr(args, "xctest_only_testing", None)
+    ) or _coerce_list(execution.get("xctestOnlyTesting"))
+    xctest_skip_testing = _coerce_list(
+        getattr(args, "xctest_skip_testing", None)
+    ) or _coerce_list(execution.get("xctestSkipTesting"))
+    if test_framework and not test_binary:
+        test_binary = _discover_test_binary(getattr(args, "repo", None), build_dir, test_framework)
+    files_value = getattr(args, "files", None) or (cfg.get("files") if isinstance(cfg.get("files"), str) else None)
+    if not files_value and getattr(args, "id", None):
+        files_value = str(getattr(args, "id")).split(":", 1)[0]
+    checker = _checker_command(check_system, check_args, files_value)
+    adapter = _adapter_commands(
+        build_system,
+        build_dir,
+        build_target,
+        test_target,
+        test_filter,
+        test_framework,
+        test_binary,
+        xctest_bundle,
+        getattr(args, "repo", None),
+        xctest_destination,
+        xctest_only_testing,
+        xctest_skip_testing,
+    )
 
     defaults = {
         "repo": getattr(args, "repo", None),
-        "files": getattr(args, "files", None) or (cfg.get("files") if isinstance(cfg.get("files"), str) else None),
+        "files": files_value,
         "base": getattr(args, "base", None) if getattr(args, "base", None) is not None else cfg.get("base"),
-        "build_command": getattr(args, "build_command", None) or execution.get("buildCommand"),
-        "test_command": getattr(args, "test_command", None) or execution.get("testCommand"),
+        "build_command": getattr(args, "build_command", None) or execution.get("buildCommand") or adapter.get("build"),
+        "check_command": getattr(args, "check_command", None) or execution.get("checkCommand") or checker,
+        "test_command": getattr(args, "test_command", None) or execution.get("testCommand") or adapter.get("test"),
+        "build_system": build_system,
+        "build_dir": build_dir,
+        "build_target": build_target,
+        "check_system": check_system,
+        "check_args": check_args,
+        "test_target": test_target,
+        "test_filter": test_filter,
+        "test_framework": test_framework,
+        "test_binary": test_binary,
+        "xctest_bundle": xctest_bundle,
+        "xctest_destination": xctest_destination,
+        "xctest_only_testing": xctest_only_testing,
+        "xctest_skip_testing": xctest_skip_testing,
         "max_mutants": getattr(args, "max_mutants", None) if getattr(args, "max_mutants", None) is not None else execution.get("maxMutants"),
         "include_metal": bool(
             getattr(args, "include_metal", False)
@@ -188,10 +1268,109 @@ def _resolve_defaults(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "mutators": getattr(args, "mutators", None) or execution.get("mutators") or execution.get("mutationMutators") or cfg.get("mutators"),
         "threshold": getattr(args, "threshold", None) if getattr(args, "threshold", None) is not None else execution.get("threshold"),
+        "threshold_high": (
+            getattr(args, "threshold_high", None)
+            if getattr(args, "threshold_high", None) is not None
+            else thresholds_cfg.get("high", report_thresholds_cfg.get("high", execution.get("thresholdHigh")))
+        ),
+        "threshold_low": (
+            getattr(args, "threshold_low", None)
+            if getattr(args, "threshold_low", None) is not None
+            else thresholds_cfg.get("low", report_thresholds_cfg.get("low", execution.get("thresholdLow")))
+        ),
+        "threshold_break": (
+            getattr(args, "threshold_break", None)
+            if getattr(args, "threshold_break", None) is not None
+            else thresholds_cfg.get("break", report_thresholds_cfg.get("break", execution.get("thresholdBreak")))
+        ),
         "timeout": getattr(args, "timeout", None) if getattr(args, "timeout", None) is not None else execution.get("timeoutSeconds"),
-        "artifact_dir": getattr(args, "artifact_dir", None) if hasattr(args, "artifact_dir") else execution.get("artifactDir"),
+        "timeout_factor": (
+            getattr(args, "timeout_factor", None)
+            if getattr(args, "timeout_factor", None) is not None
+            else execution.get("timeoutFactor", 1.5)
+        ),
+        "timeout_constant_ms": (
+            getattr(args, "timeout_constant_ms", None)
+            if getattr(args, "timeout_constant_ms", None) is not None
+            else execution.get("timeoutConstantMs", 5000)
+        ),
+        "skip_initial_test": bool(
+            getattr(args, "skip_initial_test", False)
+            or execution.get("skipInitialTest", False)
+            or execution.get("initialTest") is False
+        ),
+        "dry_run_only": bool(getattr(args, "dry_run_only", False) or execution.get("dryRunOnly", False)),
+        "skip_tests": bool(getattr(args, "skip_tests", False) or execution.get("skipTests", False)),
+        "coverage_file": getattr(args, "coverage_file", None) or execution.get("coverageFile") or cfg.get("coverageFile"),
+        "coverage_provider": getattr(args, "coverage_provider", None) or execution.get("coverageProvider") or cfg.get("coverageProvider"),
+        "coverage_test_command_template": getattr(args, "coverage_test_command_template", None) or execution.get("coverageTestCommandTemplate"),
+        "coverage_helper_command_template": (
+            getattr(args, "coverage_helper_command_template", None)
+            or execution.get("coverageHelperCommandTemplate")
+            or cfg.get("coverageHelperCommandTemplate")
+        ),
+        "coverage_helper_tests": (
+            _coerce_list(getattr(args, "coverage_helper_tests", None))
+            or _coerce_list(execution.get("coverageHelperTests"))
+            or _coerce_list(cfg.get("coverageHelperTests"))
+        ),
+        "plugins": _coerce_list(getattr(args, "plugin", None)) or _coerce_list(execution.get("plugins")) or _coerce_list(cfg.get("plugins")),
+        "plugin_dirs": _coerce_list(getattr(args, "plugin_dir", None)) or _coerce_list(execution.get("pluginDirs")) or _coerce_list(cfg.get("pluginDirs")),
+        "reporters": _coerce_list(getattr(args, "reporter", None)) or _coerce_list(execution.get("reporters")),
+        "dashboard_export": getattr(args, "dashboard_export", None) or execution.get("dashboardExport"),
+        "dashboard_upload_url": getattr(args, "dashboard_upload_url", None) or execution.get("dashboardUploadUrl"),
+        "dashboard_version": (
+            getattr(args, "dashboard_version", None)
+            or execution.get("dashboardVersion", "1")
+        ),
+        "dashboard_retention_days": (
+            getattr(args, "dashboard_retention_days", None)
+            if getattr(args, "dashboard_retention_days", None) is not None
+            else execution.get("dashboardRetentionDays")
+        ),
+        "dashboard_auth_token_env": (
+            getattr(args, "dashboard_auth_token_env", None)
+            or execution.get("dashboardAuthTokenEnv")
+        ),
+        "dashboard_auth_header": (
+            getattr(args, "dashboard_auth_header", None)
+            or execution.get("dashboardAuthHeader", "Authorization")
+        ),
+        "incremental": bool(getattr(args, "incremental", False) or execution.get("incremental", False)),
+        "baseline_file": getattr(args, "baseline_file", None) or execution.get("baselineFile") or cfg.get("baselineFile"),
+        "baseline_max_age_days": (
+            getattr(args, "baseline_max_age_days", None)
+            if getattr(args, "baseline_max_age_days", None) is not None
+            else execution.get("baselineMaxAgeDays")
+        ),
+        "baseline_branch": getattr(args, "baseline_branch", None) or execution.get("baselineBranch"),
+        "write_baseline": getattr(args, "write_baseline", None) or execution.get("writeBaseline") or cfg.get("writeBaseline"),
+        "clear_baseline": bool(getattr(args, "clear_baseline", False) or execution.get("clearBaseline", False)),
+        "artifact_dir": getattr(args, "artifact_dir", None) or execution.get("artifactDir"),
+        "retain_worktrees": bool(getattr(args, "retain_worktrees", False) or execution.get("retainWorktrees", False)),
+        "retain_worktrees_for": (
+            _coerce_list(getattr(args, "retain_worktrees_for", None))
+            or _coerce_list(execution.get("retainWorktreesFor"))
+        ),
+        "retained_worktree_ttl_hours": (
+            getattr(args, "retained_worktree_ttl_hours", None)
+            if getattr(args, "retained_worktree_ttl_hours", None) is not None
+            else execution.get("retainedWorktreeTtlHours")
+        ),
+        "worker_tmp_dir": getattr(args, "worker_tmp_dir", None) or execution.get("workerTmpDir"),
+        "env": _coerce_env_args(getattr(args, "env", None)) or _coerce_env_args(execution.get("env")),
+        "env_inherit": _coerce_list(getattr(args, "env_inherit", None))
+        or _coerce_list(execution.get("envInherit")),
+        "env_block": _coerce_list(getattr(args, "env_block", None))
+        or _coerce_list(execution.get("envBlock")),
         "mode": getattr(args, "mode", None) if getattr(args, "mode", None) is not None else execution.get("mode", "token"),
         "jobs": getattr(args, "jobs", None) if getattr(args, "jobs", None) is not None else execution.get("jobs", 1),
+        "batch_mutants": bool(getattr(args, "batch_mutants", False) or execution.get("batchMutants", False)),
+        "batch_size": (
+            getattr(args, "batch_size", None)
+            if getattr(args, "batch_size", None) is not None
+            else execution.get("batchSize", 4)
+        ),
         "worktree_mode": (
             getattr(args, "worktree_mode", None)
             if getattr(args, "worktree_mode", None) is not None
@@ -226,9 +1405,21 @@ def _resolve_defaults(args: argparse.Namespace) -> dict[str, Any]:
 
     if defaults["threshold"] is None:
         defaults["threshold"] = defaults.get("report_threshold")
+    if defaults["threshold_break"] is None:
+        defaults["threshold_break"] = report_cfg.get("thresholdBreak", None)
 
     if defaults["jobs"] is not None and defaults["jobs"] < 1:
         raise ValueError("--jobs must be >= 1")
+    if defaults["batch_size"] is not None and defaults["batch_size"] < 1:
+        raise ValueError("--batch-size must be >= 1")
+    if defaults["timeout"] is not None and defaults["timeout"] < 1:
+        raise ValueError("--timeout must be >= 1")
+    if defaults["timeout_factor"] is not None and defaults["timeout_factor"] < 0:
+        raise ValueError("--timeout-factor must be >= 0")
+    if defaults["timeout_constant_ms"] is not None and defaults["timeout_constant_ms"] < 0:
+        raise ValueError("--timeout-constant-ms must be >= 0")
+    if defaults["dry_run_only"] and defaults["skip_initial_test"]:
+        raise ValueError("--dry-run-only cannot be combined with --skip-initial-test")
 
     if defaults["shard_total"] is not None and defaults["shard_total"] < 1:
         raise ValueError("--shard-total must be >= 1")
@@ -242,7 +1433,7 @@ def _resolve_defaults(args: argparse.Namespace) -> dict[str, Any]:
     if defaults["fail_on_empty"] is False and defaults.get("fail_on_empty_report"):
         defaults["fail_on_empty"] = True
 
-    if defaults["build_command"] is None or defaults["test_command"] is None:
+    if defaults["build_command"] is None or (defaults["test_command"] is None and not defaults["skip_tests"]):
         # allow parser validation to fail with concrete context in run/list context.
         pass
 
@@ -267,6 +1458,11 @@ def _resolve_defaults(args: argparse.Namespace) -> dict[str, Any]:
         )
     defaults["files_include"] = cfg_includes + cli_includes
     defaults["files_exclude"] = cfg_excludes + cli_excludes
+    effective = _effective_config_payload(defaults)
+    redacted_effective = _redact_effective_config_payload(effective)
+    defaults["config_path"] = config_path or None
+    defaults["config_hash"] = _stable_hash({"source": cfg, "effective": effective})
+    defaults["effective_config_json"] = json.dumps(redacted_effective, sort_keys=True, default=str)
 
     return defaults
 
@@ -278,8 +1474,8 @@ def _run(args: argparse.Namespace) -> int:
     if not files:
         raise ValueError("run requires --files or stryker-cxx config files.include")
 
-    if not cfg["build_command"] or not cfg["test_command"]:
-        raise ValueError("run requires --build-command/--test-command or config equivalents")
+    if not cfg["build_command"] or (not cfg["test_command"] and not cfg["skip_tests"]):
+        raise ValueError("run requires --build-command and --test-command unless --skip-tests is set")
 
     mutators = cfg["mutators"]
     legacy_args = [
@@ -289,10 +1485,18 @@ def _run(args: argparse.Namespace) -> int:
         ",".join(files),
         "--build-cmd",
         cfg["build_command"],
+        "--check-cmd",
+        cfg["check_command"] or "",
         "--test-cmd",
-        cfg["test_command"],
+        cfg["test_command"] or "",
         "--report",
         cfg["report"],
+        "--config-path",
+        cfg["config_path"] or "",
+        "--config-hash",
+        cfg["config_hash"],
+        "--effective-config-json",
+        cfg["effective_config_json"],
         "--output-format",
         cfg["output_format"],
         "--format",
@@ -310,12 +1514,26 @@ def _run(args: argparse.Namespace) -> int:
         legacy_args.append("--include-metal")
     if cfg["threshold"] is not None:
         legacy_args.extend(["--threshold", str(cfg["threshold"])])
+    if cfg["threshold_high"] is not None:
+        legacy_args.extend(["--threshold-high", str(cfg["threshold_high"])])
+    if cfg["threshold_low"] is not None:
+        legacy_args.extend(["--threshold-low", str(cfg["threshold_low"])])
+    if cfg["threshold_break"] is not None:
+        legacy_args.extend(["--threshold-break", str(cfg["threshold_break"])])
     if cfg["timeout"] is not None:
         legacy_args.extend(["--timeout", str(cfg["timeout"])])
+    if cfg["timeout_factor"] is not None:
+        legacy_args.extend(["--timeout-factor", str(cfg["timeout_factor"])])
+    if cfg["timeout_constant_ms"] is not None:
+        legacy_args.extend(["--timeout-constant-ms", str(cfg["timeout_constant_ms"])])
     if cfg["mode"] is not None:
         legacy_args.extend(["--mode", str(cfg["mode"])])
     if cfg["jobs"] is not None:
         legacy_args.extend(["--jobs", str(cfg["jobs"])])
+    if cfg["batch_mutants"]:
+        legacy_args.append("--batch-mutants")
+    if cfg["batch_size"] is not None:
+        legacy_args.extend(["--batch-size", str(cfg["batch_size"])])
     if cfg["shard_index"] is not None:
         legacy_args.extend(["--shard-index", str(cfg["shard_index"])])
     if cfg["shard_total"] is not None:
@@ -326,10 +1544,70 @@ def _run(args: argparse.Namespace) -> int:
         legacy_args.append("--allow-dirty")
     if cfg["artifact_dir"]:
         legacy_args.extend(["--artifact-dir", cfg["artifact_dir"]])
+    if cfg["retain_worktrees"]:
+        legacy_args.append("--retain-worktrees")
+    if cfg["retain_worktrees_for"]:
+        legacy_args.extend(["--retain-worktrees-for", ",".join(cfg["retain_worktrees_for"])])
+    if cfg["retained_worktree_ttl_hours"] is not None:
+        legacy_args.extend(["--retained-worktree-ttl-hours", str(cfg["retained_worktree_ttl_hours"])])
+    if cfg["worker_tmp_dir"]:
+        legacy_args.extend(["--worker-tmp-dir", cfg["worker_tmp_dir"]])
+    for item in cfg["env"]:
+        legacy_args.extend(["--env", item])
+    for item in cfg["env_inherit"]:
+        legacy_args.extend(["--env-inherit", item])
+    for item in cfg["env_block"]:
+        legacy_args.extend(["--env-block", item])
     if cfg["resume"]:
         legacy_args.extend(["--resume", cfg["resume"]])
     if cfg["fail_on_empty"]:
         legacy_args.append("--fail-on-empty")
+    if cfg["skip_initial_test"]:
+        legacy_args.append("--skip-initial-test")
+    if cfg["dry_run_only"]:
+        legacy_args.append("--dry-run-only")
+    if cfg["skip_tests"]:
+        legacy_args.append("--skip-tests")
+    if cfg["coverage_file"]:
+        legacy_args.extend(["--coverage-file", cfg["coverage_file"]])
+    if cfg["coverage_provider"]:
+        legacy_args.extend(["--coverage-provider", cfg["coverage_provider"]])
+    if cfg["coverage_test_command_template"]:
+        legacy_args.extend(["--coverage-test-command-template", cfg["coverage_test_command_template"]])
+    if cfg["coverage_helper_command_template"]:
+        legacy_args.extend(["--coverage-helper-command-template", cfg["coverage_helper_command_template"]])
+    for item in cfg["coverage_helper_tests"]:
+        legacy_args.extend(["--coverage-helper-tests", item])
+    for plugin in cfg["plugins"]:
+        legacy_args.extend(["--plugin", plugin])
+    for plugin_dir in cfg["plugin_dirs"]:
+        legacy_args.extend(["--plugin-dir", plugin_dir])
+    for reporter in cfg["reporters"]:
+        legacy_args.extend(["--reporter", reporter])
+    if cfg["dashboard_export"]:
+        legacy_args.extend(["--dashboard-export", cfg["dashboard_export"]])
+    if cfg["dashboard_upload_url"]:
+        legacy_args.extend(["--dashboard-upload-url", cfg["dashboard_upload_url"]])
+    if cfg["dashboard_version"]:
+        legacy_args.extend(["--dashboard-version", cfg["dashboard_version"]])
+    if cfg["dashboard_retention_days"] is not None:
+        legacy_args.extend(["--dashboard-retention-days", str(cfg["dashboard_retention_days"])])
+    if cfg["dashboard_auth_token_env"]:
+        legacy_args.extend(["--dashboard-auth-token-env", cfg["dashboard_auth_token_env"]])
+    if cfg["dashboard_auth_header"]:
+        legacy_args.extend(["--dashboard-auth-header", cfg["dashboard_auth_header"]])
+    if cfg["incremental"]:
+        legacy_args.append("--incremental")
+    if cfg["baseline_file"]:
+        legacy_args.extend(["--baseline-file", cfg["baseline_file"]])
+    if cfg["baseline_max_age_days"] is not None:
+        legacy_args.extend(["--baseline-max-age-days", str(cfg["baseline_max_age_days"])])
+    if cfg["baseline_branch"]:
+        legacy_args.extend(["--baseline-branch", cfg["baseline_branch"]])
+    if cfg["write_baseline"]:
+        legacy_args.extend(["--write-baseline", cfg["write_baseline"]])
+    if cfg["clear_baseline"]:
+        legacy_args.append("--clear-baseline")
     if cfg["quiet"]:
         legacy_args.append("--quiet")
 
@@ -345,6 +1623,7 @@ def _list_mutants(args: argparse.Namespace) -> int:
 
     mutators = cfg["mutators"]
     repo = cfg["repo"]
+    engine.load_plugins(cfg["plugins"], cfg["plugin_dirs"])
 
     enabled = [m.strip() for m in mutators.split(",") if m.strip()]
     bad = [m for m in enabled if m not in engine.MUTATORS]
@@ -397,8 +1676,8 @@ def _parse_mutant_id(mut_id: str) -> str:
 def _run_mutant(args: argparse.Namespace) -> int:
     cfg = _resolve_defaults(args)
 
-    if not cfg["build_command"] or not cfg["test_command"]:
-        raise ValueError("run-mutant requires --build-command/--test-command or config equivalents")
+    if not cfg["build_command"] or (not cfg["test_command"] and not cfg["skip_tests"]):
+        raise ValueError("run-mutant requires --build-command and --test-command unless --skip-tests is set")
 
     file_hint = _parse_mutant_id(args.id)
     legacy_args = [
@@ -408,10 +1687,18 @@ def _run_mutant(args: argparse.Namespace) -> int:
         file_hint,
         "--build-cmd",
         cfg["build_command"],
+        "--check-cmd",
+        cfg["check_command"] or "",
         "--test-cmd",
-        cfg["test_command"],
+        cfg["test_command"] or "",
         "--report",
         cfg["report"],
+        "--config-path",
+        cfg["config_path"] or "",
+        "--config-hash",
+        cfg["config_hash"],
+        "--effective-config-json",
+        cfg["effective_config_json"],
         "--output-format",
         cfg["output_format"],
         "--format",
@@ -427,6 +1714,10 @@ def _run_mutant(args: argparse.Namespace) -> int:
         legacy_args.extend(["--lines", args.lines])
     if cfg["timeout"] is not None:
         legacy_args.extend(["--timeout", str(cfg["timeout"])])
+    if cfg["timeout_factor"] is not None:
+        legacy_args.extend(["--timeout-factor", str(cfg["timeout_factor"])])
+    if cfg["timeout_constant_ms"] is not None:
+        legacy_args.extend(["--timeout-constant-ms", str(cfg["timeout_constant_ms"])])
     if cfg["mode"] is not None:
         legacy_args.extend(["--mode", str(cfg["mode"])])
     if cfg["jobs"] is not None:
@@ -441,12 +1732,78 @@ def _run_mutant(args: argparse.Namespace) -> int:
         legacy_args.append("--allow-dirty")
     if cfg["artifact_dir"]:
         legacy_args.extend(["--artifact-dir", cfg["artifact_dir"]])
+    if cfg["retain_worktrees"]:
+        legacy_args.append("--retain-worktrees")
+    if cfg["retain_worktrees_for"]:
+        legacy_args.extend(["--retain-worktrees-for", ",".join(cfg["retain_worktrees_for"])])
+    if cfg["retained_worktree_ttl_hours"] is not None:
+        legacy_args.extend(["--retained-worktree-ttl-hours", str(cfg["retained_worktree_ttl_hours"])])
+    if cfg["worker_tmp_dir"]:
+        legacy_args.extend(["--worker-tmp-dir", cfg["worker_tmp_dir"]])
+    for item in cfg["env"]:
+        legacy_args.extend(["--env", item])
+    for item in cfg["env_inherit"]:
+        legacy_args.extend(["--env-inherit", item])
+    for item in cfg["env_block"]:
+        legacy_args.extend(["--env-block", item])
     if cfg["fail_on_empty"]:
         legacy_args.append("--fail-on-empty")
+    if cfg["skip_initial_test"]:
+        legacy_args.append("--skip-initial-test")
+    if cfg["dry_run_only"]:
+        legacy_args.append("--dry-run-only")
+    if cfg["skip_tests"]:
+        legacy_args.append("--skip-tests")
+    if cfg["coverage_file"]:
+        legacy_args.extend(["--coverage-file", cfg["coverage_file"]])
+    if cfg["coverage_provider"]:
+        legacy_args.extend(["--coverage-provider", cfg["coverage_provider"]])
+    if cfg["coverage_test_command_template"]:
+        legacy_args.extend(["--coverage-test-command-template", cfg["coverage_test_command_template"]])
+    if cfg["coverage_helper_command_template"]:
+        legacy_args.extend(["--coverage-helper-command-template", cfg["coverage_helper_command_template"]])
+    for item in cfg["coverage_helper_tests"]:
+        legacy_args.extend(["--coverage-helper-tests", item])
+    for plugin in cfg["plugins"]:
+        legacy_args.extend(["--plugin", plugin])
+    for plugin_dir in cfg["plugin_dirs"]:
+        legacy_args.extend(["--plugin-dir", plugin_dir])
+    for reporter in cfg["reporters"]:
+        legacy_args.extend(["--reporter", reporter])
+    if cfg["dashboard_export"]:
+        legacy_args.extend(["--dashboard-export", cfg["dashboard_export"]])
+    if cfg["dashboard_upload_url"]:
+        legacy_args.extend(["--dashboard-upload-url", cfg["dashboard_upload_url"]])
+    if cfg["dashboard_version"]:
+        legacy_args.extend(["--dashboard-version", cfg["dashboard_version"]])
+    if cfg["dashboard_retention_days"] is not None:
+        legacy_args.extend(["--dashboard-retention-days", str(cfg["dashboard_retention_days"])])
+    if cfg["dashboard_auth_token_env"]:
+        legacy_args.extend(["--dashboard-auth-token-env", cfg["dashboard_auth_token_env"]])
+    if cfg["dashboard_auth_header"]:
+        legacy_args.extend(["--dashboard-auth-header", cfg["dashboard_auth_header"]])
+    if cfg["incremental"]:
+        legacy_args.append("--incremental")
+    if cfg["baseline_file"]:
+        legacy_args.extend(["--baseline-file", cfg["baseline_file"]])
+    if cfg["baseline_max_age_days"] is not None:
+        legacy_args.extend(["--baseline-max-age-days", str(cfg["baseline_max_age_days"])])
+    if cfg["baseline_branch"]:
+        legacy_args.extend(["--baseline-branch", cfg["baseline_branch"]])
+    if cfg["write_baseline"]:
+        legacy_args.extend(["--write-baseline", cfg["write_baseline"]])
+    if cfg["clear_baseline"]:
+        legacy_args.append("--clear-baseline")
     if cfg["quiet"]:
         legacy_args.append("--quiet")
     if cfg["threshold"] is not None:
         legacy_args.extend(["--threshold", str(cfg["threshold"])])
+    if cfg["threshold_high"] is not None:
+        legacy_args.extend(["--threshold-high", str(cfg["threshold_high"])])
+    if cfg["threshold_low"] is not None:
+        legacy_args.extend(["--threshold-low", str(cfg["threshold_low"])])
+    if cfg["threshold_break"] is not None:
+        legacy_args.extend(["--threshold-break", str(cfg["threshold_break"])])
 
     return engine.main(legacy_args)
 
@@ -462,6 +1819,14 @@ def main(argv: list[str] | None = None) -> int:
             return _list_mutants(args)
         if args.command == "run-mutant":
             return _run_mutant(args)
+        if args.command == "init":
+            return _init_config(args)
+        if args.command == "baseline-merge":
+            return _baseline_merge(args)
+        if args.command == "baseline-prune":
+            return _baseline_prune(args)
+        if args.command == "baseline-info":
+            return _baseline_info(args)
         parser.error(f"unsupported command: {args.command}")
     except Exception as exc:
         print(f"error: {exc}")

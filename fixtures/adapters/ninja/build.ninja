@@ -1,0 +1,12 @@
+cxx = c++
+cxxflags = -std=c++17 -Wall -Wextra
+
+rule cxx
+  command = $cxx $cxxflags $in -o $out
+
+rule run
+  command = ./$in
+
+build math_test: cxx math_test.cpp
+build test: run math_test
+default math_test

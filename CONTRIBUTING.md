@@ -16,6 +16,7 @@ Requirements:
 Run the default checks:
 
 ```bash
+npm run lint
 npm test
 npm pack --dry-run
 git diff --check
@@ -48,6 +49,17 @@ Changes must preserve the first-parity contract in `docs/spec.md`:
 
 Do not add third-party status aliases to `stryker-cxx`. Normalization of
 non-native tools belongs at the consuming boundary, such as Marmorkrebs.
+
+## Code style and conventions
+
+- Keep CLI flags kebab-case and config/report fields lowerCamelCase.
+- Keep mutation status names in the native Stryker/MTE-style uppercase set.
+- Match file-local formatting: Python uses 4-space indentation and type hints;
+  TypeScript, JSON, YAML, and Markdown use 2-space indentation where applicable.
+- Use the committed `.editorconfig` for whitespace, LF endings, and final
+  newlines.
+- Keep Stryker-compatible behavior in this repository and Marmorkrebs-specific
+  normalization at the consuming boundary.
 
 ## Mutator changes
 

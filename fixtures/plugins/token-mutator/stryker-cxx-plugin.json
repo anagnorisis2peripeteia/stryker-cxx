@@ -1,0 +1,15 @@
+{
+  "name": "token-mutator-fixture",
+  "version": "0.1.0",
+  "capabilities": {
+    "mutators": true,
+    "reporters": false
+  },
+  "mutators": [
+    {
+      "name": "IntegerOneToZero",
+      "description": "Replace integer literal 1 with 0",
+      "replacements": [["1", "0"]]
+    }
+  ]
+}
