@@ -72,7 +72,7 @@ test("valid cxx-mutant wrapper parses via mutationTestingElements", () => {
   assert.equal(flat[1].status, "Survived");
 });
 
-test("normalizes legacy and stryker timeout/noCoverage statuses", () => {
+test("summarizes standard timeout and noCoverage statuses", () => {
   const compatibilitySample = {
     schemaVersion: "2.0",
     language: "cpp",
@@ -104,7 +104,7 @@ test("normalizes legacy and stryker timeout/noCoverage statuses", () => {
   };
   const parsed = assertMteReport(compatibilitySample);
   const summary = summarizeReport(parsed);
-  assert.equal(summary.timeouts, 1);
+  assert.equal(summary.timedOut, 1);
   assert.equal(summary.compileErrors, 1);
   assert.equal(summary.score, 0.0);
 });

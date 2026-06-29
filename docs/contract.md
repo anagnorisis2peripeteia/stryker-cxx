@@ -23,13 +23,11 @@ It accepts both:
   - `location.end.line`, `location.end.column`
   - optional `runCommand`, `nodeKind`
 
-## Status normalization currently used upstream
+## Status set used by this adapter
 
 - `Killed`
 - `Survived`
-- `CompileError`
 - `NoCoverage`
-- `TimedOut`
 - `Timeout`
 - `Pending`
 - `RuntimeError`
