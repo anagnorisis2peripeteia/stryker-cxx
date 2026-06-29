@@ -442,6 +442,57 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(payload["mutants"][0]["original"], "touched()")
         self.assertEqual(payload["mutants"][0]["mutated"], "(void)0")
 
+    def test_clang_mode_runs_compile_database_fixture_when_bindings_are_available(self) -> None:
+        try:
+            from clang import cindex  # type: ignore
+            cindex.Index.create()
+        except Exception as exc:
+            self.skipTest(f"optional libclang binding is unavailable: {exc}")
+
+        self.source.write_text(
+            "int main() {\n"
+            "  if (1 == 1) return 0;\n"
+            "  return 1;\n"
+            "}\n"
+        )
+        compile_db = [
+            {
+                "directory": str(self.repo),
+                "command": "clang++ -std=c++17 -c sample.cpp -o sample.o",
+                "file": str(self.source),
+            }
+        ]
+        (self.repo / "compile_commands.json").write_text(json.dumps(compile_db))
+        self._git("add", "sample.cpp", "compile_commands.json")
+        self._git("-c", "user.name=stryker-cxx", "-c", "user.email=stryker-cxx@example.invalid", "commit", "-q", "-m", "clang-fixture")
+        report = self.repo / "clang.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "false",
+            "--report",
+            str(report),
+            "--mutators",
+            "EqualityOperator",
+            "--mode",
+            "clang",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["execution"]["mode"], "clang")
+        self.assertEqual(payload["totalMutants"], 1)
+        self.assertEqual(payload["killed"], 1)
+        self.assertEqual(payload["mutants"][0]["nodeKind"], "BINARY_OPERATOR")
+
     def test_git_worktree_mode_runs_without_mutating_source(self) -> None:
         report = self.repo / "worktree.json"
         original = self.source.read_text()

@@ -138,8 +138,8 @@ Additional implemented mutators:
 
 Still missing for parity:
 
-- mutator-specific docs with examples and known noise profile
-- real-toolchain clang fixture coverage for optional libclang environments
+- no known first-parity gaps in the repository spec; remaining work is broader
+  ecosystem hardening against real downstream repositories
 
 ## Ignore comments
 
@@ -200,5 +200,7 @@ The test suite must prove:
 Current tests cover CLI/report basics, timeout, copy mode, git-worktree mode,
 dirty refusal, resume, direct MTE output, sharding, markdown/SARIF/HTML
 artifacts, source ignore comments, `CallRemoval`, clang AST classifier behavior,
-and JS MTE adapter behavior. The remaining high-value proof gap is a
-real-libclang fixture test that runs when the optional binding is installed.
+an optional real-libclang fixture, and JS MTE adapter behavior.
+
+Mutator-specific examples and noise profiles live in
+[`docs/mutators.md`](mutators.md).

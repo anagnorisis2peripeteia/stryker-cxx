@@ -71,6 +71,10 @@ The CLI expects fields in MTE shape:
 ## Spec
 
 The Stryker/Stryker.NET parity checklist lives in [`docs/spec.md`](docs/spec.md).
+Mutator behavior and noise profiles are documented in
+[`docs/mutators.md`](docs/mutators.md).
+Contribution and CI expectations are documented in
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Project map
 

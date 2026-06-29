@@ -670,7 +670,6 @@ def _discover_mode(repo: str, path: str, only: set[int] | None, enabled: list[st
         tu = cindex.Index.create().parse(
             os.path.join(repo, path),
             args=compile_entry,
-            options=cindex.TranslationUnit.PARSE_SKIP_FUNCTION_BODIES,
         )
         errors = [
             d for d in tu.diagnostics

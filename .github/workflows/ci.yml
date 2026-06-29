@@ -6,11 +6,37 @@ on:
 
 jobs:
   tests:
+    name: tests (${{ matrix.os }}, node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: ["20", "22"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Run tests
+        run: npm test
+      - name: Check package contents
+        run: npm pack --dry-run
+      - name: Check whitespace
+        run: git diff --check
+
+  clang-fixture:
+    name: optional libclang fixture
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
-      - name: Run tests
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install optional libclang binding
+        run: python -m pip install libclang
+      - name: Run tests with clang fixture enabled
         run: npm test
