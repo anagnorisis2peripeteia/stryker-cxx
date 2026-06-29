@@ -68,6 +68,10 @@ The CLI expects fields in MTE shape:
 - `files` map keyed by source path
 - per mutant: `id`, `mutatorName`, `original`, `replacement`, `status`, `location`
 
+## Spec
+
+The Stryker/Stryker.NET parity checklist lives in [`docs/spec.md`](docs/spec.md).
+
 ## Project map
 
 - `src/index.js`: contract parser + summary helpers

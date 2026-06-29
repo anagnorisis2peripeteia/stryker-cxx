@@ -176,40 +176,40 @@ def _resolve_defaults(args: argparse.Namespace) -> dict[str, Any]:
     exec_mutators = _coerce_mutator_list(execution.get("mutators"))
 
     defaults = {
-        "repo": args.repo if hasattr(args, "repo") else None,
-        "files": args.files or cfg.get("files") if isinstance(cfg.get("files"), str) else None,
-        "base": args.base if args.base is not None else cfg.get("base"),
-        "build_command": args.build_command or execution.get("buildCommand"),
-        "test_command": args.test_command or execution.get("testCommand"),
-        "max_mutants": args.max_mutants if args.max_mutants is not None else execution.get("maxMutants"),
+        "repo": getattr(args, "repo", None),
+        "files": getattr(args, "files", None) or (cfg.get("files") if isinstance(cfg.get("files"), str) else None),
+        "base": getattr(args, "base", None) if getattr(args, "base", None) is not None else cfg.get("base"),
+        "build_command": getattr(args, "build_command", None) or execution.get("buildCommand"),
+        "test_command": getattr(args, "test_command", None) or execution.get("testCommand"),
+        "max_mutants": getattr(args, "max_mutants", None) if getattr(args, "max_mutants", None) is not None else execution.get("maxMutants"),
         "include_metal": bool(
-            args.include_metal if hasattr(args, "include_metal") else False
+            getattr(args, "include_metal", False)
             or execution.get("includeMetal", False)
         ),
-        "mutators": args.mutators or execution.get("mutators") or execution.get("mutationMutators") or cfg.get("mutators"),
-        "threshold": args.threshold if args.threshold is not None else execution.get("threshold"),
-        "timeout": args.timeout if args.timeout is not None else execution.get("timeoutSeconds"),
-        "artifact_dir": args.artifact_dir if hasattr(args, "artifact_dir") else execution.get("artifactDir"),
-        "mode": args.mode if hasattr(args, "mode") and args.mode is not None else execution.get("mode", "token"),
-        "jobs": args.jobs if hasattr(args, "jobs") and args.jobs is not None else execution.get("jobs", 1),
+        "mutators": getattr(args, "mutators", None) or execution.get("mutators") or execution.get("mutationMutators") or cfg.get("mutators"),
+        "threshold": getattr(args, "threshold", None) if getattr(args, "threshold", None) is not None else execution.get("threshold"),
+        "timeout": getattr(args, "timeout", None) if getattr(args, "timeout", None) is not None else execution.get("timeoutSeconds"),
+        "artifact_dir": getattr(args, "artifact_dir", None) if hasattr(args, "artifact_dir") else execution.get("artifactDir"),
+        "mode": getattr(args, "mode", None) if getattr(args, "mode", None) is not None else execution.get("mode", "token"),
+        "jobs": getattr(args, "jobs", None) if getattr(args, "jobs", None) is not None else execution.get("jobs", 1),
         "worktree_mode": (
-            args.worktree_mode
-            if hasattr(args, "worktree_mode") and args.worktree_mode is not None
+            getattr(args, "worktree_mode", None)
+            if getattr(args, "worktree_mode", None) is not None
             else execution.get("worktreeMode", execution.get("workTreeMode", "inplace"))
         ),
         "allow_dirty": bool(getattr(args, "allow_dirty", False)),
-        "resume": args.resume if hasattr(args, "resume") else None,
-        "fail_on_empty": args.fail_on_empty if hasattr(args, "fail_on_empty") else False,
-        "quiet": args.quiet if hasattr(args, "quiet") else False,
-        "format": args.format if hasattr(args, "format") and args.format is not None else execution.get("format", "json"),
+        "resume": getattr(args, "resume", None),
+        "fail_on_empty": getattr(args, "fail_on_empty", False),
+        "quiet": getattr(args, "quiet", False),
+        "format": getattr(args, "format", None) if getattr(args, "format", None) is not None else execution.get("format", "json"),
         "output_format": (
-            args.output_format
-            if hasattr(args, "output_format") and args.output_format is not None
+            getattr(args, "output_format", None)
+            if getattr(args, "output_format", None) is not None
             else execution.get("outputFormat", "stryker-cxx")
         ),
-        "report": args.report if hasattr(args, "report") else None,
-        "shard_index": args.shard_index if hasattr(args, "shard_index") else None,
-        "shard_total": args.shard_total if hasattr(args, "shard_total") else None,
+        "report": getattr(args, "report", None),
+        "shard_index": getattr(args, "shard_index", None),
+        "shard_total": getattr(args, "shard_total", None),
         "files_include": _coerce_list(files_cfg.get("include")) if isinstance(files_cfg, dict) else [],
         "files_exclude": _coerce_list(files_cfg.get("exclude")) if isinstance(files_cfg, dict) else [],
         "report_threshold": report_cfg.get("threshold", None),
