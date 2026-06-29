@@ -114,6 +114,37 @@ class TestContracts(unittest.TestCase):
         self.assertEqual(flat[0]["status"], "Killed")
         self.assertEqual(flat[1]["status"], "Timeout")
 
+    def test_ignored_mutants_are_valid_native_and_mte_statuses(self) -> None:
+        rep = Report(
+            target_files=["src/foo.cpp"],
+            repo="/tmp/repo",
+            total=1,
+            ignored=1,
+            buildCommand="true",
+            testCommand="true",
+        )
+        rep.mutants = [
+            {
+                "id": "src/foo.cpp:1:0:EqualityOperator:ignored",
+                "file": "src/foo.cpp",
+                "line": 1,
+                "col": 0,
+                "mutator": "EqualityOperator",
+                "original": "==",
+                "mutated": "!=",
+                "status": "IGNORED",
+                "detail": "equivalent guard",
+                "ignoreReason": "equivalent guard",
+            }
+        ]
+
+        native = _report_dict(rep)
+        self.assertEqual(validate_report(native), [])
+        self.assertEqual(native["ignored"], 1)
+        flat = native["mutationTestingElements"]["files"]["src/foo.cpp"]["mutants"]
+        self.assertEqual(flat[0]["status"], "Ignored")
+        self.assertEqual(flat[0]["statusReason"], "equivalent guard")
+
     def test_require_mte_guard(self) -> None:
         rep = self._base_report()
         rep.repo = None

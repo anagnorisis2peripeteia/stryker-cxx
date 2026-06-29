@@ -375,6 +375,9 @@ def _list_mutants(args: argparse.Namespace) -> int:
             "mutator": mut.mutator,
             "original": mut.original,
             "mutated": mut.mutated,
+            "status": mut.status,
+            "detail": mut.detail,
+            "ignoreReason": mut.ignoreReason,
             "nodeKind": mut.nodeKind,
             "mode": cfg["mode"],
         }

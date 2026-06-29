@@ -321,6 +321,127 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(payload["language"], "cpp")
         self.assertIn("sample.cpp", payload["files"])
 
+    def test_stryker_disable_next_line_marks_mutant_ignored_without_running_it(self) -> None:
+        self.source.write_text(
+            "// Stryker disable next-line EqualityOperator: equivalent guard\n"
+            "int main() { if (1 == 1) return 0; return 1; }\n"
+        )
+        self._git("add", "sample.cpp")
+        self._git("-c", "user.name=stryker-cxx", "-c", "user.email=stryker-cxx@example.invalid", "commit", "-q", "-m", "ignored-mutant")
+        report = self.repo / "ignored.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "false",
+            "--report",
+            str(report),
+            "--mutators",
+            "EqualityOperator",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["totalMutants"], 1)
+        self.assertEqual(payload["ignored"], 1)
+        self.assertEqual(payload["killed"], 0)
+        self.assertEqual(payload["survived"], 0)
+        self.assertEqual(payload["score"], 1)
+        self.assertEqual(payload["mutants"][0]["status"], "IGNORED")
+        self.assertIn("equivalent guard", payload["mutants"][0]["ignoreReason"])
+        first = payload["mutationTestingElements"]["files"]["sample.cpp"]["mutants"][0]
+        self.assertEqual(first["status"], "Ignored")
+        self.assertIn("equivalent guard", first["statusReason"])
+
+    def test_stryker_restore_next_line_and_list_mutants_expose_ignore_state(self) -> None:
+        self.source.write_text(
+            "// Stryker disable all: generated comparison\n"
+            "// Stryker restore next-line EqualityOperator\n"
+            "int keep() { return 1 == 1; }\n"
+            "int skip() { return 2 == 2; }\n"
+        )
+        self._git("add", "sample.cpp")
+        self._git("-c", "user.name=stryker-cxx", "-c", "user.email=stryker-cxx@example.invalid", "commit", "-q", "-m", "restore-next-line")
+        report = self.repo / "restore.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "false",
+            "--report",
+            str(report),
+            "--mutators",
+            "EqualityOperator",
+            "--quiet",
+        )
+        listed = self._cli(
+            "list-mutants",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--mutators",
+            "EqualityOperator",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["totalMutants"], 2)
+        self.assertEqual(payload["killed"], 1)
+        self.assertEqual(payload["ignored"], 1)
+        statuses = [mut["status"] for mut in json.loads(listed.stdout)]
+        self.assertEqual(statuses, ["PENDING", "IGNORED"])
+
+    def test_call_removal_mutator_removes_statement_level_calls(self) -> None:
+        self.source.write_text(
+            "void touched() {}\n"
+            "int main() {\n"
+            "  touched();\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        self._git("add", "sample.cpp")
+        self._git("-c", "user.name=stryker-cxx", "-c", "user.email=stryker-cxx@example.invalid", "commit", "-q", "-m", "call-removal")
+        report = self.repo / "call-removal.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "false",
+            "--report",
+            str(report),
+            "--mutators",
+            "CallRemoval",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["totalMutants"], 1)
+        self.assertEqual(payload["killed"], 1)
+        self.assertEqual(payload["mutants"][0]["mutator"], "CallRemoval")
+        self.assertEqual(payload["mutants"][0]["original"], "touched()")
+        self.assertEqual(payload["mutants"][0]["mutated"], "(void)0")
+
     def test_git_worktree_mode_runs_without_mutating_source(self) -> None:
         report = self.repo / "worktree.json"
         original = self.source.read_text()
@@ -433,6 +554,30 @@ class CliContractTests(unittest.TestCase):
         sarif_artifact = self.repo / "code-scanning.json.sarif"
         self.assertTrue(sarif_artifact.exists())
         self.assertEqual(json.loads(sarif_artifact.read_text())["version"], "2.1.0")
+
+        html_report = self.repo / "page.json"
+        html = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "false",
+            "--report",
+            str(html_report),
+            "--max-mutants",
+            "1",
+            "--format",
+            "html",
+            "--quiet",
+        )
+        self.assertEqual(html.returncode, 0, html.stderr + html.stdout)
+        html_artifact = self.repo / "page.json.html"
+        self.assertTrue(html_artifact.exists())
+        self.assertIn("<h1>stryker-cxx report</h1>", html_artifact.read_text())
 
 
 if __name__ == "__main__":

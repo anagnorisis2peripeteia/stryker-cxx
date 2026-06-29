@@ -40,6 +40,8 @@ not required for the first parity target.
 - `--format json|markdown|html|sarif|mutation-testing-elements`
 - `--threshold`, `--fail-on-empty`
 - `stryker-cxx.yml` / `.stryker-cxx.yml` config loading
+- source-level `// Stryker disable|restore` ignore comments with
+  `next-line` and Stryker.NET-style `once` aliases
 
 ## Native report
 
@@ -52,7 +54,7 @@ Required top-level fields:
 - `repo`, `base`
 - `startedAt`, `completedAt`
 - `threshold`
-- `totalMutants`, `killed`, `survived`, `buildErrors`, `timeouts`
+- `totalMutants`, `killed`, `survived`, `buildErrors`, `timeouts`, `ignored`
 - `score` as a `0.0..1.0` fraction
 - `execution.mode`, `execution.worktreeMode`, `execution.jobs`
 - `commands.build`, `commands.test`
@@ -79,6 +81,7 @@ Native statuses:
 - `SURVIVED`
 - `BUILD_ERROR`
 - `TIMEOUT`
+- `IGNORED`
 - `PENDING`
 - `RUNTIME_ERROR`
 
@@ -91,6 +94,7 @@ Stryker-style statuses only:
 - `Survived`
 - `NoCoverage`
 - `Timeout`
+- `Ignored`
 - `Pending`
 - `RuntimeError`
 
@@ -100,6 +104,7 @@ Native-to-MTE mapping:
 - `SURVIVED` -> `Survived`
 - `BUILD_ERROR` -> `NoCoverage`
 - `TIMEOUT` -> `Timeout`
+- `IGNORED` -> `Ignored`
 - `PENDING` -> `Pending`
 - other infrastructure statuses -> `RuntimeError`
 
@@ -129,12 +134,28 @@ Additional implemented mutators:
 - `BitwiseOperator`
 - `UnaryOperator`
 - `ReturnValue`
+- `CallRemoval`
 
 Still missing for parity:
 
-- `CallRemoval`
-- equivalent-mutant annotation/suppression flow
+- AST-confirmed clang-mode mutation selection
 - mutator-specific docs with examples and known noise profile
+
+## Ignore comments
+
+`stryker-cxx` supports source-level suppression comments modelled on
+StrykerJS and Stryker.NET:
+
+- `// Stryker disable all: reason`
+- `// Stryker restore all`
+- `// Stryker disable next-line EqualityOperator: reason`
+- `// Stryker restore next-line EqualityOperator`
+- `// Stryker disable once Arithmetic: reason`
+
+`next-line` and `once` both apply to the following source line. Mutator lists
+are comma-separated and use `stryker-cxx` mutator names. Ignored mutants remain
+in native and MTE reports with status `IGNORED` / `Ignored`, carry
+`ignoreReason`, do not execute, and are excluded from score calculation.
 
 ## Analysis modes
 
@@ -170,8 +191,12 @@ The test suite must prove:
 - `copy` and `git-worktree` modes;
 - sharding behavior;
 - markdown, SARIF, and HTML artifact generation;
+- Stryker ignore comments and ignored MTE/native statuses;
+- `CallRemoval` statement-level discovery;
 - clang-mode behavior on compile-database fixtures.
 
-Current tests cover most CLI/report basics, timeout, copy mode, dirty refusal,
-resume, and JS MTE adapter behavior. Remaining high-value tests are
-`git-worktree`, sharding, human artifacts, and clang fixtures.
+Current tests cover CLI/report basics, timeout, copy mode, git-worktree mode,
+dirty refusal, resume, direct MTE output, sharding, markdown/SARIF/HTML
+artifacts, source ignore comments, `CallRemoval`, and JS MTE adapter behavior.
+The remaining high-value proof gap is clang fixtures backed by AST-confirmed
+mutation selection.

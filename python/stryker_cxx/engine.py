@@ -43,6 +43,7 @@ MUTATORS: dict[str, list[tuple[str, str]]] = {
     "BitwiseOperator": [("&", "|"), ("|", "&"), ("^", "|")],
     "UnaryOperator": [("!", ""), ("!", "!!")],
     "ReturnValue": [("return true", "return false"), ("return false", "return true")],
+    "CallRemoval": [],
 }
 
 MUTATOR_DESCRIPTIONS: dict[str, str] = {
@@ -55,6 +56,7 @@ MUTATOR_DESCRIPTIONS: dict[str, str] = {
     "BitwiseOperator": "replaced bitwise operator",
     "UnaryOperator": "modified unary operator",
     "ReturnValue": "reversed returned boolean result",
+    "CallRemoval": "removed a statement-level function call",
 }
 
 _TOKEN_PATTERNS: dict[str, str] = {
@@ -85,6 +87,11 @@ _TOKEN_PATTERNS: dict[str, str] = {
     "return false": r"\breturn\s+false\b",
 }
 
+_CALL_REMOVAL_RE = re.compile(
+    r"\b(?!if\b|for\b|while\b|switch\b|return\b|sizeof\b|catch\b)"
+    r"([A-Za-z_]\w*(?:(?:\s*::\s*|\s*->\s*|\s*\.\s*)[A-Za-z_]\w*)*\s*\([^;{}]*\))(?=\s*;)"
+)
+
 SOURCE_EXTENSIONS = {".cpp", ".cc", ".cxx", ".c", ".mm", ".m", ".h", ".hpp", ".hh", ".hxx"}
 DEFAULT_MUTATORS = ["ConditionalBoundary", "EqualityOperator", "LogicalOperator", "BooleanLiteral"]
 
@@ -103,8 +110,9 @@ class Mutant:
     mutated: str
     id: str = ""
     nodeKind: str = ""
-    status: str = "PENDING"  # KILLED | SURVIVED | BUILD_ERROR | TIMEOUT | PENDING
+    status: str = "PENDING"  # KILLED | SURVIVED | BUILD_ERROR | TIMEOUT | IGNORED | PENDING
     detail: str = ""
+    ignoreReason: str = ""
     durationMs: int = 0
     buildLog: str = ""
     testLog: str = ""
@@ -126,6 +134,7 @@ class Report:
     survived: int = 0
     buildError: int = 0
     timeouts: int = 0
+    ignored: int = 0
     execution: dict[str, Any] = field(default_factory=dict)
     mutants: list[dict] = field(default_factory=list)
     startedAt: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
@@ -148,7 +157,38 @@ class Report:
         self.completedAt = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-FATAL_STATUSES = {"KILLED", "SURVIVED", "BUILD_ERROR", "TIMEOUT"}
+FATAL_STATUSES = {"KILLED", "SURVIVED", "BUILD_ERROR", "TIMEOUT", "IGNORED"}
+
+
+@dataclass(frozen=True)
+class IgnoreDirective:
+    action: str
+    targets: frozenset[str] | None
+    reason: str
+    next_line: bool = False
+
+
+IGNORE_MUTATOR_ALIASES: dict[str, str] = {
+    "boolean": "BooleanLiteral",
+    "booleanliteral": "BooleanLiteral",
+    "equality": "EqualityOperator",
+    "equalityoperator": "EqualityOperator",
+    "logical": "LogicalOperator",
+    "logicaloperator": "LogicalOperator",
+    "arithmetic": "ArithmeticOperator",
+    "arithmeticoperator": "ArithmeticOperator",
+    "assignment": "AssignmentOperator",
+    "assignmentoperator": "AssignmentOperator",
+    "bitwise": "BitwiseOperator",
+    "bitwiseoperator": "BitwiseOperator",
+    "unary": "UnaryOperator",
+    "unaryoperator": "UnaryOperator",
+    "return": "ReturnValue",
+    "returnvalue": "ReturnValue",
+    "call": "CallRemoval",
+    "callremoval": "CallRemoval",
+    "conditionalboundary": "ConditionalBoundary",
+}
 
 
 def normalize_mutator_list(raw: str) -> list[str]:
@@ -157,6 +197,85 @@ def normalize_mutator_list(raw: str) -> list[str]:
     if unknown:
         raise ValueError(f"unknown mutators: {unknown}")
     return vals
+
+
+def _normalize_ignore_target(raw: str) -> str:
+    key = re.sub(r"[^A-Za-z0-9]", "", raw).lower()
+    return IGNORE_MUTATOR_ALIASES.get(key, raw.strip())
+
+
+def _extract_stryker_comment(raw: str) -> str | None:
+    candidates: list[str] = []
+    line_idx = raw.find("//")
+    if line_idx >= 0:
+        candidates.append(raw[line_idx + 2 :])
+    block_idx = raw.find("/*")
+    if block_idx >= 0:
+        end_idx = raw.find("*/", block_idx + 2)
+        candidates.append(raw[block_idx + 2 : end_idx if end_idx >= 0 else len(raw)])
+    for candidate in candidates:
+        if "Stryker" in candidate:
+            return candidate.strip()
+    return None
+
+
+def _parse_ignore_directive(raw: str) -> IgnoreDirective | None:
+    comment = _extract_stryker_comment(raw)
+    if not comment:
+        return None
+
+    match = re.search(r"\bStryker\s+(disable|restore)\b(.*)$", comment, re.IGNORECASE)
+    if not match:
+        return None
+
+    action = match.group(1).lower()
+    rest = match.group(2).strip()
+    next_line = False
+    lowered = rest.lower()
+    for marker in ("next-line", "once"):
+        if lowered.startswith(marker):
+            next_line = True
+            rest = rest[len(marker) :].strip()
+            lowered = rest.lower()
+            break
+
+    if ":" in rest:
+        target_text, reason = rest.split(":", 1)
+    else:
+        target_text, reason = rest, ""
+
+    target_text = target_text.strip()
+    reason = reason.strip()
+    if not target_text or target_text.lower() == "all":
+        targets = None
+    else:
+        targets = frozenset(
+            _normalize_ignore_target(target)
+            for target in target_text.split(",")
+            if target.strip()
+        )
+        if not targets:
+            targets = None
+
+    return IgnoreDirective(action=action, targets=targets, reason=reason, next_line=next_line)
+
+
+def _directive_matches(directive: IgnoreDirective, mutator: str) -> bool:
+    if directive.targets is None:
+        return True
+    return mutator in directive.targets or mutator.lower() in {target.lower() for target in directive.targets}
+
+
+def _ignore_reason(mutator: str, directives: list[IgnoreDirective]) -> str | None:
+    reason: str | None = None
+    for directive in directives:
+        if not _directive_matches(directive, mutator):
+            continue
+        if directive.action == "disable":
+            reason = directive.reason or "ignored by Stryker disable comment"
+        elif directive.action == "restore":
+            reason = None
+    return reason
 
 
 def _strip_noncode(line: str, in_block_comment: bool = False) -> tuple[str, bool]:
@@ -223,6 +342,51 @@ def _strip_noncode(line: str, in_block_comment: bool = False) -> tuple[str, bool
         i += 1
 
     return "".join(out), in_block_comment
+
+
+def _discover_call_removals(path: str, line: int, code: str, raw: str) -> list[Mutant]:
+    out: list[Mutant] = []
+    for match in re.finditer(_CALL_REMOVAL_RE, code):
+        if code[: match.start()].strip():
+            continue
+        original = raw[match.start(1) : match.end(1)]
+        if not original.strip():
+            continue
+        mut = Mutant("CallRemoval", path, line, match.start(1), original, "(void)0")
+        mut.id = stable_id(mut)
+        out.append(mut)
+    return out
+
+
+def _apply_stryker_ignore_comments(repo: str, path: str, mutants: list[Mutant]) -> list[Mutant]:
+    if not mutants:
+        return mutants
+
+    try:
+        with open(os.path.join(repo, path)) as f:
+            src = f.readlines()
+    except OSError:
+        return mutants
+
+    directives_by_line: dict[int, list[IgnoreDirective]] = {}
+    active: list[IgnoreDirective] = []
+    next_line: dict[int, list[IgnoreDirective]] = {}
+    for line_no, raw in enumerate(src, start=1):
+        directive = _parse_ignore_directive(raw)
+        if directive:
+            if directive.next_line:
+                next_line.setdefault(line_no + 1, []).append(directive)
+            else:
+                active.append(directive)
+        directives_by_line[line_no] = active[:] + next_line.get(line_no, [])
+
+    for mut in mutants:
+        reason = _ignore_reason(mut.mutator, directives_by_line.get(mut.line, []))
+        if reason is not None:
+            mut.status = "IGNORED"
+            mut.detail = reason
+            mut.ignoreReason = reason
+    return mutants
 
 
 def parse_lines(spec: str) -> set[int]:
@@ -298,7 +462,9 @@ def discover(repo: str, path: str, only: set[int] | None, enabled: list[str]) ->
                     mut = Mutant(mutator, path, i, m.start(), orig, new)
                     mut.id = stable_id(mut)
                     muts.append(mut)
-    return muts
+        if "CallRemoval" in enabled:
+            muts.extend(_discover_call_removals(path, i, code, raw))
+    return _apply_stryker_ignore_comments(repo, path, muts)
 
 
 def stable_id(mut: Mutant) -> str:
@@ -437,7 +603,7 @@ def _discover_mode(repo: str, path: str, only: set[int] | None, enabled: list[st
                     except Exception:
                         mut.nodeKind = ""
                     out.append(mut)
-        return out
+        return _apply_stryker_ignore_comments(repo, path, out)
     return discover(repo, path, only, enabled)
 
 
@@ -552,6 +718,11 @@ def _normalize_mutant_record(mut: dict[str, Any] | Mutant) -> dict[str, Any]:
         rec["column"] = 0
     if "col" in rec and not isinstance(rec["col"], int):
         rec["col"] = 0
+    if rec.get("status") == "IGNORED":
+        if not rec.get("ignoreReason"):
+            rec["ignoreReason"] = rec.get("detail", "")
+        if rec.get("ignoreReason") and not rec.get("detail"):
+            rec["detail"] = rec["ignoreReason"]
     return rec
 
 
@@ -585,6 +756,7 @@ def _legacy_report(rep: Report) -> dict:
         "killed": rep.killed,
         "survived": rep.survived,
         "build_error": rep.buildError,
+        "ignored": rep.ignored,
         "mutants": rep.mutants,
         "score": rep.scorePercent,
     }
@@ -606,6 +778,7 @@ def _report_dict(rep: Report, repo: str | None = None, base: str | None = None,
         "survived": rep.survived,
         "buildErrors": rep.buildError,
         "timeouts": rep.timeouts,
+        "ignored": rep.ignored,
         "score": rep.score,
         "execution": {
             "mode": rep.execution.get("mode", "token"),
@@ -624,6 +797,7 @@ def _report_dict(rep: Report, repo: str | None = None, base: str | None = None,
         "target_files": rep.target_files,
         "build_error": rep.buildError,
         "total": rep.total,
+        "ignored_count": rep.ignored,
     }
 
 
@@ -687,6 +861,7 @@ def _mte_status(status: str) -> str:
         "SURVIVED": "Survived",
         "BUILD_ERROR": "NoCoverage",
         "TIMEOUT": "Timeout",
+        "IGNORED": "Ignored",
         "PENDING": "Pending",
     }.get(status.upper(), "RuntimeError")
 
@@ -706,6 +881,7 @@ def _format_markdown(rep: Report) -> str:
         f"| survived | {rep.survived} |",
         f"| build errors | {rep.buildError} |",
         f"| timeouts | {rep.timeouts} |",
+        f"| ignored | {rep.ignored} |",
         f"| total mutants | {rep.total} |",
         f"| target files | {', '.join(rep.target_files) if rep.target_files else '(none)'} |",
         f"| build command | `{rep.buildCommand or ''}` |",
@@ -726,6 +902,15 @@ def _format_markdown(rep: Report) -> str:
             detail = mut.get("detail")
             if detail:
                 lines.append(f"  - detail: {detail}")
+    ignored = [mut for mut in rep.mutants if mut.get("status") == "IGNORED"]
+    if ignored:
+        lines.extend(["", "## Ignored mutants"])
+        for mut in ignored:
+            lines.append(
+                f"- `{mut['file']}:{mut['line']}:{mut['col']}` "
+                f"{mut['mutator']} `{mut['original']} -> {mut['mutated']}` "
+                f"- {mut.get('ignoreReason') or mut.get('detail') or 'ignored'}"
+            )
     return "\n".join(lines)
 
 
@@ -745,7 +930,7 @@ def _format_html(rep: Report) -> str:
         "<!doctype html><html><body>"
         f"<h1>stryker-cxx report</h1><p>score={rep.score:.2f} "
         f"killed={rep.killed} survived={rep.survived} "
-        f"build_errors={rep.buildError} timeouts={rep.timeouts}</p>"
+        f"build_errors={rep.buildError} timeouts={rep.timeouts} ignored={rep.ignored}</p>"
         f"<table>{''.join(rows)}</table></body></html>"
     )
 
@@ -759,6 +944,7 @@ def _format_sarif(rep: Report) -> dict:
             "SURVIVED": "warning",
             "BUILD_ERROR": "warning",
             "TIMEOUT": "warning",
+            "IGNORED": "none",
         }.get(status, "warning")
         results.append(
             {
@@ -1003,6 +1189,12 @@ def main(argv: list[str] | None = None) -> int:
                 rep.buildError += 1
             elif status == "TIMEOUT":
                 rep.timeouts += 1
+            elif status == "IGNORED":
+                rep.ignored += 1
+            continue
+        if m.status == "IGNORED":
+            rep.ignored += 1
+            rep.mutants.append(_normalize_mutant_record(asdict(m)))
             continue
         pending.append(m)
 
@@ -1095,7 +1287,8 @@ def main(argv: list[str] | None = None) -> int:
     if not args.quiet:
         print(
             f"[stryker-cxx] score={rep.score:.2f} killed={rep.killed} "
-            f"survived={rep.survived} build_error={rep.buildError} timeouts={rep.timeouts}",
+            f"survived={rep.survived} build_error={rep.buildError} "
+            f"timeouts={rep.timeouts} ignored={rep.ignored}",
         )
     for m in rep.mutants:
         if m["status"] == "SURVIVED":

@@ -58,6 +58,7 @@ def validate_report(payload: dict[str, Any]) -> list[str]:
         "survived": int,
         "buildErrors": int,
         "timeouts": int,
+        "ignored": int,
     }
     for key, expected in required_ints.items():
         if not _expect(payload, key, expected):
@@ -153,7 +154,7 @@ def validate_mte(payload: dict[str, Any]) -> list[str]:
 
 
 def validate_mutant_status(status: str) -> bool:
-    return str(status) in {"KILLED", "SURVIVED", "BUILD_ERROR", "TIMEOUT", "PENDING", "RUNTIME_ERROR"}
+    return str(status) in {"KILLED", "SURVIVED", "BUILD_ERROR", "TIMEOUT", "IGNORED", "PENDING", "RUNTIME_ERROR"}
 
 
 def _validate_mutant(mut: Any, errors: list[str], *, prefix: str) -> bool:
@@ -180,6 +181,7 @@ def _validate_mutant(mut: Any, errors: list[str], *, prefix: str) -> bool:
         "SURVIVED",
         "BUILD_ERROR",
         "TIMEOUT",
+        "IGNORED",
         "PENDING",
         "RUNTIME_ERROR",
     }:
@@ -202,6 +204,7 @@ def _validate_mte_mutant(mut: Any, errors: list[str], *, prefix: str) -> bool:
         "Survived",
         "NoCoverage",
         "Timeout",
+        "Ignored",
         "Pending",
         "RuntimeError",
     }:
@@ -238,10 +241,11 @@ def supported_mte_statuses() -> Iterable[str]:
         "Survived",
         "NoCoverage",
         "Timeout",
+        "Ignored",
         "Pending",
         "RuntimeError",
     )
 
 
 def supported_native_statuses() -> Iterable[str]:
-    return ("KILLED", "SURVIVED", "BUILD_ERROR", "TIMEOUT", "PENDING", "RUNTIME_ERROR")
+    return ("KILLED", "SURVIVED", "BUILD_ERROR", "TIMEOUT", "IGNORED", "PENDING", "RUNTIME_ERROR")
