@@ -30,7 +30,7 @@ not required for the first parity target.
 - `--base`, `--lines`, `--include`, `--exclude`
 - `--mutators`, `--max-mutants`, `--include-metal`
 - `--mode token`
-- preliminary `--mode clang` using libclang token metadata
+- `--mode clang` using libclang parse validation and AST-confirmed source mutations
 - `--timeout`
 - `--jobs` with non-inplace worktree modes
 - `--worktree-mode inplace|copy|git-worktree`
@@ -138,8 +138,8 @@ Additional implemented mutators:
 
 Still missing for parity:
 
-- AST-confirmed clang-mode mutation selection
 - mutator-specific docs with examples and known noise profile
+- real-toolchain clang fixture coverage for optional libclang environments
 
 ## Ignore comments
 
@@ -163,9 +163,11 @@ Token mode is the production path today. It must stay deterministic, skip
 comments and string/character literals, avoid preprocessor lines, and avoid
 common template punctuation traps.
 
-Clang mode is currently preliminary. It reads compile commands and records
-`nodeKind`, but parity requires AST-confirmed mutations rather than token
-matches over a parsed translation unit.
+Clang mode parses the translation unit with libclang, reuses deterministic
+source-level discovery, and keeps only mutants whose source span is inside a
+mutator-appropriate AST cursor such as `BINARY_OPERATOR`, `RETURN_STMT`, or
+`CALL_EXPR`. It records the confirming `nodeKind` in the report. Token mode
+remains the dependency-free default.
 
 ## Safety requirements
 
@@ -197,6 +199,6 @@ The test suite must prove:
 
 Current tests cover CLI/report basics, timeout, copy mode, git-worktree mode,
 dirty refusal, resume, direct MTE output, sharding, markdown/SARIF/HTML
-artifacts, source ignore comments, `CallRemoval`, and JS MTE adapter behavior.
-The remaining high-value proof gap is clang fixtures backed by AST-confirmed
-mutation selection.
+artifacts, source ignore comments, `CallRemoval`, clang AST classifier behavior,
+and JS MTE adapter behavior. The remaining high-value proof gap is a
+real-libclang fixture test that runs when the optional binding is installed.

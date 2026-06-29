@@ -190,6 +190,19 @@ IGNORE_MUTATOR_ALIASES: dict[str, str] = {
     "conditionalboundary": "ConditionalBoundary",
 }
 
+AST_MUTATOR_CURSOR_KINDS: dict[str, set[str]] = {
+    "ConditionalBoundary": {"BINARY_OPERATOR"},
+    "EqualityOperator": {"BINARY_OPERATOR"},
+    "LogicalOperator": {"BINARY_OPERATOR"},
+    "ArithmeticOperator": {"BINARY_OPERATOR"},
+    "AssignmentOperator": {"COMPOUND_ASSIGNMENT_OPERATOR", "BINARY_OPERATOR"},
+    "BitwiseOperator": {"BINARY_OPERATOR"},
+    "UnaryOperator": {"UNARY_OPERATOR"},
+    "BooleanLiteral": {"CXX_BOOL_LITERAL_EXPR", "OBJC_BOOL_LITERAL_EXPR"},
+    "ReturnValue": {"RETURN_STMT"},
+    "CallRemoval": {"CALL_EXPR", "CXX_MEMBER_CALL_EXPR", "OBJC_MESSAGE_EXPR"},
+}
+
 
 def normalize_mutator_list(raw: str) -> list[str]:
     vals = [v.strip() for v in (raw or "").split(",") if v.strip()]
@@ -276,6 +289,104 @@ def _ignore_reason(mutator: str, directives: list[IgnoreDirective]) -> str | Non
         elif directive.action == "restore":
             reason = None
     return reason
+
+
+def _clang_file_name(location: Any) -> str:
+    file_obj = getattr(location, "file", None)
+    return str(getattr(file_obj, "name", "") or "")
+
+
+def _collect_clang_cursor_ranges(cursor: Any, full_path: str) -> list[dict[str, int | str]]:
+    out: list[dict[str, int | str]] = []
+
+    def visit(node: Any) -> None:
+        try:
+            children = list(node.get_children())
+        except Exception:
+            children = []
+
+        extent = getattr(node, "extent", None)
+        start = getattr(extent, "start", None)
+        end = getattr(extent, "end", None)
+        kind = getattr(getattr(node, "kind", None), "name", "")
+        try:
+            start_file = os.path.abspath(_clang_file_name(start))
+        except Exception:
+            start_file = ""
+        if kind and start and end and start_file == full_path:
+            out.append(
+                {
+                    "kind": kind,
+                    "startLine": int(getattr(start, "line", 0) or 0),
+                    "startColumn": int(getattr(start, "column", 0) or 0),
+                    "endLine": int(getattr(end, "line", 0) or 0),
+                    "endColumn": int(getattr(end, "column", 0) or 0),
+                }
+            )
+
+        for child in children:
+            visit(child)
+
+    visit(cursor)
+    return out
+
+
+def _clang_range_contains(
+    item: dict[str, int | str],
+    line: int,
+    start_col0: int,
+    end_col0: int,
+) -> bool:
+    start_line = int(item.get("startLine", 0) or 0)
+    end_line = int(item.get("endLine", 0) or 0)
+    start_col = int(item.get("startColumn", 0) or 0)
+    end_col = int(item.get("endColumn", 0) or 0)
+    start_col1 = max(1, start_col0 + 1)
+    end_col1 = max(start_col1, end_col0 + 1)
+
+    if start_line <= 0 or end_line <= 0:
+        return False
+    if line < start_line or line > end_line:
+        return False
+    if line == start_line and start_col and start_col1 < start_col:
+        return False
+    if line == end_line and end_col and end_col1 > end_col:
+        return False
+    return True
+
+
+def _clang_matching_kinds(
+    ranges: list[dict[str, int | str]],
+    line: int,
+    col: int,
+    original: str,
+) -> list[str]:
+    end_col = col + max(len(original), 1)
+    matches = [
+        item
+        for item in ranges
+        if _clang_range_contains(item, line, col, end_col)
+    ]
+    matches.sort(
+        key=lambda item: (
+            int(item.get("endLine", 0) or 0) - int(item.get("startLine", 0) or 0),
+            int(item.get("endColumn", 0) or 0) - int(item.get("startColumn", 0) or 0),
+        )
+    )
+    return [str(item["kind"]) for item in matches if item.get("kind")]
+
+
+def _clang_mutation_is_ast_confirmed(mutator: str, kinds: list[str]) -> bool:
+    allowed = AST_MUTATOR_CURSOR_KINDS.get(mutator, set())
+    return any(kind in allowed for kind in kinds)
+
+
+def _clang_primary_node_kind(mutator: str, kinds: list[str]) -> str:
+    allowed = AST_MUTATOR_CURSOR_KINDS.get(mutator, set())
+    for kind in kinds:
+        if kind in allowed:
+            return kind
+    return kinds[0] if kinds else ""
 
 
 def _strip_noncode(line: str, in_block_comment: bool = False) -> tuple[str, bool]:
@@ -569,40 +680,15 @@ def _discover_mode(repo: str, path: str, only: set[int] | None, enabled: list[st
             raise ValueError(f"clang parse failed for {path}: {errors[0].spelling}")
 
         full = os.path.abspath(os.path.join(repo, path))
-        with open(full) as f:
-            src = f.readlines()
-
+        token_mutants = discover(repo, path, only, enabled)
+        ranges = _collect_clang_cursor_ranges(tu.cursor, full)
         out: list[Mutant] = []
-        for tok in tu.get_tokens(extent=tu.cursor.extent):
-            loc = getattr(tok, "location", None)
-            if loc is None or loc.file is None:
+        for mut in token_mutants:
+            kinds = _clang_matching_kinds(ranges, mut.line, mut.col, mut.original)
+            if not _clang_mutation_is_ast_confirmed(mut.mutator, kinds):
                 continue
-            try:
-                if os.path.abspath(loc.file.name) != full:
-                    continue
-            except Exception:
-                continue
-
-            line = int(loc.line)
-            if only is not None and line not in only:
-                continue
-            if line < 1 or line > len(src):
-                continue
-
-            spelling = tok.spelling
-            col = max(int(loc.column) - 1, 0)
-            for mutator in enabled:
-                for orig, repl in MUTATORS[mutator]:
-                    if orig != spelling:
-                        continue
-                    mut = Mutant(mutator, path, line, col, orig, repl)
-                    mut.id = stable_id(mut)
-                    try:
-                        cursor = tok.cursor
-                        mut.nodeKind = getattr(getattr(cursor, "kind", None), "name", "")
-                    except Exception:
-                        mut.nodeKind = ""
-                    out.append(mut)
+            mut.nodeKind = _clang_primary_node_kind(mut.mutator, kinds)
+            out.append(mut)
         return _apply_stryker_ignore_comments(repo, path, out)
     return discover(repo, path, only, enabled)
 

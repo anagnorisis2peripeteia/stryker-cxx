@@ -5,7 +5,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from stryker_cxx.engine import Report, Mutant, _mutation_testing_elements, _report_dict
+from stryker_cxx.engine import (
+    Report,
+    Mutant,
+    _clang_matching_kinds,
+    _clang_mutation_is_ast_confirmed,
+    _clang_primary_node_kind,
+    _mutation_testing_elements,
+    _report_dict,
+)
 from stryker_cxx.schema import (
     validate_mte,
     validate_report,
@@ -187,6 +195,27 @@ class TestPersistence(unittest.TestCase):
             self.assertEqual(payload["files"]["sample.cpp"]["source"], "int main() { return 0; }\n")
             # Ensure JSON serialization stays valid with stable keys in sorted run order.
             json.dumps(payload)
+
+
+class TestClangAstConfirmation(unittest.TestCase):
+    def test_ast_classifier_confirms_mutator_specific_cursor_kinds(self) -> None:
+        self.assertTrue(_clang_mutation_is_ast_confirmed("EqualityOperator", ["UNEXPOSED_EXPR", "BINARY_OPERATOR"]))
+        self.assertTrue(_clang_mutation_is_ast_confirmed("CallRemoval", ["CALL_EXPR", "COMPOUND_STMT"]))
+        self.assertTrue(_clang_mutation_is_ast_confirmed("ReturnValue", ["RETURN_STMT", "FUNCTION_DECL"]))
+        self.assertFalse(_clang_mutation_is_ast_confirmed("EqualityOperator", ["TEMPLATE_REF", "TYPE_REF"]))
+        self.assertEqual(_clang_primary_node_kind("EqualityOperator", ["UNEXPOSED_EXPR", "BINARY_OPERATOR"]), "BINARY_OPERATOR")
+
+    def test_clang_matching_kinds_uses_source_span_containment(self) -> None:
+        ranges = [
+            {"kind": "FUNCTION_DECL", "startLine": 1, "startColumn": 1, "endLine": 5, "endColumn": 2},
+            {"kind": "BINARY_OPERATOR", "startLine": 3, "startColumn": 10, "endLine": 3, "endColumn": 16},
+            {"kind": "TYPE_REF", "startLine": 3, "startColumn": 1, "endLine": 3, "endColumn": 4},
+        ]
+
+        kinds = _clang_matching_kinds(ranges, line=3, col=11, original="==")
+        self.assertEqual(kinds[0], "BINARY_OPERATOR")
+        self.assertIn("FUNCTION_DECL", kinds)
+        self.assertNotIn("TYPE_REF", kinds)
 
 
 if __name__ == "__main__":
