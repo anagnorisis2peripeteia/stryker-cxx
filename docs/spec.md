@@ -286,6 +286,13 @@ Remaining for parity:
 This matrix separates what is already implemented from the remaining Stryker-family
 surface that still needs work for `full parity` mode.
 
+### Public-repo parity posture (2026-06-29)
+
+- The items in the ✅ section are required for current standalone PR-gate use and
+  are intended to be stable.
+- The ⚠️ section are explicit backlog items for eventual broader Stryker-family parity.
+  They are known gaps, not unknown implementation debt.
+
 ### ✅ implemented in `stryker-cxx`
 
 - Deterministic mutant discovery, stable mutant IDs, and resume/continuation.
