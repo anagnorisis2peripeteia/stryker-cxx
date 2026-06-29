@@ -166,6 +166,22 @@ Security reporting is documented in [`SECURITY.md`](SECURITY.md).
 Machine-readable schemas live under [`docs/schemas/`](docs/schemas/).
 Full-spec validation is documented in [`docs/validation.md`](docs/validation.md).
 
+## Review cascade
+
+Use this repo-local review cascade when you want a cheap-then-strong review pass:
+
+```bash
+scripts/review-cascade.sh
+```
+
+The wrapper runs the built-in model ladder in `qwen -> agy-gemini` order (with
+intermediate fallbacks on top of that). Configure with environment variables if needed:
+
+- `STRYKER_CXX_REVIEW_BASE` (default `origin/main`)
+- `STRYKER_CXX_REVIEW_TARGET_REPO` (default
+  `anagnorisis2peripeteia/stryker-cxx`)
+- `STRYKER_CXX_REVIEW_CEILING` (default `agy-gemini`)
+
 ## Project map
 
 - `src/index.js`: contract parser + summary helpers
