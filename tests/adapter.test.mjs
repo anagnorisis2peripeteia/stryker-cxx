@@ -72,6 +72,43 @@ test("valid cxx-mutant wrapper parses via mutationTestingElements", () => {
   assert.equal(flat[1].status, "Survived");
 });
 
+test("normalizes legacy and stryker timeout/noCoverage statuses", () => {
+  const compatibilitySample = {
+    schemaVersion: "2.0",
+    language: "cpp",
+    projectRoot: "/tmp/sample",
+    files: {
+      "src/foo.cpp": {
+        source: "int main() { return 0; }\n",
+        mutants: [
+          {
+            id: "src/foo.cpp:1:0:ArithmeticOperator:abc123",
+            mutatorName: "ArithmeticOperator",
+            original: "+",
+            replacement: "-",
+            status: "Timeout",
+            location: { start: { line: 1, column: 1 }, end: { line: 1, column: 2 } },
+          },
+          {
+            id: "src/foo.cpp:2:0:ArithmeticOperator:def456",
+            mutatorName: "ArithmeticOperator",
+            original: "+",
+            replacement: "-",
+            status: "NoCoverage",
+            location: { start: { line: 2, column: 1 }, end: { line: 2, column: 2 } },
+          },
+        ],
+      },
+    },
+    testFiles: {},
+  };
+  const parsed = assertMteReport(compatibilitySample);
+  const summary = summarizeReport(parsed);
+  assert.equal(summary.timeouts, 1);
+  assert.equal(summary.compileErrors, 1);
+  assert.equal(summary.score, 0.0);
+});
+
 test("invalid schema version is rejected", () => {
   const payload = structuredClone(sample);
   payload.schemaVersion = "1.0";

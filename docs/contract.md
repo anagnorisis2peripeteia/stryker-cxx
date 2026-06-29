@@ -28,6 +28,8 @@ It accepts both:
 - `Killed`
 - `Survived`
 - `CompileError`
+- `NoCoverage`
 - `TimedOut`
+- `Timeout`
 - `Pending`
 - `RuntimeError`

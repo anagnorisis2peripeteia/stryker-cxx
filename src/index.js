@@ -4,7 +4,9 @@ const CXX_STATUS = new Set([
   "Killed",
   "Survived",
   "CompileError",
+  "NoCoverage",
   "TimedOut",
+  "Timeout",
   "Pending",
   "RuntimeError",
 ]);
@@ -104,8 +106,8 @@ export function summarizeReport(report) {
       acc.total += 1;
       if (mut.status === "Killed") acc.killed += 1;
       if (mut.status === "Survived") acc.survived += 1;
-      if (mut.status === "CompileError") acc.compileErrors += 1;
-      if (mut.status === "TimedOut") acc.timeouts += 1;
+      if (mut.status === "CompileError" || mut.status === "NoCoverage") acc.compileErrors += 1;
+      if (mut.status === "TimedOut" || mut.status === "Timeout") acc.timeouts += 1;
       if (mut.status === "Pending") acc.pending += 1;
       if (mut.status === "RuntimeError") acc.runtimeErrors += 1;
       return acc;
