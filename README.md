@@ -152,6 +152,8 @@ The CLI expects fields in MTE shape:
 ## Spec
 
 The Stryker/Stryker.NET parity checklist lives in [`docs/spec.md`](docs/spec.md).
+The Stryker.NET structural parity target lives in
+[`docs/stryker-net-structural-parity-spec.md`](docs/stryker-net-structural-parity-spec.md).
 The Stryker lifecycle parity roadmap lives in
 [`docs/lifecycle-parity-spec.md`](docs/lifecycle-parity-spec.md).
 Mutator behavior and noise profiles are documented in

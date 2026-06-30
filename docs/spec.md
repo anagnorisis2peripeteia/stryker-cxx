@@ -28,7 +28,10 @@ with comparable lifecycle behavior to StrykerJS and Stryker.NET, not merely a
 Marmorkrebs provider. That requires the additional components listed in
 [Full parity requirements](#full-parity-requirements). The lifecycle-level gap
 and action plan are tracked in
-[`docs/lifecycle-parity-spec.md`](lifecycle-parity-spec.md).
+[`docs/lifecycle-parity-spec.md`](lifecycle-parity-spec.md). The stricter
+Stryker.NET structural target, where source overlays become a compatibility
+backend and mutation runs through compiled artifacts, is tracked in
+[`docs/stryker-net-structural-parity-spec.md`](stryker-net-structural-parity-spec.md).
 
 ## Implemented surface
 
