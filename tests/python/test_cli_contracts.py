@@ -944,6 +944,65 @@ class CliContractTests(unittest.TestCase):
             lines_by_batch.setdefault(mut["run"]["batchId"], []).append(mut["line"])
         self.assertEqual(sorted(sorted(lines) for lines in lines_by_batch.values()), [[1, 3], [2, 4]])
 
+    def test_batch_compile_failure_prunes_and_retries_remaining_mutants(self) -> None:
+        self.source.write_text(
+            "int a() { return 1 == 1; }\n"
+            "int b() { return 2 == 2; }\n"
+            "int c() { return 3 == 3; }\n"
+            "int d() { return 4 == 4; }\n"
+            "int e() { return 5 == 5; }\n"
+        )
+        self._git("add", "sample.cpp")
+        self._git("-c", "user.name=stryker-cxx", "-c", "user.email=stryker-cxx@example.invalid", "commit", "-q", "-m", "batch-pruning")
+        report = self.repo / "batch-pruning.json"
+        build_command = (
+            "python3 -c \"import pathlib, sys; "
+            "sys.exit(1 if 'return 1 != 1' in pathlib.Path('sample.cpp').read_text() else 0)\""
+        )
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            build_command,
+            "--test-command",
+            "true",
+            "--report",
+            str(report),
+            "--mutators",
+            "EqualityOperator",
+            "--batch-mutants",
+            "--batch-size",
+            "3",
+            "--worktree-mode",
+            "copy",
+            "--skip-initial-test",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["buildErrors"], 1)
+        self.assertEqual(payload["survived"], 4)
+        self.assertEqual(payload["execution"]["compilePruning"]["prunedMutants"], 1)
+        self.assertEqual(payload["execution"]["compilePruning"]["buildErrors"], 1)
+        self.assertEqual(payload["execution"]["compilePruning"]["retryBatches"], 1)
+        by_line = {mut["line"]: mut for mut in payload["mutants"]}
+        self.assertEqual(by_line[1]["status"], "BUILD_ERROR")
+        self.assertEqual(by_line[1]["resultSource"], "compile-pruning")
+        self.assertEqual(by_line[1]["run"]["testSkippedReason"], "compile-pruned")
+        self.assertEqual(by_line[2]["status"], "SURVIVED")
+        self.assertEqual(by_line[3]["status"], "SURVIVED")
+        self.assertEqual(by_line[4]["status"], "SURVIVED")
+        self.assertEqual(by_line[5]["status"], "SURVIVED")
+        self.assertEqual(by_line[2]["resultSource"], "batch")
+        self.assertEqual(by_line[3]["resultSource"], "batch")
+        self.assertEqual(by_line[4]["resultSource"], "batch")
+        self.assertEqual(by_line[5]["resultSource"], "batch")
+
     def test_timeout_maps_to_canonical_mte_timeout(self) -> None:
         report = self.repo / "timeout.json"
 
@@ -2590,6 +2649,10 @@ class CliContractTests(unittest.TestCase):
         payload = json.loads(report.read_text())
         self.assertEqual(payload["checkErrors"], 1)
         self.assertEqual(payload["mutants"][0]["status"], "CHECK_ERROR")
+        self.assertEqual(payload["mutants"][0]["resultSource"], "compile-pruning")
+        self.assertEqual(payload["mutants"][0]["run"]["testSkippedReason"], "compile-pruned")
+        self.assertEqual(payload["execution"]["compilePruning"]["prunedMutants"], 1)
+        self.assertEqual(payload["execution"]["compilePruning"]["checkErrors"], 1)
         self.assertEqual(payload["commands"]["check"], "false")
 
     def test_coverage_file_marks_uncovered_mutants_without_execution(self) -> None:

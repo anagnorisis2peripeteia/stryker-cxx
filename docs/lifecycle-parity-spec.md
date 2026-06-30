@@ -190,6 +190,8 @@ Acceptance criteria:
 
 ### Phase 4: compile-pruning loop
 
+Status: implemented for source-overlay runs and batched prune-and-retry.
+
 Implementation work:
 
 - build candidate mutation sets through the artifact interface;

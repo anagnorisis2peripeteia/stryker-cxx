@@ -65,9 +65,11 @@ The current source-level runner emits these phases:
 - `artifactRestoration`
 - `reporting`
 
-`compilePruning` is currently reported as `notSupported`; compile and checker
-failures still appear as native mutant statuses until the lifecycle parity
-roadmap adds a pruning loop.
+`compilePruning` is reported as `completed` for the source-overlay runner.
+Compile and checker failures still appear as native `BUILD_ERROR` and
+`CHECK_ERROR` mutant statuses for compatibility, but native reports also record
+which mutants were pruned before test execution under
+`execution.compilePruning`.
 
 ## Project analysis metadata
 
@@ -109,3 +111,20 @@ Per-mutant native run records may also include `run.mutationArtifact` with the
 materialized workspace path and retained-artifact details. This is intentionally
 native-only metadata; the embedded Mutation Testing Elements projection remains
 stable and does not expose local workspace paths.
+
+## Compile pruning metadata
+
+Native reports include `execution.compilePruning` with
+`strategy = "source-overlay-prune-and-retry"`. It records:
+
+- `attempts`, compile-failing candidate batch attempts;
+- `candidateMutants`, the number of mutants considered by those attempts;
+- `failedBatches`, candidate batches that failed build/check;
+- `retryBatches`, batches retried after compile-pruned mutants were removed;
+- `prunedMutants`, `buildErrors`, and `checkErrors`;
+- `records[]`, the native details for each pruned mutant.
+
+Each pruned mutant remains visible in `mutants[]` with status `BUILD_ERROR` or
+`CHECK_ERROR`, `resultSource = "compile-pruning"`, and
+`run.testSkippedReason = "compile-pruned"`. This keeps current consumers stable
+while separating compile-invalid mutants from test-executed mutants.

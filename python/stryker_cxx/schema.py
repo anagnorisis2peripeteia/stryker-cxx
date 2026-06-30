@@ -151,6 +151,29 @@ def validate_report(payload: dict[str, Any]) -> list[str]:
                 for key in ("batchSize", "batches", "splitBatches", "batchedMutants"):
                     if key in batching and not isinstance(batching.get(key), int):
                         errors.append(_collect(f"execution.batching.{key}", "expected integer"))
+        compile_pruning = exec_ctx.get("compilePruning")
+        if compile_pruning is not None:
+            if not isinstance(compile_pruning, dict):
+                errors.append(_collect("execution.compilePruning", "expected object"))
+            else:
+                if "enabled" in compile_pruning and not isinstance(compile_pruning.get("enabled"), bool):
+                    errors.append(_collect("execution.compilePruning.enabled", "expected boolean"))
+                if "strategy" in compile_pruning and not isinstance(compile_pruning.get("strategy"), str):
+                    errors.append(_collect("execution.compilePruning.strategy", "expected string"))
+                for key in (
+                    "attempts",
+                    "candidateMutants",
+                    "failedBatches",
+                    "retryBatches",
+                    "prunedMutants",
+                    "buildErrors",
+                    "checkErrors",
+                ):
+                    if key in compile_pruning and not isinstance(compile_pruning.get(key), int):
+                        errors.append(_collect(f"execution.compilePruning.{key}", "expected integer"))
+                for key in ("records", "attemptRecords", "retryRecords"):
+                    if key in compile_pruning and not isinstance(compile_pruning.get(key), list):
+                        errors.append(_collect(f"execution.compilePruning.{key}", "expected array"))
         dashboard = exec_ctx.get("dashboard")
         if dashboard is not None:
             if not isinstance(dashboard, dict):

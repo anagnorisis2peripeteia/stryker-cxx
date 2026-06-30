@@ -65,6 +65,19 @@ class TestContracts(unittest.TestCase):
                     "splitBatches": 0,
                     "batchedMutants": 2,
                 },
+                "compilePruning": {
+                    "enabled": True,
+                    "strategy": "source-overlay-prune-and-retry",
+                    "candidateArtifactMode": "source-overlay",
+                    "attempts": 0,
+                    "candidateMutants": 0,
+                    "failedBatches": 0,
+                    "retryBatches": 0,
+                    "prunedMutants": 0,
+                    "buildErrors": 0,
+                    "checkErrors": 0,
+                    "records": [],
+                },
                 "dashboard": {
                     "version": "1",
                     "retentionDays": 14,
@@ -195,6 +208,7 @@ class TestContracts(unittest.TestCase):
         self.assertEqual(payload["mutationArtifact"]["schemaVersion"], "stryker-cxx.mutation-artifact.v1")
         self.assertEqual(payload["mutationArtifact"]["mode"], "source-overlay")
         self.assertEqual(payload["mutationArtifact"]["implementation"], "copy")
+        self.assertEqual(payload["execution"]["compilePruning"]["strategy"], "source-overlay-prune-and-retry")
         self.assertEqual(payload["lifecycle"]["schemaVersion"], "stryker-cxx.lifecycle.v1")
         self.assertIn("projectAnalysis", payload["lifecycle"]["phaseOrder"])
         self.assertIn("coverageAnalysis", payload["lifecycle"]["phaseOrder"])
@@ -205,7 +219,8 @@ class TestContracts(unittest.TestCase):
         self.assertEqual(lifecycle_by_name["mutationArtifact"]["status"], "sourceLevel")
         self.assertEqual(lifecycle_by_name["mutationArtifact"]["detail"]["artifactMode"], "source-overlay")
         self.assertEqual(lifecycle_by_name["mutationArtifact"]["detail"]["implementation"], "copy")
-        self.assertEqual(lifecycle_by_name["compilePruning"]["status"], "notSupported")
+        self.assertEqual(lifecycle_by_name["compilePruning"]["status"], "completed")
+        self.assertEqual(lifecycle_by_name["compilePruning"]["detail"]["prunedMutants"], 0)
         self.assertEqual(payload["summary"]["byStatus"]["SURVIVED"], 1)
         self.assertEqual(payload["summary"]["byFile"]["src/foo.cpp"]["survived"], 1)
         self.assertEqual(payload["summary"]["byMutator"]["ConditionalBoundary"]["killed"], 1)
@@ -232,6 +247,14 @@ class TestContracts(unittest.TestCase):
         errors = validate_report(payload)
 
         self.assertTrue(any("mutationArtifact.workspacePerMutant" in item for item in errors))
+
+    def test_report_validator_checks_compile_pruning_shape_when_present(self) -> None:
+        payload = _report_dict(self._base_report())
+        payload["execution"]["compilePruning"]["prunedMutants"] = "one"
+
+        errors = validate_report(payload)
+
+        self.assertTrue(any("execution.compilePruning.prunedMutants" in item for item in errors))
 
     def test_mutation_artifact_metadata_describes_source_overlay(self) -> None:
         metadata = mutation_artifact_metadata(

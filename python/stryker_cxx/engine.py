@@ -398,6 +398,7 @@ class Report:
 
 FATAL_STATUSES = {"KILLED", "SURVIVED", "BUILD_ERROR", "CHECK_ERROR", "NO_COVERAGE", "TIMEOUT", "IGNORED"}
 RETAINABLE_STATUSES = FATAL_STATUSES | {"RUNTIME_ERROR", "PENDING"}
+COMPILE_PRUNED_STATUSES = {"BUILD_ERROR", "CHECK_ERROR"}
 BATCH_ISOLATED_MUTATORS = {
     "BlockRemoval",
     "CallRemoval",
@@ -2988,6 +2989,94 @@ def _count_status(rep: Report, status: str) -> None:
         rep.ignored += 1
 
 
+def _compile_pruning_state(rep: Report) -> dict[str, Any]:
+    state = rep.execution.setdefault("compilePruning", {})
+    state.setdefault("enabled", True)
+    state.setdefault("strategy", "source-overlay-prune-and-retry")
+    state.setdefault("attempts", 0)
+    state.setdefault("candidateMutants", 0)
+    state.setdefault("failedBatches", 0)
+    state.setdefault("retryBatches", 0)
+    state.setdefault("prunedMutants", 0)
+    state.setdefault("buildErrors", 0)
+    state.setdefault("checkErrors", 0)
+    state.setdefault("records", [])
+    return state
+
+
+def _record_compile_pruning_attempt(
+    rep: Report,
+    batch: list[Mutant],
+    status: str,
+    run: dict[str, Any],
+) -> None:
+    state = _compile_pruning_state(rep)
+    state["attempts"] = int(state.get("attempts", 0)) + 1
+    state["candidateMutants"] = int(state.get("candidateMutants", 0)) + len(batch)
+    state["failedBatches"] = int(state.get("failedBatches", 0)) + 1
+    attempts = state.setdefault("attemptRecords", [])
+    if isinstance(attempts, list):
+        attempts.append(
+            {
+                "batchId": run.get("batchId"),
+                "status": status,
+                "mutantIds": [mut.id for mut in batch],
+            }
+        )
+
+
+def _record_compile_pruning_retry(rep: Report, batch: list[Mutant]) -> None:
+    state = _compile_pruning_state(rep)
+    state["retryBatches"] = int(state.get("retryBatches", 0)) + 1
+    retries = state.setdefault("retryRecords", [])
+    if isinstance(retries, list):
+        retries.append({"mutantIds": [mut.id for mut in batch]})
+
+
+def _record_compile_pruned_mutant(
+    rep: Report,
+    mut: Mutant,
+    *,
+    source: str,
+    batch_id: str | None = None,
+) -> None:
+    if mut.status not in COMPILE_PRUNED_STATUSES:
+        return
+    state = _compile_pruning_state(rep)
+    phase = "build" if mut.status == "BUILD_ERROR" else "check"
+    mut.run["compilePruning"] = {
+        "pruned": True,
+        "phase": phase,
+        "source": source,
+        "batchId": batch_id,
+        "reason": mut.detail,
+    }
+    mut.run["testSkippedReason"] = "compile-pruned"
+    records = state.setdefault("records", [])
+    if not isinstance(records, list):
+        return
+    if any(isinstance(item, dict) and item.get("id") == mut.id for item in records):
+        return
+    records.append(
+        {
+            "id": mut.id,
+            "file": mut.file,
+            "line": mut.line,
+            "mutator": mut.mutator,
+            "status": mut.status,
+            "phase": phase,
+            "source": source,
+            "batchId": batch_id,
+            "reason": mut.detail,
+        }
+    )
+    state["prunedMutants"] = int(state.get("prunedMutants", 0)) + 1
+    if mut.status == "BUILD_ERROR":
+        state["buildErrors"] = int(state.get("buildErrors", 0)) + 1
+    else:
+        state["checkErrors"] = int(state.get("checkErrors", 0)) + 1
+
+
 def _single_line_source_range(
     src: list[str],
     item: dict[str, int | str],
@@ -3893,6 +3982,7 @@ def _lifecycle_metadata(rep: Report, mutants: list[dict[str, Any]]) -> dict[str,
     coverage = rep.coverage or {"enabled": False, "provider": "none"}
     batching = rep.execution.get("batching", {})
     resource = rep.execution.get("resourceIsolation", {})
+    compile_pruning = rep.execution.get("compilePruning", {})
     lifecycle = rep.execution.get("lifecycle", {})
     if isinstance(lifecycle, dict) and lifecycle:
         return lifecycle
@@ -3964,10 +4054,19 @@ def _lifecycle_metadata(rep: Report, mutants: list[dict[str, Any]]) -> dict[str,
         ),
         _phase(
             "compilePruning",
-            "notSupported",
+            "completed" if isinstance(compile_pruning, dict) and compile_pruning.get("enabled") else "notSupported",
+            strategy=compile_pruning.get("strategy") if isinstance(compile_pruning, dict) else None,
             buildErrors=rep.buildError,
             checkErrors=rep.checkErrors,
-            prunedMutants=0,
+            prunedMutants=compile_pruning.get("prunedMutants", 0)
+            if isinstance(compile_pruning, dict)
+            else 0,
+            attempts=compile_pruning.get("attempts", 0)
+            if isinstance(compile_pruning, dict)
+            else 0,
+            retryBatches=compile_pruning.get("retryBatches", 0)
+            if isinstance(compile_pruning, dict)
+            else 0,
         ),
         _phase(
             "coverageAnalysis",
@@ -4569,6 +4668,9 @@ def _run_mutant_once(
     if worker_label:
         run_record["workerLabel"] = worker_label
     mut.run = run_record
+    mut.status = "PENDING"
+    mut.detail = ""
+    mut.durationMs = 0
     _record_environment_policy(mut.run, env_overrides, env_inherit, env_block)
     start_ms = time.perf_counter()
     retain_state = {"retain": False}
@@ -4664,6 +4766,124 @@ def _run_mutant_once(
                         else:
                             mut.status = "SURVIVED"
                             mut.detail = "all targeted tests passed"
+        finally:
+            retain_current = _should_retain_worktree(
+                retain_worktrees,
+                retain_worktrees_for,
+                mut.status,
+                work_repo,
+                repo,
+            )
+            if retain_current:
+                retain_state["retain"] = True
+                artifact.mark_retained(mut.status)
+                mut.run["retainedWorktree"] = work_repo
+                mut.run["retainedWorktreeReason"] = mut.status
+                if worker_label:
+                    mut.run["retainedWorktreeLabel"] = worker_label
+            else:
+                restore(work_repo, mut.file, mut.line, original)
+            mut.run["mutationArtifact"] = artifact.run_metadata()
+            mut.durationMs = int((time.perf_counter() - start_ms) * 1000)
+    return mut
+
+
+def _compile_probe_mutant(
+    mut: Mutant,
+    repo: str,
+    build_cmd: str,
+    check_cmd: str | None,
+    timeout_seconds: int | None,
+    worktree_mode: str,
+    artifact_root: str,
+    execution_mode: str,
+    plugins: list[dict[str, Any]] | None = None,
+    worker_tmp_dir: str | None = None,
+    retain_worktrees: bool = False,
+    retain_worktrees_for: set[str] | None = None,
+    worker_label: str | None = None,
+    env_overrides: dict[str, str] | None = None,
+    env_inherit: list[str] | None = None,
+    env_block: list[str] | None = None,
+    batch_id: str | None = None,
+) -> Mutant:
+    existing_run = dict(mut.run)
+    run_record = dict(existing_run)
+    run_record["mode"] = execution_mode
+    run_record["worktreeMode"] = worktree_mode
+    run_record["compilePruning"] = {
+        "candidate": True,
+        "batchId": batch_id,
+        "testSession": "notStarted",
+    }
+    if worker_label:
+        run_record["workerLabel"] = worker_label
+    mut.run = run_record
+    mut.status = "PENDING"
+    mut.detail = ""
+    mut.durationMs = 0
+    _record_environment_policy(mut.run, env_overrides, env_inherit, env_block)
+    start_ms = time.perf_counter()
+    retain_state = {"retain": False}
+    with materialize_mutation_artifact(
+        repo,
+        worktree_mode,
+        worker_tmp_dir=worker_tmp_dir,
+        retain_state=retain_state,
+        worker_label=worker_label,
+    ) as artifact:
+        work_repo = artifact.work_repo
+        mut.run["mutationArtifact"] = artifact.run_metadata()
+        original = apply_mutant(work_repo, mut)
+        build_log = os.path.join(artifact_root, f"prune_build_{_safe_basename(mut.id)}.log")
+        check_log = os.path.join(artifact_root, f"prune_check_{_safe_basename(mut.id)}.log")
+        mut.buildLog = build_log
+        mut.checkLog = check_log
+        try:
+            build_rc, build_ms = run_cmd(
+                build_cmd,
+                work_repo,
+                build_log,
+                timeout_seconds,
+                "build",
+                plugins,
+                env_overrides,
+                env_inherit,
+                env_block,
+            )
+            mut.run["buildReturnCode"] = build_rc
+            mut.run["buildMs"] = build_ms
+            mut.run["buildProvider"] = _phase_provider_name(plugins, "build")
+            if build_rc == 124:
+                mut.status = "TIMEOUT"
+                mut.detail = "build timed out during compile pruning"
+            elif build_rc != 0:
+                mut.status = "BUILD_ERROR"
+                mut.detail = "did not compile during compile pruning"
+            elif check_cmd:
+                check_rc, check_ms = run_cmd(
+                    check_cmd,
+                    work_repo,
+                    check_log,
+                    timeout_seconds,
+                    "check",
+                    plugins,
+                    env_overrides,
+                    env_inherit,
+                    env_block,
+                )
+                mut.run["checkReturnCode"] = check_rc
+                mut.run["checkMs"] = check_ms
+                mut.run["checkProvider"] = _phase_provider_name(plugins, "check")
+                if check_rc == 124:
+                    mut.status = "TIMEOUT"
+                    mut.detail = "check timed out during compile pruning"
+                elif check_rc != 0:
+                    mut.status = "CHECK_ERROR"
+                    mut.detail = "checker rejected mutant during compile pruning"
+            if mut.status == "PENDING":
+                mut.detail = "passed compile pruning probe"
+                mut.run["compilePruning"]["passed"] = True
         finally:
             retain_current = _should_retain_worktree(
                 retain_worktrees,
@@ -5221,6 +5441,19 @@ def main(argv: list[str] | None = None) -> int:
                     "failed batch split attribution",
                 ],
             },
+            "compilePruning": {
+                "enabled": True,
+                "strategy": "source-overlay-prune-and-retry",
+                "candidateArtifactMode": "source-overlay",
+                "attempts": 0,
+                "candidateMutants": 0,
+                "failedBatches": 0,
+                "retryBatches": 0,
+                "prunedMutants": 0,
+                "buildErrors": 0,
+                "checkErrors": 0,
+                "records": [],
+            },
             "dashboard": {
                 "version": args.dashboard_version,
                 "retentionDays": args.dashboard_retention_days,
@@ -5620,9 +5853,11 @@ def main(argv: list[str] | None = None) -> int:
                             env_inherit=env_inherit,
                             env_block=env_block,
                         )
+                        _record_compile_pruned_mutant(rep, executed, source="executed")
                         _count_status(rep, executed.status)
                         executed.run["reproCommand"] = mutation_repro_command(executed, repo, args.build_cmd, str(executed.run.get("selectedTestCommand") or args.test_cmd or ""), args.report)
-                        rep.mutants.append(_executed_record(executed))
+                        result_source = "compile-pruning" if executed.status in COMPILE_PRUNED_STATUSES else "executed"
+                        rep.mutants.append(_executed_record(executed, result_source))
                         _write_report(args.report, rep, output_mode=output_mode)
                         continue
 
@@ -5642,6 +5877,120 @@ def main(argv: list[str] | None = None) -> int:
                         continue
 
                     rep.execution["batching"]["splitBatches"] += 1
+                    if status in COMPILE_PRUNED_STATUSES:
+                        original_batch_id = str(run.get("batchId") or "")
+                        _record_compile_pruning_attempt(rep, batch, status, run)
+                        retry_candidates: list[Mutant] = []
+                        for mut in batch:
+                            probed = _compile_probe_mutant(
+                                mut,
+                                repo=repo,
+                                build_cmd=args.build_cmd,
+                                check_cmd=args.check_cmd,
+                                timeout_seconds=effective_timeout_seconds,
+                                worktree_mode=args.worktree_mode,
+                                artifact_root=artifact_root,
+                                execution_mode=args.mode,
+                                plugins=plugins,
+                                worker_tmp_dir=args.worker_tmp_dir,
+                                retain_worktrees=retain_worktrees,
+                                retain_worktrees_for=retain_worktrees_for,
+                                worker_label=worker_label,
+                                env_overrides=env_overrides,
+                                env_inherit=env_inherit,
+                                env_block=env_block,
+                                batch_id=original_batch_id,
+                            )
+                            if probed.status in COMPILE_PRUNED_STATUSES:
+                                _record_compile_pruned_mutant(
+                                    rep,
+                                    probed,
+                                    source="batch",
+                                    batch_id=original_batch_id,
+                                )
+                                _count_status(rep, probed.status)
+                                probed.run["reproCommand"] = mutation_repro_command(
+                                    probed,
+                                    repo,
+                                    args.build_cmd,
+                                    str(probed.run.get("selectedTestCommand") or args.test_cmd or ""),
+                                    args.report,
+                                )
+                                rep.mutants.append(_executed_record(probed, "compile-pruning"))
+                                continue
+                            if probed.status == "PENDING":
+                                retry_candidates.append(probed)
+                                continue
+                            _count_status(rep, probed.status)
+                            probed.run["reproCommand"] = mutation_repro_command(
+                                probed,
+                                repo,
+                                args.build_cmd,
+                                str(probed.run.get("selectedTestCommand") or args.test_cmd or ""),
+                                args.report,
+                            )
+                            rep.mutants.append(_executed_record(probed, "compile-pruning"))
+
+                        if not retry_candidates:
+                            _write_report(args.report, rep, output_mode=output_mode)
+                            continue
+
+                        _record_compile_pruning_retry(rep, retry_candidates)
+                        if len(retry_candidates) > 1:
+                            retry_status, retry_detail, retry_duration_ms, retry_run = _run_batch_probe(
+                                retry_candidates,
+                                repo=repo,
+                                build_cmd=args.build_cmd,
+                                check_cmd=args.check_cmd,
+                                test_cmd=args.test_cmd,
+                                timeout_seconds=effective_timeout_seconds,
+                                worktree_mode=args.worktree_mode,
+                                artifact_root=artifact_root,
+                                execution_mode=args.mode,
+                                skip_tests=args.skip_tests,
+                                plugins=plugins,
+                                worker_tmp_dir=args.worker_tmp_dir,
+                                retain_worktrees=retain_worktrees,
+                                retain_worktrees_for=retain_worktrees_for,
+                                worker_label=worker_label,
+                                env_overrides=env_overrides,
+                                env_inherit=env_inherit,
+                                env_block=env_block,
+                            )
+                            if retry_status == "SURVIVED":
+                                for mut in retry_candidates:
+                                    mut.status = "SURVIVED"
+                                    mut.detail = retry_detail
+                                    mut.durationMs = retry_duration_ms
+                                    mut.run.update(retry_run)
+                                    mut.run["compilePruning"] = {
+                                        **dict(mut.run.get("compilePruning", {})),
+                                        "retriedAfterPruning": True,
+                                        "sourceBatchId": original_batch_id,
+                                    }
+                                    mut.run["reproCommand"] = mutation_repro_command(mut, repo, args.build_cmd, args.test_cmd or "", args.report)
+                                    _count_status(rep, mut.status)
+                                    rep.mutants.append(_executed_record(mut, "batch"))
+                                _write_report(args.report, rep, output_mode=output_mode)
+                                if not args.quiet:
+                                    print(
+                                        f"[batch {batch_index}/{len(batches)}] "
+                                        f"{len(retry_candidates)} mutants ... SURVIVED after pruning "
+                                        f"({retry_duration_ms}ms)"
+                                    )
+                                continue
+                            if retry_status in COMPILE_PRUNED_STATUSES:
+                                _record_compile_pruning_attempt(rep, retry_candidates, retry_status, retry_run)
+                            batch, status, detail, duration_ms, run = (
+                                retry_candidates,
+                                retry_status,
+                                retry_detail,
+                                retry_duration_ms,
+                                retry_run,
+                            )
+                        else:
+                            batch = retry_candidates
+
                     if not args.quiet:
                         print(f"[batch {batch_index}/{len(batches)}] {len(batch)} mutants ... {status}; splitting")
                     for mut in batch:
@@ -5665,9 +6014,16 @@ def main(argv: list[str] | None = None) -> int:
                             env_inherit=env_inherit,
                             env_block=env_block,
                         )
+                        _record_compile_pruned_mutant(
+                            rep,
+                            executed,
+                            source="executed",
+                            batch_id=str(run.get("batchId") or "") or None,
+                        )
                         _count_status(rep, executed.status)
                         executed.run["reproCommand"] = mutation_repro_command(executed, repo, args.build_cmd, str(executed.run.get("selectedTestCommand") or args.test_cmd or ""), args.report)
-                        rep.mutants.append(_executed_record(executed))
+                        result_source = "compile-pruning" if executed.status in COMPILE_PRUNED_STATUSES else "executed"
+                        rep.mutants.append(_executed_record(executed, result_source))
                         _write_report(args.report, rep, output_mode=output_mode)
             elif args.jobs > 1:
                 if not args.quiet:
@@ -5709,6 +6065,7 @@ def main(argv: list[str] | None = None) -> int:
                             rep.noCoverage += 1
                         elif executed.status == "TIMEOUT":
                             rep.timeouts += 1
+                        _record_compile_pruned_mutant(rep, executed, source="executed")
 
                         if not args.quiet:
                             tag = (
@@ -5718,7 +6075,7 @@ def main(argv: list[str] | None = None) -> int:
                             print(f"[{idx}/{len(pending)}] {tag} ... {executed.status} ({executed.durationMs}ms)")
                         executed.run["reproCommand"] = mutation_repro_command(executed, repo, args.build_cmd, str(executed.run.get("selectedTestCommand") or args.test_cmd or ""), args.report)
                         rec = _normalize_mutant_record(asdict(executed))
-                        rec["resultSource"] = "executed"
+                        rec["resultSource"] = "compile-pruning" if executed.status in COMPILE_PRUNED_STATUSES else "executed"
                         if isinstance(executed.run, dict) and executed.run.get("baselineKey"):
                             rec["baselineKey"] = executed.run["baselineKey"]
                         rep.mutants.append(rec)
@@ -5762,9 +6119,10 @@ def main(argv: list[str] | None = None) -> int:
                         rep.noCoverage += 1
                     elif executed.status == "TIMEOUT":
                         rep.timeouts += 1
+                    _record_compile_pruned_mutant(rep, executed, source="executed")
                     executed.run["reproCommand"] = mutation_repro_command(executed, repo, args.build_cmd, str(executed.run.get("selectedTestCommand") or args.test_cmd or ""), args.report)
                     rec = _normalize_mutant_record(asdict(executed))
-                    rec["resultSource"] = "executed"
+                    rec["resultSource"] = "compile-pruning" if executed.status in COMPILE_PRUNED_STATUSES else "executed"
                     if isinstance(executed.run, dict) and executed.run.get("baselineKey"):
                         rec["baselineKey"] = executed.run["baselineKey"]
                     rep.mutants.append(rec)
