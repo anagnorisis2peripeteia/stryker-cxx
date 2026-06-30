@@ -204,6 +204,7 @@
       "properties": {
         "schemaVersion": { "type": "string" },
         "mode": { "type": "string" },
+        "backend": { "type": "string" },
         "implementation": { "type": "string" },
         "workspacePerMutant": { "type": "boolean" },
         "parallelSafe": { "type": "boolean" },
@@ -267,6 +268,33 @@
         "retainedPath": { "type": "string" },
         "retainedReason": { "type": "string" },
         "cleanupGuidance": { "type": "string" }
+      }
+    },
+    "compiledArtifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "schemaVersion": { "type": "string" },
+          "backend": { "type": "string" },
+          "kind": { "type": "string" },
+          "target": { "type": "string" },
+          "scratchRoot": { "type": "string" },
+          "scratchRepo": { "type": "string" },
+          "scratchBuildDir": { "type": "string" },
+          "mutatedArtifact": { "type": ["string", "null"] },
+          "originalArtifact": { "type": "string" },
+          "backupArtifact": { "type": "string" },
+          "placementPolicy": { "type": "string" },
+          "restorationPolicy": { "type": "string" },
+          "sourceCheckoutMutation": { "type": "boolean" },
+          "originalHashBefore": { "type": ["string", "null"] },
+          "originalHashAfter": { "type": ["string", "null"] },
+          "originalRestored": { "type": "boolean" },
+          "retained": { "type": "boolean" },
+          "retainedPath": { "type": "string" },
+          "cleanupGuidance": { "type": "string" }
+        }
       }
     },
     "summary": {

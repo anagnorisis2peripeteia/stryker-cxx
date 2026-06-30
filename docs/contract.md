@@ -177,3 +177,34 @@ workspace, whether the materialized artifact was restored or retained, retained
 path/reason, and cleanup guidance. In `inplace` mode the source line is restored
 after each mutation session; in isolated `copy` and `git-worktree` modes the
 workspace is removed unless retention was explicitly requested.
+
+## Compiled artifact backend metadata
+
+`source-overlay` remains available as a compatibility backend, but native runs
+can now select `--artifact-backend compiled-executable` for CMake/CTest-style
+executable targets.
+
+The compiled executable backend:
+
+- materializes mutated source in a scratch workspace, not in the user's
+  checkout;
+- configures and builds the mutated executable in scratch space;
+- snapshots the original executable artifact;
+- swaps the mutated executable into the original build/test location;
+- runs the configured tests against that swapped executable;
+- restores the original executable after the session;
+- records the proof under top-level `compiledArtifacts[]` and
+  per-mutant `run.compiledArtifact`.
+
+Compiled executable native reports use:
+
+- `mutationArtifact.mode = "compiled-artifact"`;
+- `mutationArtifact.backend = "compiled-executable"`;
+- `artifactPlacement.compiledArtifacts.supported = true`;
+- `compiledArtifacts[].placementPolicy = "swap-file"`;
+- `compiledArtifacts[].sourceCheckoutMutation = false`;
+- `compiledArtifacts[].originalRestored = true` when the original artifact hash
+  after restoration matches the pre-session hash.
+
+`compiled-library` and `compiled-object` remain explicit future backends; the
+CLI rejects them until their artifact builders and placement policies exist.

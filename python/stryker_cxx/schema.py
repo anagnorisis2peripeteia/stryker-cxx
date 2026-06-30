@@ -432,6 +432,23 @@ def validate_report(payload: dict[str, Any]) -> list[str]:
                 if key in artifact_placement and not isinstance(artifact_placement.get(key), dict):
                     errors.append(_collect(f"artifactPlacement.{key}", "expected object"))
 
+    compiled_artifacts = payload.get("compiledArtifacts")
+    if compiled_artifacts is not None:
+        if not isinstance(compiled_artifacts, list):
+            errors.append(_collect("compiledArtifacts", "expected array"))
+        else:
+            for idx, item in enumerate(compiled_artifacts):
+                if not isinstance(item, dict):
+                    errors.append(_collect(f"compiledArtifacts[{idx}]", "expected object"))
+                    continue
+                if "schemaVersion" in item and not isinstance(item.get("schemaVersion"), str):
+                    errors.append(_collect(f"compiledArtifacts[{idx}].schemaVersion", "expected string"))
+                for key in ("backend", "kind", "target"):
+                    if key in item and not isinstance(item.get(key), str):
+                        errors.append(_collect(f"compiledArtifacts[{idx}].{key}", "expected string"))
+                if "originalRestored" in item and not isinstance(item.get("originalRestored"), bool):
+                    errors.append(_collect(f"compiledArtifacts[{idx}].originalRestored", "expected boolean"))
+
     lifecycle = payload.get("lifecycle")
     if lifecycle is not None:
         if not isinstance(lifecycle, dict):

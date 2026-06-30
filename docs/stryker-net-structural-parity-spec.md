@@ -39,14 +39,17 @@ The current implementation now has lifecycle metadata, project analysis,
 mutation artifact abstraction, compile pruning metadata, coverage-aware
 scheduling, and artifact placement metadata.
 
+It also has an initial `compiled-executable` backend for CMake/CTest-style
+executable targets. That backend mutates scratch source, builds a mutated
+executable in scratch space, swaps the executable into the original build/test
+location, runs tests against it, and restores the original executable by hash.
+
 The structural gap remains:
 
-- source text is still the primary mutation execution artifact;
-- mutated object/library/executable artifacts are not built as first-class
-  artifacts;
-- compiled artifacts are not swapped into the build/test location;
-- original compiled artifacts are not snapshotted/restored;
-- source-overlay execution is still the default backend.
+- source-overlay is still the default compatibility backend;
+- `compiled-library` and `compiled-object` are not implemented;
+- compiled artifact batching is not implemented;
+- full build graph discovery beyond the CMake executable path is incomplete.
 
 ## Target architecture
 

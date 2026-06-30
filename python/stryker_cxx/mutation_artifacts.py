@@ -19,6 +19,7 @@ from typing import Any
 MUTATION_ARTIFACT_SCHEMA_VERSION = "stryker-cxx.mutation-artifact.v1"
 ARTIFACT_PLACEMENT_SCHEMA_VERSION = "stryker-cxx.artifact-placement.v1"
 SOURCE_OVERLAY_MODE = "source-overlay"
+COMPILED_ARTIFACT_MODE = "compiled-artifact"
 
 
 def _workspace_is_retained(retain: bool, retain_state: dict[str, bool] | None) -> bool:
@@ -111,6 +112,75 @@ def artifact_placement_policy(
         },
     }
     return payload
+
+
+def compiled_mutation_artifact_metadata(
+    backend: str,
+    *,
+    implementation: str = "scratch-build-swap",
+    worker_tmp_dir: str | None = None,
+    retain_artifacts: bool = False,
+    retain_artifacts_for: list[str] | None = None,
+    worker_label: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "schemaVersion": MUTATION_ARTIFACT_SCHEMA_VERSION,
+        "mode": COMPILED_ARTIFACT_MODE,
+        "backend": backend,
+        "implementation": implementation,
+        "workspacePerMutant": True,
+        "parallelSafe": True,
+        "supportsCompiledReplacement": True,
+        "sourceOverlay": {
+            "strategy": "scratch-source-materialization",
+            "restoration": "discard-scratch-source",
+        },
+        "compiledArtifacts": {
+            "supported": True,
+            "kinds": ["executable"],
+            "placementPolicy": "swap-file",
+            "sourceCheckoutMutation": False,
+        },
+        "retainArtifacts": retain_artifacts,
+        "retainArtifactsFor": list(retain_artifacts_for or []),
+    }
+    if worker_tmp_dir:
+        payload["workerTmpDir"] = worker_tmp_dir
+    if worker_label:
+        payload["workerLabel"] = worker_label
+    return payload
+
+
+def compiled_artifact_placement_policy(
+    backend: str,
+    *,
+    artifact_root: str | None = None,
+    worker_tmp_dir: str | None = None,
+    retain_artifacts: bool = False,
+    retain_artifacts_for: list[str] | None = None,
+    worker_label: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "schemaVersion": ARTIFACT_PLACEMENT_SCHEMA_VERSION,
+        "mode": COMPILED_ARTIFACT_MODE,
+        "implementation": backend,
+        "artifactRoot": artifact_root,
+        "workerTmpDir": worker_tmp_dir,
+        "workerLabel": worker_label,
+        "restoreOriginals": True,
+        "retainArtifacts": retain_artifacts,
+        "retainArtifactsFor": list(retain_artifacts_for or []),
+        "sourceOverlay": {
+            "restorePolicy": "discard-scratch-source",
+            "placement": "scratch-source-materialization",
+        },
+        "compiledArtifacts": {
+            "supported": True,
+            "kind": "executable",
+            "placement": "swap-file",
+            "restorePolicy": "restore-original-file",
+        },
+    }
 
 
 @dataclass

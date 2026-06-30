@@ -38,6 +38,8 @@ from .payload_contract import native_to_mte_status
 from .project_analysis import analyze_project
 from .mutation_artifacts import (
     artifact_placement_policy,
+    compiled_artifact_placement_policy,
+    compiled_mutation_artifact_metadata,
     materialize_mutation_artifact,
     mutation_artifact_metadata,
 )
@@ -400,6 +402,7 @@ class Report:
 FATAL_STATUSES = {"KILLED", "SURVIVED", "BUILD_ERROR", "CHECK_ERROR", "NO_COVERAGE", "TIMEOUT", "IGNORED"}
 RETAINABLE_STATUSES = FATAL_STATUSES | {"RUNTIME_ERROR", "PENDING"}
 COMPILE_PRUNED_STATUSES = {"BUILD_ERROR", "CHECK_ERROR"}
+ARTIFACT_BACKENDS = {"source-overlay", "compiled-executable", "compiled-library", "compiled-object"}
 BATCH_ISOLATED_MUTATORS = {
     "BlockRemoval",
     "CallRemoval",
@@ -4046,6 +4049,11 @@ def _report_dict(rep: Report, repo: str | None = None, base: str | None = None,
         "projectAnalysis": execution.get("projectAnalysis", {}),
         "mutationArtifact": execution.get("mutationArtifact", {}),
         "artifactPlacement": execution.get("artifactPlacement", {}),
+        "compiledArtifacts": [
+            mut.get("run", {}).get("compiledArtifact")
+            for mut in normalized_mutants
+            if isinstance(mut.get("run"), dict) and isinstance(mut.get("run", {}).get("compiledArtifact"), dict)
+        ],
         "lifecycle": _lifecycle_metadata(rep, normalized_mutants),
         "config": rep.config or {"path": None, "hash": None, "effective": {}},
         "commands": {
@@ -4116,6 +4124,7 @@ def _lifecycle_metadata(rep: Report, mutants: list[dict[str, Any]]) -> dict[str,
     mutation_artifact_detail = (
         {
             "artifactMode": mutation_artifact.get("mode"),
+            "backend": mutation_artifact.get("backend"),
             "implementation": mutation_artifact.get("implementation"),
             "workspacePerMutant": mutation_artifact.get("workspacePerMutant"),
             "parallelSafe": mutation_artifact.get("parallelSafe"),
@@ -4127,6 +4136,12 @@ def _lifecycle_metadata(rep: Report, mutants: list[dict[str, Any]]) -> dict[str,
             "implementation": rep.execution.get("worktreeMode", "inplace"),
         }
     )
+    artifact_model = (
+        "compiled-artifact"
+        if isinstance(mutation_artifact, dict) and mutation_artifact.get("mode") == "compiled-artifact"
+        else "source-level"
+    )
+    mutation_artifact_status = "compiledArtifact" if artifact_model == "compiled-artifact" else "sourceLevel"
     phases = [
         _phase(
             "initialization",
@@ -4149,7 +4164,7 @@ def _lifecycle_metadata(rep: Report, mutants: list[dict[str, Any]]) -> dict[str,
         ),
         _phase(
             "mutationArtifact",
-            "sourceLevel",
+            mutation_artifact_status,
             **mutation_artifact_detail,
         ),
         _phase(
@@ -4209,7 +4224,7 @@ def _lifecycle_metadata(rep: Report, mutants: list[dict[str, Any]]) -> dict[str,
     ]
     return {
         "schemaVersion": "stryker-cxx.lifecycle.v1",
-        "artifactModel": "source-level",
+        "artifactModel": artifact_model,
         "phaseOrder": [phase["name"] for phase in phases],
         "phases": phases,
     }
@@ -4757,6 +4772,118 @@ def _write_output_artifacts(report_path: str, output_format: str, rep: "Report")
         _write_human_artifact(report_path, "json", _mutation_testing_elements(rep))
 
 
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _ignore_for_compiled_scratch(build_dir: str | None, artifact_root: str | None):
+    ignored = {".git", "__pycache__", ".pytest_cache", "node_modules"}
+    if build_dir and not os.path.isabs(build_dir):
+        ignored.add(os.path.normpath(build_dir).split(os.sep)[0])
+    if artifact_root and not os.path.isabs(artifact_root):
+        ignored.add(os.path.normpath(artifact_root).split(os.sep)[0])
+
+    def ignore(_dir: str, names: list[str]) -> set[str]:
+        return {name for name in names if name in ignored}
+
+    return ignore
+
+
+def _infer_cmake_executable_target(repo: str) -> str | None:
+    path = os.path.join(repo, "CMakeLists.txt")
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return None
+    match = re.search(r"\badd_executable\s*\(\s*([A-Za-z0-9_.:+-]+)", text, flags=re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def _compiled_executable_target(
+    repo: str,
+    build_dir: str | None,
+    build_target: str | None,
+    test_binary: str | None,
+) -> tuple[str, str]:
+    if test_binary:
+        original = test_binary if os.path.isabs(test_binary) else os.path.join(repo, test_binary)
+        return os.path.splitext(os.path.basename(original))[0], os.path.abspath(original)
+    target = build_target or _infer_cmake_executable_target(repo)
+    if not target:
+        raise ValueError("compiled-executable backend requires --build-target, --test-binary, or a discoverable add_executable target")
+    build_root = build_dir or "build"
+    original = os.path.join(repo, build_root, target) if not os.path.isabs(build_root) else os.path.join(build_root, target)
+    return target, os.path.abspath(original)
+
+
+def _find_built_artifact(build_dir: str, target: str, original_artifact: str) -> str:
+    candidates = [
+        os.path.join(build_dir, os.path.basename(original_artifact)),
+        os.path.join(build_dir, target),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    for current, dirs, files in os.walk(build_dir):
+        dirs[:] = sorted(d for d in dirs if d not in {"CMakeFiles", "__pycache__"})
+        for file_name in sorted(files):
+            if file_name in {os.path.basename(original_artifact), target}:
+                return os.path.join(current, file_name)
+    raise ValueError(f"compiled-executable backend did not produce artifact for target {target!r}")
+
+
+def _compiled_backend_retain_statuses(retain_worktrees_for: set[str] | None) -> list[str]:
+    if retain_worktrees_for is None:
+        return ["ALL"]
+    if not retain_worktrees_for:
+        return []
+    return _retain_status_names(retain_worktrees_for)
+
+
+def _compiled_artifact_run_metadata(
+    *,
+    backend: str,
+    target: str,
+    scratch_root: str,
+    scratch_repo: str,
+    scratch_build_dir: str,
+    mutated_artifact: str | None,
+    original_artifact: str,
+    backup_artifact: str,
+    retained: bool,
+    original_hash_before: str | None,
+    original_hash_after: str | None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "schemaVersion": "stryker-cxx.compiled-artifact.v1",
+        "backend": backend,
+        "kind": "executable",
+        "target": target,
+        "scratchRoot": scratch_root,
+        "scratchRepo": scratch_repo,
+        "scratchBuildDir": scratch_build_dir,
+        "mutatedArtifact": mutated_artifact,
+        "originalArtifact": original_artifact,
+        "backupArtifact": backup_artifact,
+        "placementPolicy": "swap-file",
+        "restorationPolicy": "restore-original-file",
+        "sourceCheckoutMutation": False,
+        "originalHashBefore": original_hash_before,
+        "originalHashAfter": original_hash_after,
+        "originalRestored": bool(original_hash_before and original_hash_after and original_hash_before == original_hash_after),
+        "retained": retained,
+    }
+    if retained:
+        payload["retainedPath"] = scratch_root
+        payload["cleanupGuidance"] = "remove retainedPath when proof capture is complete"
+    return payload
+
+
 def _run_mutant_once(
     mut: Mutant,
     repo: str,
@@ -4910,6 +5037,253 @@ def _run_mutant_once(
             mut.run["mutationArtifact"] = artifact.run_metadata()
             mut.run["artifactPlacement"] = artifact.placement_metadata()
             mut.durationMs = int((time.perf_counter() - start_ms) * 1000)
+    return mut
+
+
+def _run_mutant_once_compiled_executable(
+    mut: Mutant,
+    repo: str,
+    build_cmd: str,
+    check_cmd: str | None,
+    test_cmd: str,
+    timeout_seconds: int | None,
+    artifact_root: str,
+    execution_mode: str,
+    skip_tests: bool,
+    build_system: str | None,
+    build_dir: str | None,
+    build_target: str | None,
+    test_binary: str | None,
+    plugins: list[dict[str, Any]] | None = None,
+    worker_tmp_dir: str | None = None,
+    retain_worktrees: bool = False,
+    retain_worktrees_for: set[str] | None = None,
+    worker_label: str | None = None,
+    env_overrides: dict[str, str] | None = None,
+    env_inherit: list[str] | None = None,
+    env_block: list[str] | None = None,
+) -> Mutant:
+    if build_system not in {"cmake", "ctest", None}:
+        raise ValueError("compiled-executable backend currently requires --build-system cmake/ctest")
+
+    existing_run = dict(mut.run)
+    run_record = dict(existing_run)
+    run_record["mode"] = execution_mode
+    run_record["artifactBackend"] = "compiled-executable"
+    run_record["worktreeMode"] = "compiled-artifact"
+    if worker_label:
+        run_record["workerLabel"] = worker_label
+    mut.run = run_record
+    mut.status = "PENDING"
+    mut.detail = ""
+    mut.durationMs = 0
+    _record_environment_policy(mut.run, env_overrides, env_inherit, env_block)
+
+    start_ms = time.perf_counter()
+    target, original_artifact = _compiled_executable_target(repo, build_dir, build_target, test_binary)
+    if not os.path.isfile(original_artifact):
+        raise ValueError(f"compiled-executable backend requires existing built artifact: {original_artifact}")
+
+    scratch_root = tempfile.mkdtemp(prefix="stryker-cxx-compiled-", dir=worker_tmp_dir)
+    scratch_repo = os.path.join(scratch_root, "source")
+    scratch_build_dir = os.path.join(scratch_root, "build")
+    backup_artifact = os.path.join(artifact_root, f"original_{_safe_basename(mut.id)}_{os.path.basename(original_artifact)}")
+    configure_log = os.path.join(artifact_root, f"compiled_configure_{_safe_basename(mut.id)}.log")
+    build_log = os.path.join(artifact_root, f"compiled_build_{_safe_basename(mut.id)}.log")
+    check_log = os.path.join(artifact_root, f"compiled_check_{_safe_basename(mut.id)}.log")
+    test_log = os.path.join(artifact_root, f"compiled_test_{_safe_basename(mut.id)}.log")
+    mut.buildLog = build_log
+    mut.checkLog = check_log
+    mut.testLog = test_log
+    original_hash_before = _sha256_file(original_artifact)
+    original_hash_after: str | None = None
+    mutated_artifact: str | None = None
+    retained = False
+
+    try:
+        shutil.copytree(
+            repo,
+            scratch_repo,
+            ignore=_ignore_for_compiled_scratch(build_dir, artifact_root),
+        )
+        apply_mutant(scratch_repo, mut)
+
+        configure_cmd = (
+            "cmake -S "
+            f"{shlex.quote(scratch_repo)} -B {shlex.quote(scratch_build_dir)} "
+            "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
+        )
+        configure_rc, configure_ms = run_cmd(
+            configure_cmd,
+            repo,
+            configure_log,
+            timeout_seconds,
+            "build",
+            plugins,
+            env_overrides,
+            env_inherit,
+            env_block,
+        )
+        mut.run["configureCommand"] = configure_cmd
+        mut.run["configureReturnCode"] = configure_rc
+        mut.run["configureMs"] = configure_ms
+        if configure_rc == 124:
+            mut.status = "TIMEOUT"
+            mut.detail = "compiled backend configure timed out"
+            return mut
+        if configure_rc != 0:
+            mut.status = "BUILD_ERROR"
+            mut.detail = "compiled backend configure failed"
+            return mut
+
+        compiled_build_cmd = f"cmake --build {shlex.quote(scratch_build_dir)} --target {shlex.quote(target)}"
+        build_rc, build_ms = run_cmd(
+            compiled_build_cmd,
+            repo,
+            build_log,
+            timeout_seconds,
+            "build",
+            plugins,
+            env_overrides,
+            env_inherit,
+            env_block,
+        )
+        mut.run["buildCommand"] = compiled_build_cmd
+        mut.run["buildReturnCode"] = build_rc
+        mut.run["buildMs"] = build_ms
+        mut.run["buildProvider"] = _phase_provider_name(plugins, "build")
+        if build_rc == 124:
+            mut.status = "TIMEOUT"
+            mut.detail = "compiled backend build timed out"
+            return mut
+        if build_rc != 0:
+            mut.status = "BUILD_ERROR"
+            mut.detail = "compiled backend mutant did not compile"
+            return mut
+
+        mutated_artifact = _find_built_artifact(scratch_build_dir, target, original_artifact)
+        if check_cmd:
+            check_rc, check_ms = run_cmd(
+                check_cmd,
+                scratch_repo,
+                check_log,
+                timeout_seconds,
+                "check",
+                plugins,
+                env_overrides,
+                env_inherit,
+                env_block,
+            )
+            mut.run["checkReturnCode"] = check_rc
+            mut.run["checkMs"] = check_ms
+            mut.run["checkProvider"] = _phase_provider_name(plugins, "check")
+            if check_rc == 124:
+                mut.status = "TIMEOUT"
+                mut.detail = "compiled backend check timed out"
+                return mut
+            if check_rc != 0:
+                mut.status = "CHECK_ERROR"
+                mut.detail = "compiled backend checker rejected mutant"
+                return mut
+
+        shutil.copy2(original_artifact, backup_artifact)
+        shutil.copy2(mutated_artifact, original_artifact)
+        mut.run["artifactPlaced"] = True
+        mut.run["scheduler"] = {
+            "sessionType": "per-mutant",
+            "coverageSelected": bool(mut.run.get("selectedTestCommand")),
+            "selectedTests": list(mut.run.get("coveredBy", []))
+            if isinstance(mut.run.get("coveredBy"), list)
+            else [],
+            "splitFromBatchId": mut.run.get("splitFromBatchId"),
+            "artifactBackend": "compiled-executable",
+        }
+        effective_test_cmd = str(mut.run.get("selectedTestCommand") or test_cmd)
+        if skip_tests:
+            mut.status = "SURVIVED"
+            mut.detail = "tests skipped after successful compiled artifact build/check"
+        else:
+            test_rc, test_ms = run_cmd(
+                effective_test_cmd,
+                repo,
+                test_log,
+                timeout_seconds,
+                "test",
+                plugins,
+                env_overrides,
+                env_inherit,
+                env_block,
+            )
+            mut.run["testReturnCode"] = test_rc
+            mut.run["testMs"] = test_ms
+            mut.run["testProvider"] = _phase_provider_name(plugins, "test")
+            mut.run["testCommand"] = effective_test_cmd
+            if test_rc == 124:
+                mut.status = "TIMEOUT"
+                mut.detail = "compiled backend tests timed out"
+            elif test_rc != 0:
+                mut.status = "KILLED"
+            else:
+                mut.status = "SURVIVED"
+                mut.detail = "all targeted tests passed against compiled artifact"
+    finally:
+        if os.path.isfile(backup_artifact):
+            shutil.copy2(backup_artifact, original_artifact)
+            original_hash_after = _sha256_file(original_artifact)
+        elif os.path.isfile(original_artifact):
+            original_hash_after = _sha256_file(original_artifact)
+        retain_current = _should_retain_worktree(
+            retain_worktrees,
+            retain_worktrees_for,
+            mut.status,
+            scratch_root,
+            repo,
+        )
+        if retain_current:
+            retained = True
+            mut.run["retainedArtifact"] = scratch_root
+            mut.run["retainedArtifactReason"] = mut.status
+            if worker_label:
+                mut.run["retainedArtifactLabel"] = worker_label
+        else:
+            shutil.rmtree(scratch_root, ignore_errors=True)
+        mut.run["mutationArtifact"] = compiled_mutation_artifact_metadata(
+            "compiled-executable",
+            worker_tmp_dir=worker_tmp_dir,
+            retain_artifacts=retained,
+            retain_artifacts_for=[mut.status] if retained else [],
+            worker_label=worker_label,
+        )
+        mut.run["compiledArtifact"] = _compiled_artifact_run_metadata(
+            backend="compiled-executable",
+            target=target,
+            scratch_root=scratch_root,
+            scratch_repo=scratch_repo,
+            scratch_build_dir=scratch_build_dir,
+            mutated_artifact=mutated_artifact,
+            original_artifact=original_artifact,
+            backup_artifact=backup_artifact,
+            retained=retained,
+            original_hash_before=original_hash_before,
+            original_hash_after=original_hash_after,
+        )
+        mut.run["artifactPlacement"] = {
+            **compiled_artifact_placement_policy(
+                "compiled-executable",
+                artifact_root=artifact_root,
+                worker_tmp_dir=worker_tmp_dir,
+                retain_artifacts=retained,
+                retain_artifacts_for=[mut.status] if retained else [],
+                worker_label=worker_label,
+            ),
+            "workRepo": scratch_repo,
+            "workspaceRoot": scratch_root,
+            "originalArtifactsRestored": bool(original_hash_after and original_hash_after == original_hash_before),
+            "materializedArtifactRetained": retained,
+            "materializedArtifactRestored": not retained,
+            "retainedPath": scratch_root if retained else None,
+        }
+        mut.durationMs = int((time.perf_counter() - start_ms) * 1000)
     return mut
 
 
@@ -5351,6 +5725,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--build-cmd", required=True, dest="build_cmd")
     ap.add_argument("--check-cmd", required=False, default=None, dest="check_cmd")
     ap.add_argument("--test-cmd", required=False, dest="test_cmd")
+    ap.add_argument("--build-system", default=None, choices=["cmake", "ctest", "ninja", "make", "meson", "bazel", "xcodebuild"])
+    ap.add_argument("--build-dir", default=None)
+    ap.add_argument("--build-target", default=None)
+    ap.add_argument("--test-binary", default=None)
     ap.add_argument("--report", required=True)
     ap.add_argument("--config-path", default=None)
     ap.add_argument("--config-hash", default=None)
@@ -5417,6 +5795,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--shard-index", type=int, default=None)
     ap.add_argument("--shard-total", type=int, default=None, help="Split work into N shards")
+    ap.add_argument("--artifact-backend", default="source-overlay", choices=sorted(ARTIFACT_BACKENDS))
+    ap.add_argument("--artifact-fallback", default="none", choices=["none", "source-overlay"])
     ap.add_argument("--worktree-mode", dest="worktree_mode", choices=["inplace", "git-worktree", "copy"], default="inplace")
     ap.add_argument("--allow-dirty", action="store_true")
     ap.add_argument("--output-format", default="legacy", choices=["legacy", "stryker-cxx"],
@@ -5455,6 +5835,13 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("--batch-size must be >= 1")
     if args.batch_mutants and args.worktree_mode == "inplace":
         ap.error("--batch-mutants requires --worktree-mode copy or git-worktree")
+    if args.artifact_backend != "source-overlay":
+        if args.artifact_backend != "compiled-executable":
+            ap.error(f"{args.artifact_backend} backend is specified but not implemented yet; use compiled-executable")
+        if args.jobs > 1:
+            ap.error("--artifact-backend compiled-executable currently requires --jobs 1")
+        if args.batch_mutants:
+            ap.error("--artifact-backend compiled-executable does not yet support --batch-mutants")
     coverage_helper_tests = _parse_csv_items(args.coverage_helper_tests)
     if args.coverage_helper_command_template and not coverage_helper_tests:
         ap.error("--coverage-helper-command-template requires --coverage-helper-tests")
@@ -5554,6 +5941,8 @@ def main(argv: list[str] | None = None) -> int:
         testCommand=args.test_cmd,
         execution={
             "mode": args.mode,
+            "artifactBackend": args.artifact_backend,
+            "artifactFallback": args.artifact_fallback,
             "worktreeMode": args.worktree_mode,
             "jobs": args.jobs,
             "initialTest": not args.skip_initial_test,
@@ -5637,24 +6026,49 @@ def main(argv: list[str] | None = None) -> int:
                 "redaction": _redaction_metadata(),
                 "network": "core-offline; explicit dashboard URLs and plugin commands may use network",
             },
-            "mutationArtifact": mutation_artifact_metadata(
-                args.worktree_mode,
-                worker_tmp_dir=args.worker_tmp_dir,
-                retain_worktrees=retain_worktrees,
-                retain_worktrees_for=_retain_status_names(retain_worktrees_for)
-                if retain_worktrees
-                else [],
-                worker_label=worker_label,
+            "mutationArtifact": (
+                compiled_mutation_artifact_metadata(
+                    args.artifact_backend,
+                    worker_tmp_dir=args.worker_tmp_dir,
+                    retain_artifacts=retain_worktrees,
+                    retain_artifacts_for=_compiled_backend_retain_statuses(retain_worktrees_for)
+                    if retain_worktrees
+                    else [],
+                    worker_label=worker_label,
+                )
+                if args.artifact_backend != "source-overlay"
+                else mutation_artifact_metadata(
+                    args.worktree_mode,
+                    worker_tmp_dir=args.worker_tmp_dir,
+                    retain_worktrees=retain_worktrees,
+                    retain_worktrees_for=_retain_status_names(retain_worktrees_for)
+                    if retain_worktrees
+                    else [],
+                    worker_label=worker_label,
+                )
             ),
-            "artifactPlacement": artifact_placement_policy(
-                args.worktree_mode,
-                artifact_root=artifact_root,
-                worker_tmp_dir=args.worker_tmp_dir,
-                retain_worktrees=retain_worktrees,
-                retain_worktrees_for=_retain_status_names(retain_worktrees_for)
-                if retain_worktrees
-                else [],
-                worker_label=worker_label,
+            "artifactPlacement": (
+                compiled_artifact_placement_policy(
+                    args.artifact_backend,
+                    artifact_root=artifact_root,
+                    worker_tmp_dir=args.worker_tmp_dir,
+                    retain_artifacts=retain_worktrees,
+                    retain_artifacts_for=_compiled_backend_retain_statuses(retain_worktrees_for)
+                    if retain_worktrees
+                    else [],
+                    worker_label=worker_label,
+                )
+                if args.artifact_backend != "source-overlay"
+                else artifact_placement_policy(
+                    args.worktree_mode,
+                    artifact_root=artifact_root,
+                    worker_tmp_dir=args.worker_tmp_dir,
+                    retain_worktrees=retain_worktrees,
+                    retain_worktrees_for=_retain_status_names(retain_worktrees_for)
+                    if retain_worktrees
+                    else [],
+                    worker_label=worker_label,
+                )
             ),
         },
     )
@@ -5953,6 +6367,52 @@ def main(argv: list[str] | None = None) -> int:
 
     rep.total = len(discovered)
 
+    def run_single_mutant(mut: Mutant) -> Mutant:
+        if args.artifact_backend == "compiled-executable":
+            return _run_mutant_once_compiled_executable(
+                mut,
+                repo=repo,
+                build_cmd=args.build_cmd,
+                check_cmd=args.check_cmd,
+                test_cmd=args.test_cmd,
+                timeout_seconds=effective_timeout_seconds,
+                artifact_root=artifact_root,
+                execution_mode=args.mode,
+                skip_tests=args.skip_tests,
+                build_system=args.build_system,
+                build_dir=args.build_dir,
+                build_target=args.build_target,
+                test_binary=args.test_binary,
+                plugins=plugins,
+                worker_tmp_dir=args.worker_tmp_dir,
+                retain_worktrees=retain_worktrees,
+                retain_worktrees_for=retain_worktrees_for,
+                worker_label=worker_label,
+                env_overrides=env_overrides,
+                env_inherit=env_inherit,
+                env_block=env_block,
+            )
+        return _run_mutant_once(
+            mut,
+            repo=repo,
+            build_cmd=args.build_cmd,
+            check_cmd=args.check_cmd,
+            test_cmd=args.test_cmd,
+            timeout_seconds=effective_timeout_seconds,
+            worktree_mode=args.worktree_mode,
+            artifact_root=artifact_root,
+            execution_mode=args.mode,
+            skip_tests=args.skip_tests,
+            plugins=plugins,
+            worker_tmp_dir=args.worker_tmp_dir,
+            retain_worktrees=retain_worktrees,
+            retain_worktrees_for=retain_worktrees_for,
+            worker_label=worker_label,
+            env_overrides=env_overrides,
+            env_inherit=env_inherit,
+            env_block=env_block,
+        )
+
     try:
         if pending:
             if args.batch_mutants:
@@ -5997,26 +6457,7 @@ def main(argv: list[str] | None = None) -> int:
                 }
                 for batch_index, batch in enumerate(batches, 1):
                     if len(batch) == 1:
-                        executed = _run_mutant_once(
-                            batch[0],
-                            repo=repo,
-                            build_cmd=args.build_cmd,
-                            check_cmd=args.check_cmd,
-                            test_cmd=args.test_cmd,
-                            timeout_seconds=effective_timeout_seconds,
-                            worktree_mode=args.worktree_mode,
-                            artifact_root=artifact_root,
-                            execution_mode=args.mode,
-                            skip_tests=args.skip_tests,
-                            plugins=plugins,
-                            worker_tmp_dir=args.worker_tmp_dir,
-                            retain_worktrees=retain_worktrees,
-                            retain_worktrees_for=retain_worktrees_for,
-                            worker_label=worker_label,
-                            env_overrides=env_overrides,
-                            env_inherit=env_inherit,
-                            env_block=env_block,
-                        )
+                        executed = run_single_mutant(batch[0])
                         _record_compile_pruned_mutant(rep, executed, source="executed")
                         _count_status(rep, executed.status)
                         executed.run["reproCommand"] = mutation_repro_command(executed, repo, args.build_cmd, str(executed.run.get("selectedTestCommand") or args.test_cmd or ""), args.report)
@@ -6161,26 +6602,7 @@ def main(argv: list[str] | None = None) -> int:
                     for mut in batch:
                         if run.get("batchId"):
                             mut.run["splitFromBatchId"] = run.get("batchId")
-                        executed = _run_mutant_once(
-                            mut,
-                            repo=repo,
-                            build_cmd=args.build_cmd,
-                            check_cmd=args.check_cmd,
-                            test_cmd=args.test_cmd,
-                            timeout_seconds=effective_timeout_seconds,
-                            worktree_mode=args.worktree_mode,
-                            artifact_root=artifact_root,
-                            execution_mode=args.mode,
-                            skip_tests=args.skip_tests,
-                            plugins=plugins,
-                            worker_tmp_dir=args.worker_tmp_dir,
-                            retain_worktrees=retain_worktrees,
-                            retain_worktrees_for=retain_worktrees_for,
-                            worker_label=worker_label,
-                            env_overrides=env_overrides,
-                            env_inherit=env_inherit,
-                            env_block=env_block,
-                        )
+                        executed = run_single_mutant(mut)
                         _record_compile_pruned_mutant(
                             rep,
                             executed,
@@ -6252,26 +6674,7 @@ def main(argv: list[str] | None = None) -> int:
                     if not args.quiet:
                         tag = f"{mut.file.split('/')[-1]}:{mut.line} {mut.original}->{mut.mutated} [{mut.mutator}]"
                         print(f"[{idx}/{len(pending)}] {tag} ... ", end="", flush=True)
-                    executed = _run_mutant_once(
-                        mut,
-                        repo=repo,
-                        build_cmd=args.build_cmd,
-                        check_cmd=args.check_cmd,
-                        test_cmd=args.test_cmd,
-                        timeout_seconds=effective_timeout_seconds,
-                        worktree_mode=args.worktree_mode,
-                        artifact_root=artifact_root,
-                        execution_mode=args.mode,
-                        skip_tests=args.skip_tests,
-                        plugins=plugins,
-                        worker_tmp_dir=args.worker_tmp_dir,
-                        retain_worktrees=retain_worktrees,
-                        retain_worktrees_for=retain_worktrees_for,
-                        worker_label=worker_label,
-                        env_overrides=env_overrides,
-                        env_inherit=env_inherit,
-                        env_block=env_block,
-                    )
+                    executed = run_single_mutant(mut)
                     if not args.quiet:
                         print(f"{executed.status} ({executed.durationMs}ms)")
                     if executed.status == "KILLED":

@@ -89,6 +89,8 @@
         "timeoutFactor": { "type": "number", "minimum": 0 },
         "timeoutConstantMs": { "type": "integer", "minimum": 0 },
         "artifactDir": { "type": "string" },
+        "artifactBackend": { "enum": ["source-overlay", "compiled-executable", "compiled-library", "compiled-object"] },
+        "artifactFallback": { "enum": ["none", "source-overlay"] },
         "retainWorktrees": { "type": "boolean" },
         "retainWorktreesFor": {
           "oneOf": [
@@ -188,6 +190,20 @@
         "baselineBranch": { "type": "string" },
         "writeBaseline": { "type": "string" },
         "clearBaseline": { "type": "boolean" }
+      }
+    },
+    "mutationArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "backend": { "enum": ["source-overlay", "compiled-executable", "compiled-library", "compiled-object"] },
+        "fallback": { "enum": ["none", "source-overlay"] },
+        "retainArtifactsFor": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "string" } }
+          ]
+        }
       }
     },
     "report": {

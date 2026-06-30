@@ -75,6 +75,8 @@ execution:
   xctestOnlyTesting: []
   xctestSkipTesting: []
   worktreeMode: copy
+  artifactBackend: source-overlay
+  artifactFallback: none
   jobs: 1
   batchMutants: false
   batchSize: 4
@@ -238,6 +240,7 @@ CONFIG_ALLOWED_TOP_LEVEL = {
     "mutators",
     "thresholds",
     "execution",
+    "mutationArtifact",
     "report",
     "coverageFile",
     "coverageProvider",
@@ -270,6 +273,8 @@ CONFIG_ALLOWED_NESTED = {
         "timeoutFactor",
         "timeoutConstantMs",
         "artifactDir",
+        "artifactBackend",
+        "artifactFallback",
         "retainWorktrees",
         "retainWorktreesFor",
         "retainedWorktreeTtlHours",
@@ -333,6 +338,7 @@ CONFIG_ALLOWED_NESTED = {
         "writeBaseline",
         "clearBaseline",
     },
+    "mutationArtifact": {"backend", "fallback", "retainArtifactsFor"},
 }
 
 
@@ -857,6 +863,8 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--jobs", type=int, default=None, help="Parallel mutant execution with isolated worktrees.")
     run.add_argument("--batch-mutants", action="store_true", dest="batch_mutants")
     run.add_argument("--batch-size", type=int, default=None, dest="batch_size")
+    run.add_argument("--artifact-backend", choices=["source-overlay", "compiled-executable", "compiled-library", "compiled-object"], default=None, dest="artifact_backend")
+    run.add_argument("--artifact-fallback", choices=["none", "source-overlay"], default=None, dest="artifact_fallback")
     run.add_argument("--worktree-mode", dest="worktree_mode", choices=["inplace", "git-worktree", "copy"], default=None)
     run.add_argument("--allow-dirty", action="store_true")
     run.add_argument("--threshold", type=float, default=None)
@@ -1041,6 +1049,8 @@ def _build_parser() -> argparse.ArgumentParser:
     run_mutant.add_argument("--threshold-break", type=float, default=None, dest="threshold_break")
     run_mutant.add_argument("--mode", choices=["token", "clang", "clang-ast"], default=None)
     run_mutant.add_argument("--equivalent-suppression", choices=["off", "conservative", "aggressive"], default=None, dest="equivalent_suppression")
+    run_mutant.add_argument("--artifact-backend", choices=["source-overlay", "compiled-executable", "compiled-library", "compiled-object"], default=None, dest="artifact_backend")
+    run_mutant.add_argument("--artifact-fallback", choices=["none", "source-overlay"], default=None, dest="artifact_fallback")
     run_mutant.add_argument("--worktree-mode", dest="worktree_mode", choices=["inplace", "git-worktree", "copy"], default=None)
     run_mutant.add_argument("--allow-dirty", action="store_true")
     run_mutant.add_argument("--quiet", action="store_true")
@@ -1250,6 +1260,7 @@ def _resolve_defaults(args: argparse.Namespace) -> dict[str, Any]:
 
     execution = cfg.get("execution", {}) if isinstance(cfg.get("execution"), dict) else {}
     report_cfg = cfg.get("report", {}) if isinstance(cfg.get("report"), dict) else {}
+    mutation_artifact_cfg = cfg.get("mutationArtifact", {}) if isinstance(cfg.get("mutationArtifact"), dict) else {}
     thresholds_cfg = cfg.get("thresholds", {}) if isinstance(cfg.get("thresholds"), dict) else {}
     report_thresholds_cfg = report_cfg.get("thresholds", {}) if isinstance(report_cfg.get("thresholds"), dict) else {}
     files_cfg = cfg.get("files") if isinstance(cfg.get("files"), dict) else {}
@@ -1453,6 +1464,18 @@ def _resolve_defaults(args: argparse.Namespace) -> dict[str, Any]:
             if getattr(args, "batch_size", None) is not None
             else execution.get("batchSize", 4)
         ),
+        "artifact_backend": (
+            getattr(args, "artifact_backend", None)
+            or execution.get("artifactBackend")
+            or mutation_artifact_cfg.get("backend")
+            or "source-overlay"
+        ),
+        "artifact_fallback": (
+            getattr(args, "artifact_fallback", None)
+            or execution.get("artifactFallback")
+            or mutation_artifact_cfg.get("fallback")
+            or "none"
+        ),
         "worktree_mode": (
             getattr(args, "worktree_mode", None)
             if getattr(args, "worktree_mode", None) is not None
@@ -1618,6 +1641,18 @@ def _run(args: argparse.Namespace) -> int:
         legacy_args.append("--batch-mutants")
     if cfg["batch_size"] is not None:
         legacy_args.extend(["--batch-size", str(cfg["batch_size"])])
+    if cfg["artifact_backend"]:
+        legacy_args.extend(["--artifact-backend", cfg["artifact_backend"]])
+    if cfg["artifact_fallback"]:
+        legacy_args.extend(["--artifact-fallback", cfg["artifact_fallback"]])
+    if cfg["build_system"]:
+        legacy_args.extend(["--build-system", cfg["build_system"]])
+    if cfg["build_dir"]:
+        legacy_args.extend(["--build-dir", cfg["build_dir"]])
+    if cfg["build_target"]:
+        legacy_args.extend(["--build-target", cfg["build_target"]])
+    if cfg["test_binary"]:
+        legacy_args.extend(["--test-binary", cfg["test_binary"]])
     if cfg["shard_index"] is not None:
         legacy_args.extend(["--shard-index", str(cfg["shard_index"])])
     if cfg["shard_total"] is not None:
@@ -1825,6 +1860,18 @@ def _run_mutant(args: argparse.Namespace) -> int:
         legacy_args.extend(["--equivalent-suppression", str(cfg["equivalent_suppression"])])
     if cfg["jobs"] is not None:
         legacy_args.extend(["--jobs", str(cfg["jobs"])])
+    if cfg["artifact_backend"]:
+        legacy_args.extend(["--artifact-backend", cfg["artifact_backend"]])
+    if cfg["artifact_fallback"]:
+        legacy_args.extend(["--artifact-fallback", cfg["artifact_fallback"]])
+    if cfg["build_system"]:
+        legacy_args.extend(["--build-system", cfg["build_system"]])
+    if cfg["build_dir"]:
+        legacy_args.extend(["--build-dir", cfg["build_dir"]])
+    if cfg["build_target"]:
+        legacy_args.extend(["--build-target", cfg["build_target"]])
+    if cfg["test_binary"]:
+        legacy_args.extend(["--test-binary", cfg["test_binary"]])
     if cfg["shard_index"] is not None:
         legacy_args.extend(["--shard-index", str(cfg["shard_index"])])
     if cfg["shard_total"] is not None:
