@@ -63,6 +63,42 @@ With `--batch-mutants`, isolated `copy`/`git-worktree` runs can use `--jobs` to
 probe multiple compatible batches concurrently while preserving stable report
 ordering. Batching stays conservative: same-file adjacent-line edits and
 source-structure mutators are isolated from mixed batches.
+
+For Stryker.NET-style artifact execution, use an explicit compiled backend on a
+prebuilt CMake/CTest project:
+
+```bash
+cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+cmake --build build --target target_test
+
+stryker-cxx run \
+  --repo . \
+  --files src/foo.cpp \
+  --build-system cmake \
+  --build-dir build \
+  --build-target target_test \
+  --test-binary build/target_test \
+  --test-command "ctest --test-dir build --output-on-failure" \
+  --artifact-backend compiled-object \
+  --batch-mutants \
+  --report mutation.json
+```
+
+Compiled backends currently support CMake/CTest targets:
+
+- `compiled-executable` swaps a rebuilt executable into the original test
+  location.
+- `compiled-library` swaps a rebuilt shared/static library into the original
+  test location.
+- `compiled-object` records mutated object artifacts, relinks the owning target,
+  swaps the linked artifact, and restores the original artifact by hash.
+
+`source-overlay` remains the default compatibility backend for generic command
+adapters. Ninja, Make, Meson, Bazel, and Xcode command synthesis are available
+for source-overlay runs; compiled artifact backends intentionally preflight to
+CMake/CTest until those build graph adapters can prove artifact ownership.
+Compiled artifact batching is supported for single-worker local sessions;
+parallel compiled workers are rejected for now.
 Reports record env keys for reproducibility, but redact explicit env values and
 shell-style sensitive assignments such as `TOKEN=value` from serialized report
 artifacts.

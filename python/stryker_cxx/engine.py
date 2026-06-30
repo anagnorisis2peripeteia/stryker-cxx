@@ -6319,6 +6319,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.artifact_backend != "source-overlay":
         if args.artifact_backend not in {"compiled-executable", "compiled-library", "compiled-object"}:
             ap.error(f"{args.artifact_backend} backend is specified but not implemented yet; use compiled-executable, compiled-library, or compiled-object")
+        if args.build_system not in {"cmake", "ctest", None}:
+            ap.error(f"--artifact-backend {args.artifact_backend} currently requires --build-system cmake/ctest")
         if args.jobs > 1:
             ap.error(f"--artifact-backend {args.artifact_backend} currently requires --jobs 1")
     coverage_helper_tests = _parse_csv_items(args.coverage_helper_tests)

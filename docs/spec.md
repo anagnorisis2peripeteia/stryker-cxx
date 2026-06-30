@@ -674,6 +674,19 @@ Implemented generic adapters:
 - checker command synthesis for `clang`/`clang++ -fsyntax-only`, `clang-tidy`,
   and `cppcheck`;
 
+Compiled artifact support matrix:
+
+- `source-overlay`: default compatibility backend for all generic command
+  adapters.
+- `compiled-executable`: CMake/CTest targets, single-worker, batch-capable.
+- `compiled-library`: CMake/CTest library targets, single-worker,
+  batch-capable.
+- `compiled-object`: CMake/CTest targets with compile database object
+  discovery, single-worker, batch-capable.
+- Ninja, Make, Meson, Bazel, and Xcode compiled-artifact backends are explicit
+  unsupported preflight paths until their build graph adapters can prove source
+  to object to linked-artifact ownership.
+
 Implemented framework adapters:
 
 - GoogleTest filtering;

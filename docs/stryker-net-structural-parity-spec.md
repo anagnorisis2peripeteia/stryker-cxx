@@ -292,15 +292,18 @@ Acceptance:
 
 ### Phase 6: adapters beyond CMake/Ninja
 
-- Add Make adapter.
-- Add Meson adapter.
-- Add Bazel adapter or explicit unsupported diagnostics.
-- Add Xcode/ObjC++ adapter if feasible.
+- Keep source-overlay command adapters for Ninja, Make, Meson, Bazel, and Xcode.
+- Keep compiled-artifact execution CMake/CTest-only until non-CMake adapters can
+  prove source-to-object-to-linked-artifact ownership.
+- Fail unsupported compiled-artifact adapters in preflight with clear
+  diagnostics.
+- Add Make/Meson/Bazel/Xcode compiled artifact adapters only when their build
+  graph discovery can satisfy the artifact ownership contract.
 
 Acceptance:
 
-- each supported adapter exposes the normalized build graph;
-- unsupported adapters fail preflight clearly;
+- supported compiled adapters expose the normalized artifact contract;
+- unsupported compiled adapters fail preflight clearly;
 - docs list support level by build system.
 
 ## Test strategy

@@ -1170,6 +1170,32 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(run["compiledArtifact"]["placementPolicy"], "swap-file")
         self.assertTrue(run["artifactPlacement"]["originalArtifactsRestored"])
 
+    def test_compiled_backend_rejects_non_cmake_adapter_in_preflight(self) -> None:
+        report = self.repo / "compiled-unsupported.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-system",
+            "ninja",
+            "--build-command",
+            "true",
+            "--test-command",
+            "true",
+            "--artifact-backend",
+            "compiled-executable",
+            "--report",
+            str(report),
+            "--skip-initial-test",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+        self.assertIn("requires --build-system cmake/ctest", result.stderr)
+
     def test_compiled_library_backend_swaps_shared_library_and_restores_original(self) -> None:
         self.source.write_text(
             "int value(int input) {\n"
