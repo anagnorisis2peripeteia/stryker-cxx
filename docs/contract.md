@@ -128,3 +128,31 @@ Each pruned mutant remains visible in `mutants[]` with status `BUILD_ERROR` or
 `CHECK_ERROR`, `resultSource = "compile-pruning"`, and
 `run.testSkippedReason = "compile-pruned"`. This keeps current consumers stable
 while separating compile-invalid mutants from test-executed mutants.
+
+## Coverage and scheduler metadata
+
+Native reports distinguish coverage state at both run and mutant level:
+
+- `coverage.enabled`, `coverage.provider`, and `coverage.files` describe the
+  coverage source;
+- `coverage.coveredMutants`, `coverage.noCoverageMutants`, and
+  `coverage.unknownCoverageMutants` separate covered, not-covered, and
+  unknown-coverage mutants;
+- `coverage.testLevel`, `coverage.testMappedFiles`, and
+  `coverage.testSelectedMutants` describe test-level selection when available;
+- each native mutant run may include `run.coverageStatus` with `covered`,
+  `not-covered`, or `unknown`.
+
+Native reports include `execution.testScheduler` with
+`schemaVersion = "stryker-cxx.test-scheduler.v1"`. It summarizes the sessions
+that actually ran:
+
+- `strategy`, currently `per-mutant` or `batched`;
+- `sessions`, `batchSessions`, `perMutantSessions`, and `splitSessions`;
+- `coverageSelectedSessions`, for sessions using coverage-selected commands;
+- `groups[]`, with session type, batch id, split source, selected tests, test
+  command, mutant ids, and final grouped status.
+
+Batched sessions can now use coverage-selected tests. When a batch contains
+multiple covered mutants, the scheduler runs the coverage command template with
+the ordered union of covered tests for that batch.

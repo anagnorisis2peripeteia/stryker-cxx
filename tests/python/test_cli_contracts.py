@@ -2683,7 +2683,9 @@ class CliContractTests(unittest.TestCase):
         payload = json.loads(report.read_text())
         self.assertEqual(payload["noCoverage"], 1)
         self.assertEqual(payload["coverage"]["noCoverageMutants"], 1)
+        self.assertEqual(payload["coverage"]["unknownCoverageMutants"], 0)
         self.assertEqual(payload["mutants"][0]["status"], "NO_COVERAGE")
+        self.assertEqual(payload["mutants"][0]["run"]["coverageStatus"], "not-covered")
         first = payload["mutationTestingElements"]["files"]["sample.cpp"]["mutants"][0]
         self.assertEqual(first["status"], "NoCoverage")
 
@@ -2725,11 +2727,83 @@ class CliContractTests(unittest.TestCase):
         payload = json.loads(report.read_text())
         self.assertEqual(payload["coverage"]["testSelectedMutants"], 1)
         self.assertEqual(payload["coverage"]["testSelectionMisses"], 0)
+        self.assertEqual(payload["mutants"][0]["run"]["coverageStatus"], "covered")
         self.assertEqual(payload["mutants"][0]["run"]["coveredBy"], ["MathTest.Basic"])
         self.assertEqual(payload["mutants"][0]["run"]["selectedTestCommand"], "test MathTest.Basic = MathTest.Basic")
+        self.assertEqual(payload["mutants"][0]["run"]["scheduler"]["coverageSelected"], True)
+        self.assertEqual(payload["execution"]["testScheduler"]["coverageSelectedSessions"], 1)
         self.assertEqual(payload["mutants"][0]["status"], "SURVIVED")
         mte = payload["mutationTestingElements"]["files"]["sample.cpp"]["mutants"][0]
         self.assertEqual(mte["coveredBy"], ["MathTest.Basic"])
+
+    def test_batched_coverage_selection_uses_union_test_command(self) -> None:
+        self.source.write_text(
+            "int a() { return 1 == 1; }\n"
+            "int b() { return 2 == 2; }\n"
+            "int c() { return 3 == 3; }\n"
+            "int d() { return 4 == 4; }\n"
+        )
+        self._git("add", "sample.cpp")
+        self._git("-c", "user.name=stryker-cxx", "-c", "user.email=stryker-cxx@example.invalid", "commit", "-q", "-m", "batch-coverage")
+        report = self.repo / "batch-coverage.json"
+        coverage = self.repo / "batch-coverage-input.json"
+        coverage.write_text(json.dumps({
+            "files": {
+                "sample.cpp": {
+                    "coveredLines": [1, 2, 3, 4],
+                    "coveredTests": {
+                        "1": ["MathTest.A"],
+                        "2": ["MathTest.B"],
+                        "3": ["MathTest.C"],
+                        "4": ["MathTest.D"],
+                    },
+                }
+            }
+        }))
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "false",
+            "--coverage-file",
+            str(coverage),
+            "--coverage-test-command-template",
+            "true {tests_space}",
+            "--report",
+            str(report),
+            "--mutators",
+            "EqualityOperator",
+            "--batch-mutants",
+            "--batch-size",
+            "2",
+            "--worktree-mode",
+            "copy",
+            "--skip-initial-test",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["survived"], 4)
+        self.assertEqual(payload["coverage"]["coveredMutants"], 4)
+        self.assertEqual(payload["coverage"]["testSelectedMutants"], 4)
+        self.assertEqual(payload["execution"]["testScheduler"]["strategy"], "batched")
+        self.assertEqual(payload["execution"]["testScheduler"]["batchSessions"], 2)
+        self.assertEqual(payload["execution"]["testScheduler"]["coverageSelectedSessions"], 2)
+        for group in payload["execution"]["testScheduler"]["groups"]:
+            self.assertTrue(group["coverageSelected"])
+            self.assertTrue(group["testCommand"].startswith("true "))
+            self.assertEqual(len(group["selectedTests"]), 2)
+        for mut in payload["mutants"]:
+            self.assertEqual(mut["resultSource"], "batch")
+            self.assertEqual(mut["run"]["coverageStatus"], "covered")
+            self.assertTrue(mut["run"]["scheduler"]["coverageSelected"])
 
     def test_coverage_helper_generates_test_level_mapping(self) -> None:
         report = self.repo / "coverage-helper-selected-tests.json"

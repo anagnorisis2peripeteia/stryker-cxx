@@ -209,6 +209,8 @@ class TestContracts(unittest.TestCase):
         self.assertEqual(payload["mutationArtifact"]["mode"], "source-overlay")
         self.assertEqual(payload["mutationArtifact"]["implementation"], "copy")
         self.assertEqual(payload["execution"]["compilePruning"]["strategy"], "source-overlay-prune-and-retry")
+        self.assertEqual(payload["execution"]["testScheduler"]["schemaVersion"], "stryker-cxx.test-scheduler.v1")
+        self.assertEqual(payload["execution"]["testScheduler"]["strategy"], "batched")
         self.assertEqual(payload["lifecycle"]["schemaVersion"], "stryker-cxx.lifecycle.v1")
         self.assertIn("projectAnalysis", payload["lifecycle"]["phaseOrder"])
         self.assertIn("coverageAnalysis", payload["lifecycle"]["phaseOrder"])
@@ -221,6 +223,7 @@ class TestContracts(unittest.TestCase):
         self.assertEqual(lifecycle_by_name["mutationArtifact"]["detail"]["implementation"], "copy")
         self.assertEqual(lifecycle_by_name["compilePruning"]["status"], "completed")
         self.assertEqual(lifecycle_by_name["compilePruning"]["detail"]["prunedMutants"], 0)
+        self.assertEqual(lifecycle_by_name["testScheduling"]["detail"]["scheduler"], "batched")
         self.assertEqual(payload["summary"]["byStatus"]["SURVIVED"], 1)
         self.assertEqual(payload["summary"]["byFile"]["src/foo.cpp"]["survived"], 1)
         self.assertEqual(payload["summary"]["byMutator"]["ConditionalBoundary"]["killed"], 1)
@@ -255,6 +258,14 @@ class TestContracts(unittest.TestCase):
         errors = validate_report(payload)
 
         self.assertTrue(any("execution.compilePruning.prunedMutants" in item for item in errors))
+
+    def test_report_validator_checks_test_scheduler_shape_when_present(self) -> None:
+        payload = _report_dict(self._base_report())
+        payload["execution"]["testScheduler"]["sessions"] = "one"
+
+        errors = validate_report(payload)
+
+        self.assertTrue(any("execution.testScheduler.sessions" in item for item in errors))
 
     def test_mutation_artifact_metadata_describes_source_overlay(self) -> None:
         metadata = mutation_artifact_metadata(

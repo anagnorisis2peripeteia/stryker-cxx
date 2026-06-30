@@ -2847,6 +2847,45 @@ def _coverage_selected_test_command(template: str, tests: list[str]) -> str:
     )
 
 
+def _unique_ordered(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _batch_selected_test_command(
+    batch: list[Mutant],
+    fallback_test_cmd: str,
+    coverage_test_command_template: str | None,
+) -> tuple[str, list[str]]:
+    selected_tests = _unique_ordered(
+        [
+            str(test)
+            for mut in batch
+            for test in mut.run.get("coveredBy", [])
+            if isinstance(mut.run.get("coveredBy"), list)
+        ]
+    )
+    if selected_tests and coverage_test_command_template:
+        return _coverage_selected_test_command(coverage_test_command_template, selected_tests), selected_tests
+
+    selected_commands = _unique_ordered(
+        [
+            str(mut.run.get("selectedTestCommand"))
+            for mut in batch
+            if mut.run.get("selectedTestCommand")
+        ]
+    )
+    if len(selected_commands) == 1:
+        return selected_commands[0], selected_tests
+    return fallback_test_cmd, selected_tests
+
+
 def _file_hash(repo: str, file_name: str) -> str:
     path = os.path.join(repo, file_name)
     try:
@@ -3894,6 +3933,62 @@ def _legacy_report(rep: Report) -> dict:
     }
 
 
+def _test_scheduler_metadata(rep: Report, mutants: list[dict[str, Any]]) -> dict[str, Any]:
+    batching = rep.execution.get("batching", {})
+    groups: dict[str, dict[str, Any]] = {}
+    order = 0
+    for mut in mutants:
+        source = str(mut.get("resultSource", "executed"))
+        if source in {"baseline", "coverage", "ignored", "compile-pruning"}:
+            continue
+        run = mut.get("run", {})
+        if not isinstance(run, dict):
+            continue
+        scheduler = run.get("scheduler", {})
+        if not isinstance(scheduler, dict):
+            scheduler = {}
+        batch_id = run.get("batchId")
+        session_type = str(scheduler.get("sessionType") or ("batch" if source == "batch" and batch_id else "per-mutant"))
+        key = f"batch:{batch_id}" if session_type == "batch" and batch_id else f"mutant:{mut.get('id')}"
+        group = groups.get(key)
+        if group is None:
+            order += 1
+            selected_tests = scheduler.get("selectedTests", run.get("coveredBy", []))
+            if not isinstance(selected_tests, list):
+                selected_tests = []
+            group = {
+                "order": order,
+                "sessionType": session_type,
+                "batchId": batch_id,
+                "splitFromBatchId": scheduler.get("splitFromBatchId") or run.get("splitFromBatchId"),
+                "coverageSelected": bool(scheduler.get("coverageSelected")),
+                "selectedTests": [str(test) for test in selected_tests],
+                "testCommand": run.get("testCommand") or run.get("selectedTestCommand"),
+                "mutantIds": [],
+                "statuses": [],
+            }
+            groups[key] = group
+        group["mutantIds"].append(mut.get("id"))
+        group["statuses"].append(str(mut.get("status", "PENDING")).upper())
+
+    sessions = []
+    for group in sorted(groups.values(), key=lambda item: int(item.get("order", 0))):
+        statuses = [str(status) for status in group.pop("statuses", [])]
+        group["status"] = statuses[0] if statuses and all(status == statuses[0] for status in statuses) else "MIXED"
+        sessions.append(group)
+
+    return {
+        "schemaVersion": "stryker-cxx.test-scheduler.v1",
+        "strategy": "batched" if isinstance(batching, dict) and batching.get("enabled") else "per-mutant",
+        "sessions": len(sessions),
+        "batchSessions": len([item for item in sessions if item.get("sessionType") == "batch"]),
+        "perMutantSessions": len([item for item in sessions if item.get("sessionType") == "per-mutant"]),
+        "splitSessions": len([item for item in sessions if item.get("splitFromBatchId")]),
+        "coverageSelectedSessions": len([item for item in sessions if item.get("coverageSelected")]),
+        "groups": sessions,
+    }
+
+
 def _report_dict(rep: Report, repo: str | None = None, base: str | None = None,
                  threshold: float | None = None, startedAt: str | None = None) -> dict:
     normalized_mutants = [_normalize_mutant_record(mut) for mut in rep.mutants]
@@ -3905,6 +4000,7 @@ def _report_dict(rep: Report, repo: str | None = None, base: str | None = None,
     for key, value in rep.execution.items():
         if key not in execution:
             execution[key] = value
+    execution["testScheduler"] = _test_scheduler_metadata(rep, normalized_mutants)
     thresholds = dict(rep.thresholds or {})
     if "break" not in thresholds:
         thresholds = _resolve_thresholds(
@@ -3981,6 +4077,7 @@ def _phase(name: str, status: str, **detail: Any) -> dict[str, Any]:
 def _lifecycle_metadata(rep: Report, mutants: list[dict[str, Any]]) -> dict[str, Any]:
     coverage = rep.coverage or {"enabled": False, "provider": "none"}
     batching = rep.execution.get("batching", {})
+    test_scheduler = _test_scheduler_metadata(rep, mutants)
     resource = rep.execution.get("resourceIsolation", {})
     compile_pruning = rep.execution.get("compilePruning", {})
     lifecycle = rep.execution.get("lifecycle", {})
@@ -3988,7 +4085,7 @@ def _lifecycle_metadata(rep: Report, mutants: list[dict[str, Any]]) -> dict[str,
         return lifecycle
 
     coverage_status = "completed" if coverage.get("enabled") else "notConfigured"
-    scheduler = "batched" if batching.get("enabled") else "perMutant"
+    scheduler = test_scheduler.get("strategy", "batched" if batching.get("enabled") else "per-mutant")
     retained_paths = [
         mut.get("run", {}).get("worktree")
         for mut in mutants
@@ -4074,12 +4171,19 @@ def _lifecycle_metadata(rep: Report, mutants: list[dict[str, Any]]) -> dict[str,
             provider=coverage.get("provider", "none"),
             coveredMutants=coverage.get("coveredMutants", 0),
             noCoverageMutants=coverage.get("noCoverageMutants", 0),
+            unknownCoverageMutants=coverage.get("unknownCoverageMutants", 0),
             testSelectedMutants=coverage.get("testSelectedMutants", 0),
+            testLevel=bool(coverage.get("testLevel")),
         ),
         _phase(
             "testScheduling",
             "completed",
             scheduler=scheduler,
+            sessions=test_scheduler.get("sessions", 0),
+            batchSessions=test_scheduler.get("batchSessions", 0),
+            perMutantSessions=test_scheduler.get("perMutantSessions", 0),
+            splitSessions=test_scheduler.get("splitSessions", 0),
+            coverageSelectedSessions=test_scheduler.get("coverageSelectedSessions", 0),
             batches=batching.get("batches", 0) if isinstance(batching, dict) else 0,
             splitBatches=batching.get("splitBatches", 0) if isinstance(batching, dict) else 0,
         ),
@@ -4691,6 +4795,14 @@ def _run_mutant_once(
         mut.checkLog = check_log
         mut.testLog = test_log
         effective_test_cmd = str(mut.run.get("selectedTestCommand") or test_cmd)
+        mut.run["scheduler"] = {
+            "sessionType": "per-mutant",
+            "coverageSelected": bool(mut.run.get("selectedTestCommand")),
+            "selectedTests": list(mut.run.get("coveredBy", []))
+            if isinstance(mut.run.get("coveredBy"), list)
+            else [],
+            "splitFromBatchId": mut.run.get("splitFromBatchId"),
+        }
 
         try:
             build_rc, build_ms = run_cmd(
@@ -4986,6 +5098,7 @@ def _run_batch_probe(
     build_cmd: str,
     check_cmd: str | None,
     test_cmd: str,
+    coverage_test_command_template: str | None,
     timeout_seconds: int | None,
     worktree_mode: str,
     artifact_root: str,
@@ -5007,6 +5120,20 @@ def _run_batch_probe(
         "batchId": batch_id,
         "batchSize": len(batch),
     }
+    effective_test_cmd, selected_tests = _batch_selected_test_command(
+        batch,
+        test_cmd,
+        coverage_test_command_template,
+    )
+    run["scheduler"] = {
+        "sessionType": "batch",
+        "coverageSelected": bool(selected_tests and coverage_test_command_template),
+        "selectedTests": selected_tests,
+        "mutantIds": [mut.id for mut in batch],
+    }
+    if selected_tests:
+        run["coveredBy"] = selected_tests
+        run["selectedTestCommand"] = effective_test_cmd
     if worker_label:
         run["workerLabel"] = worker_label
     _record_environment_policy(run, env_overrides, env_inherit, env_block)
@@ -5090,7 +5217,7 @@ def _run_batch_probe(
                 return result
 
             test_rc, test_ms = run_cmd(
-                test_cmd,
+                effective_test_cmd,
                 work_repo,
                 test_log,
                 timeout_seconds,
@@ -5104,6 +5231,7 @@ def _run_batch_probe(
             run["testMs"] = test_ms
             run["testLog"] = test_log
             run["testProvider"] = _phase_provider_name(plugins, "test")
+            run["testCommand"] = effective_test_cmd
             if test_rc == 124:
                 result = ("TIMEOUT", "batch tests timed out", int((time.perf_counter() - start_ms) * 1000), run)
                 return result
@@ -5152,6 +5280,7 @@ def _run_batch_task(payload: tuple[Any, ...]) -> tuple[int, list[Mutant], str, s
         build_cmd,
         check_cmd,
         test_cmd,
+        coverage_test_command_template,
         timeout_seconds,
         worktree_mode,
         artifact_root,
@@ -5172,6 +5301,7 @@ def _run_batch_task(payload: tuple[Any, ...]) -> tuple[int, list[Mutant], str, s
         build_cmd=build_cmd,
         check_cmd=check_cmd,
         test_cmd=test_cmd,
+        coverage_test_command_template=coverage_test_command_template,
         timeout_seconds=timeout_seconds,
         worktree_mode=worktree_mode,
         artifact_root=artifact_root,
@@ -5310,8 +5440,6 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("--batch-size must be >= 1")
     if args.batch_mutants and args.worktree_mode == "inplace":
         ap.error("--batch-mutants requires --worktree-mode copy or git-worktree")
-    if args.batch_mutants and args.coverage_test_command_template:
-        ap.error("--coverage-test-command-template cannot be combined with --batch-mutants")
     coverage_helper_tests = _parse_csv_items(args.coverage_helper_tests)
     if args.coverage_helper_command_template and not coverage_helper_tests:
         ap.error("--coverage-helper-command-template requires --coverage-helper-tests")
@@ -5601,6 +5729,7 @@ def main(argv: list[str] | None = None) -> int:
         **coverage_meta,
         "coveredMutants": 0,
         "noCoverageMutants": 0,
+        "unknownCoverageMutants": 0,
         "testSelectionTemplate": args.coverage_test_command_template,
         "testSelectedMutants": 0,
         "testSelectionMisses": 0,
@@ -5746,7 +5875,11 @@ def main(argv: list[str] | None = None) -> int:
             continue
         if coverage_map:
             covered = _covered_lines_for(coverage_map, repo, m.file)
-            if covered is not None and m.line not in covered:
+            if covered is None:
+                m.run["coverageStatus"] = "unknown"
+                rep.coverage["unknownCoverageMutants"] = int(rep.coverage.get("unknownCoverageMutants", 0)) + 1
+            elif m.line not in covered:
+                m.run["coverageStatus"] = "not-covered"
                 m.status = "NO_COVERAGE"
                 m.detail = "mutant line was not covered by supplied coverage data"
                 rep.noCoverage += 1
@@ -5756,7 +5889,9 @@ def main(argv: list[str] | None = None) -> int:
                 rec["baselineKey"] = _baseline_key(m, repo, baseline_config_hash)
                 rep.mutants.append(rec)
                 continue
-            rep.coverage["coveredMutants"] = int(rep.coverage.get("coveredMutants", 0)) + 1
+            else:
+                m.run["coverageStatus"] = "covered"
+                rep.coverage["coveredMutants"] = int(rep.coverage.get("coveredMutants", 0)) + 1
             if args.coverage_test_command_template:
                 tests = _covered_tests_for(coverage_tests, repo, m.file, m.line)
                 if tests:
@@ -5766,6 +5901,9 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     m.run["coverageSelectionMissReason"] = "no covering tests for mutant line"
                     rep.coverage["testSelectionMisses"] = int(rep.coverage.get("testSelectionMisses", 0)) + 1
+        else:
+            m.run["coverageStatus"] = "unknown"
+            rep.coverage["unknownCoverageMutants"] = int(rep.coverage.get("unknownCoverageMutants", 0)) + 1
         if baseline_key_active:
             key = _baseline_key(m, repo, baseline_config_hash)
             cached = baseline_entries.get(key) if args.incremental else None
@@ -5804,6 +5942,7 @@ def main(argv: list[str] | None = None) -> int:
                         args.build_cmd,
                         args.check_cmd,
                         args.test_cmd,
+                        args.coverage_test_command_template,
                         effective_timeout_seconds,
                         args.worktree_mode,
                         artifact_root,
@@ -5943,6 +6082,7 @@ def main(argv: list[str] | None = None) -> int:
                                 build_cmd=args.build_cmd,
                                 check_cmd=args.check_cmd,
                                 test_cmd=args.test_cmd,
+                                coverage_test_command_template=args.coverage_test_command_template,
                                 timeout_seconds=effective_timeout_seconds,
                                 worktree_mode=args.worktree_mode,
                                 artifact_root=artifact_root,
@@ -5994,6 +6134,8 @@ def main(argv: list[str] | None = None) -> int:
                     if not args.quiet:
                         print(f"[batch {batch_index}/{len(batches)}] {len(batch)} mutants ... {status}; splitting")
                     for mut in batch:
+                        if run.get("batchId"):
+                            mut.run["splitFromBatchId"] = run.get("batchId")
                         executed = _run_mutant_once(
                             mut,
                             repo=repo,

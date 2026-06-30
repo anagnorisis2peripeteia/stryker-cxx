@@ -174,6 +174,26 @@ def validate_report(payload: dict[str, Any]) -> list[str]:
                 for key in ("records", "attemptRecords", "retryRecords"):
                     if key in compile_pruning and not isinstance(compile_pruning.get(key), list):
                         errors.append(_collect(f"execution.compilePruning.{key}", "expected array"))
+        test_scheduler = exec_ctx.get("testScheduler")
+        if test_scheduler is not None:
+            if not isinstance(test_scheduler, dict):
+                errors.append(_collect("execution.testScheduler", "expected object"))
+            else:
+                if "schemaVersion" in test_scheduler and not isinstance(test_scheduler.get("schemaVersion"), str):
+                    errors.append(_collect("execution.testScheduler.schemaVersion", "expected string"))
+                if "strategy" in test_scheduler and not isinstance(test_scheduler.get("strategy"), str):
+                    errors.append(_collect("execution.testScheduler.strategy", "expected string"))
+                for key in (
+                    "sessions",
+                    "batchSessions",
+                    "perMutantSessions",
+                    "splitSessions",
+                    "coverageSelectedSessions",
+                ):
+                    if key in test_scheduler and not isinstance(test_scheduler.get(key), int):
+                        errors.append(_collect(f"execution.testScheduler.{key}", "expected integer"))
+                if "groups" in test_scheduler and not isinstance(test_scheduler.get("groups"), list):
+                    errors.append(_collect("execution.testScheduler.groups", "expected array"))
         dashboard = exec_ctx.get("dashboard")
         if dashboard is not None:
             if not isinstance(dashboard, dict):

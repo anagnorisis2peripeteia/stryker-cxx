@@ -207,6 +207,9 @@ Acceptance criteria:
 
 ### Phase 5: coverage phase and scheduler
 
+Status: implemented for source-overlay runs, per-mutant sessions, and batched
+coverage-selected sessions.
+
 Implementation work:
 
 - make coverage loading/discovery a named lifecycle phase;
