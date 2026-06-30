@@ -26,7 +26,9 @@ not required for the first parity target.
 Full Stryker-family parity means becoming a standalone C/C++ mutation runner
 with comparable lifecycle behavior to StrykerJS and Stryker.NET, not merely a
 Marmorkrebs provider. That requires the additional components listed in
-[Full parity requirements](#full-parity-requirements).
+[Full parity requirements](#full-parity-requirements). The lifecycle-level gap
+and action plan are tracked in
+[`docs/lifecycle-parity-spec.md`](lifecycle-parity-spec.md).
 
 ## Implemented surface
 
