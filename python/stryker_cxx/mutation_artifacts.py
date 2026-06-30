@@ -117,6 +117,7 @@ def artifact_placement_policy(
 def compiled_mutation_artifact_metadata(
     backend: str,
     *,
+    artifact_kind: str = "executable",
     implementation: str = "scratch-build-swap",
     worker_tmp_dir: str | None = None,
     retain_artifacts: bool = False,
@@ -137,7 +138,7 @@ def compiled_mutation_artifact_metadata(
         },
         "compiledArtifacts": {
             "supported": True,
-            "kinds": ["executable"],
+            "kinds": [artifact_kind],
             "placementPolicy": "swap-file",
             "sourceCheckoutMutation": False,
         },
@@ -154,6 +155,7 @@ def compiled_mutation_artifact_metadata(
 def compiled_artifact_placement_policy(
     backend: str,
     *,
+    artifact_kind: str = "executable",
     artifact_root: str | None = None,
     worker_tmp_dir: str | None = None,
     retain_artifacts: bool = False,
@@ -176,7 +178,7 @@ def compiled_artifact_placement_policy(
         },
         "compiledArtifacts": {
             "supported": True,
-            "kind": "executable",
+            "kind": artifact_kind,
             "placement": "swap-file",
             "restorePolicy": "restore-original-file",
         },

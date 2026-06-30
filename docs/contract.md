@@ -181,7 +181,8 @@ workspace is removed unless retention was explicitly requested.
 ## Compiled artifact backend metadata
 
 `source-overlay` remains available as a compatibility backend, but native runs
-can now select `--artifact-backend compiled-executable` for CMake/CTest-style
+can now select `--artifact-backend compiled-executable` or
+`--artifact-backend compiled-library` for CMake/CTest-style
 executable targets.
 
 The compiled executable backend:
@@ -199,12 +200,12 @@ The compiled executable backend:
 Compiled executable native reports use:
 
 - `mutationArtifact.mode = "compiled-artifact"`;
-- `mutationArtifact.backend = "compiled-executable"`;
+- `mutationArtifact.backend = "compiled-executable"` or `"compiled-library"`;
 - `artifactPlacement.compiledArtifacts.supported = true`;
 - `compiledArtifacts[].placementPolicy = "swap-file"`;
 - `compiledArtifacts[].sourceCheckoutMutation = false`;
 - `compiledArtifacts[].originalRestored = true` when the original artifact hash
   after restoration matches the pre-session hash.
 
-`compiled-library` and `compiled-object` remain explicit future backends; the
+`compiled-object` remains an explicit future backend; the
 CLI rejects them until their artifact builders and placement policies exist.

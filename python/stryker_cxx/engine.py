@@ -4804,21 +4804,46 @@ def _infer_cmake_executable_target(repo: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _compiled_executable_target(
+def _find_library_artifact(build_root: str, target: str) -> str | None:
+    names = [
+        f"lib{target}.dylib",
+        f"lib{target}.so",
+        f"lib{target}.a",
+        f"{target}.dll",
+        f"{target}.lib",
+    ]
+    for current, dirs, files in os.walk(build_root):
+        dirs[:] = sorted(d for d in dirs if d not in {"CMakeFiles", "__pycache__"})
+        for file_name in sorted(files):
+            if file_name in names:
+                return os.path.join(current, file_name)
+    return None
+
+
+def _compiled_artifact_target(
     repo: str,
+    backend: str,
     build_dir: str | None,
     build_target: str | None,
     test_binary: str | None,
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
+    build_root = build_dir or "build"
+    build_root_abs = build_root if os.path.isabs(build_root) else os.path.join(repo, build_root)
+    if backend == "compiled-library":
+        if not build_target:
+            raise ValueError("compiled-library backend requires --build-target for the library target")
+        original = _find_library_artifact(build_root_abs, build_target)
+        if not original:
+            raise ValueError(f"compiled-library backend could not find built library artifact for target {build_target!r}")
+        return build_target, os.path.abspath(original), "library"
     if test_binary:
         original = test_binary if os.path.isabs(test_binary) else os.path.join(repo, test_binary)
-        return os.path.splitext(os.path.basename(original))[0], os.path.abspath(original)
+        return os.path.splitext(os.path.basename(original))[0], os.path.abspath(original), "executable"
     target = build_target or _infer_cmake_executable_target(repo)
     if not target:
         raise ValueError("compiled-executable backend requires --build-target, --test-binary, or a discoverable add_executable target")
-    build_root = build_dir or "build"
     original = os.path.join(repo, build_root, target) if not os.path.isabs(build_root) else os.path.join(build_root, target)
-    return target, os.path.abspath(original)
+    return target, os.path.abspath(original), "executable"
 
 
 def _find_built_artifact(build_dir: str, target: str, original_artifact: str) -> str:
@@ -4834,7 +4859,7 @@ def _find_built_artifact(build_dir: str, target: str, original_artifact: str) ->
         for file_name in sorted(files):
             if file_name in {os.path.basename(original_artifact), target}:
                 return os.path.join(current, file_name)
-    raise ValueError(f"compiled-executable backend did not produce artifact for target {target!r}")
+    raise ValueError(f"compiled artifact backend did not produce artifact for target {target!r}")
 
 
 def _compiled_backend_retain_statuses(retain_worktrees_for: set[str] | None) -> list[str]:
@@ -4848,6 +4873,7 @@ def _compiled_backend_retain_statuses(retain_worktrees_for: set[str] | None) -> 
 def _compiled_artifact_run_metadata(
     *,
     backend: str,
+    artifact_kind: str,
     target: str,
     scratch_root: str,
     scratch_repo: str,
@@ -4862,7 +4888,7 @@ def _compiled_artifact_run_metadata(
     payload: dict[str, Any] = {
         "schemaVersion": "stryker-cxx.compiled-artifact.v1",
         "backend": backend,
-        "kind": "executable",
+        "kind": artifact_kind,
         "target": target,
         "scratchRoot": scratch_root,
         "scratchRepo": scratch_repo,
@@ -5040,7 +5066,7 @@ def _run_mutant_once(
     return mut
 
 
-def _run_mutant_once_compiled_executable(
+def _run_mutant_once_compiled_artifact(
     mut: Mutant,
     repo: str,
     build_cmd: str,
@@ -5051,6 +5077,7 @@ def _run_mutant_once_compiled_executable(
     execution_mode: str,
     skip_tests: bool,
     build_system: str | None,
+    artifact_backend: str,
     build_dir: str | None,
     build_target: str | None,
     test_binary: str | None,
@@ -5064,12 +5091,12 @@ def _run_mutant_once_compiled_executable(
     env_block: list[str] | None = None,
 ) -> Mutant:
     if build_system not in {"cmake", "ctest", None}:
-        raise ValueError("compiled-executable backend currently requires --build-system cmake/ctest")
+        raise ValueError(f"{artifact_backend} backend currently requires --build-system cmake/ctest")
 
     existing_run = dict(mut.run)
     run_record = dict(existing_run)
     run_record["mode"] = execution_mode
-    run_record["artifactBackend"] = "compiled-executable"
+    run_record["artifactBackend"] = artifact_backend
     run_record["worktreeMode"] = "compiled-artifact"
     if worker_label:
         run_record["workerLabel"] = worker_label
@@ -5080,9 +5107,15 @@ def _run_mutant_once_compiled_executable(
     _record_environment_policy(mut.run, env_overrides, env_inherit, env_block)
 
     start_ms = time.perf_counter()
-    target, original_artifact = _compiled_executable_target(repo, build_dir, build_target, test_binary)
+    target, original_artifact, artifact_kind = _compiled_artifact_target(
+        repo,
+        artifact_backend,
+        build_dir,
+        build_target,
+        test_binary,
+    )
     if not os.path.isfile(original_artifact):
-        raise ValueError(f"compiled-executable backend requires existing built artifact: {original_artifact}")
+        raise ValueError(f"{artifact_backend} backend requires existing built artifact: {original_artifact}")
 
     scratch_root = tempfile.mkdtemp(prefix="stryker-cxx-compiled-", dir=worker_tmp_dir)
     scratch_repo = os.path.join(scratch_root, "source")
@@ -5129,11 +5162,11 @@ def _run_mutant_once_compiled_executable(
         mut.run["configureMs"] = configure_ms
         if configure_rc == 124:
             mut.status = "TIMEOUT"
-            mut.detail = "compiled backend configure timed out"
+            mut.detail = f"{artifact_backend} configure timed out"
             return mut
         if configure_rc != 0:
             mut.status = "BUILD_ERROR"
-            mut.detail = "compiled backend configure failed"
+            mut.detail = f"{artifact_backend} configure failed"
             return mut
 
         compiled_build_cmd = f"cmake --build {shlex.quote(scratch_build_dir)} --target {shlex.quote(target)}"
@@ -5154,11 +5187,11 @@ def _run_mutant_once_compiled_executable(
         mut.run["buildProvider"] = _phase_provider_name(plugins, "build")
         if build_rc == 124:
             mut.status = "TIMEOUT"
-            mut.detail = "compiled backend build timed out"
+            mut.detail = f"{artifact_backend} build timed out"
             return mut
         if build_rc != 0:
             mut.status = "BUILD_ERROR"
-            mut.detail = "compiled backend mutant did not compile"
+            mut.detail = f"{artifact_backend} mutant did not compile"
             return mut
 
         mutated_artifact = _find_built_artifact(scratch_build_dir, target, original_artifact)
@@ -5179,11 +5212,11 @@ def _run_mutant_once_compiled_executable(
             mut.run["checkProvider"] = _phase_provider_name(plugins, "check")
             if check_rc == 124:
                 mut.status = "TIMEOUT"
-                mut.detail = "compiled backend check timed out"
+                mut.detail = f"{artifact_backend} check timed out"
                 return mut
             if check_rc != 0:
                 mut.status = "CHECK_ERROR"
-                mut.detail = "compiled backend checker rejected mutant"
+                mut.detail = f"{artifact_backend} checker rejected mutant"
                 return mut
 
         shutil.copy2(original_artifact, backup_artifact)
@@ -5196,7 +5229,7 @@ def _run_mutant_once_compiled_executable(
             if isinstance(mut.run.get("coveredBy"), list)
             else [],
             "splitFromBatchId": mut.run.get("splitFromBatchId"),
-            "artifactBackend": "compiled-executable",
+            "artifactBackend": artifact_backend,
         }
         effective_test_cmd = str(mut.run.get("selectedTestCommand") or test_cmd)
         if skip_tests:
@@ -5220,7 +5253,7 @@ def _run_mutant_once_compiled_executable(
             mut.run["testCommand"] = effective_test_cmd
             if test_rc == 124:
                 mut.status = "TIMEOUT"
-                mut.detail = "compiled backend tests timed out"
+                mut.detail = f"{artifact_backend} tests timed out"
             elif test_rc != 0:
                 mut.status = "KILLED"
             else:
@@ -5248,14 +5281,16 @@ def _run_mutant_once_compiled_executable(
         else:
             shutil.rmtree(scratch_root, ignore_errors=True)
         mut.run["mutationArtifact"] = compiled_mutation_artifact_metadata(
-            "compiled-executable",
+            artifact_backend,
+            artifact_kind=artifact_kind,
             worker_tmp_dir=worker_tmp_dir,
             retain_artifacts=retained,
             retain_artifacts_for=[mut.status] if retained else [],
             worker_label=worker_label,
         )
         mut.run["compiledArtifact"] = _compiled_artifact_run_metadata(
-            backend="compiled-executable",
+            backend=artifact_backend,
+            artifact_kind=artifact_kind,
             target=target,
             scratch_root=scratch_root,
             scratch_repo=scratch_repo,
@@ -5269,7 +5304,8 @@ def _run_mutant_once_compiled_executable(
         )
         mut.run["artifactPlacement"] = {
             **compiled_artifact_placement_policy(
-                "compiled-executable",
+                artifact_backend,
+                artifact_kind=artifact_kind,
                 artifact_root=artifact_root,
                 worker_tmp_dir=worker_tmp_dir,
                 retain_artifacts=retained,
@@ -5836,12 +5872,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.batch_mutants and args.worktree_mode == "inplace":
         ap.error("--batch-mutants requires --worktree-mode copy or git-worktree")
     if args.artifact_backend != "source-overlay":
-        if args.artifact_backend != "compiled-executable":
-            ap.error(f"{args.artifact_backend} backend is specified but not implemented yet; use compiled-executable")
+        if args.artifact_backend not in {"compiled-executable", "compiled-library"}:
+            ap.error(f"{args.artifact_backend} backend is specified but not implemented yet; use compiled-executable or compiled-library")
         if args.jobs > 1:
-            ap.error("--artifact-backend compiled-executable currently requires --jobs 1")
+            ap.error(f"--artifact-backend {args.artifact_backend} currently requires --jobs 1")
         if args.batch_mutants:
-            ap.error("--artifact-backend compiled-executable does not yet support --batch-mutants")
+            ap.error(f"--artifact-backend {args.artifact_backend} does not yet support --batch-mutants")
     coverage_helper_tests = _parse_csv_items(args.coverage_helper_tests)
     if args.coverage_helper_command_template and not coverage_helper_tests:
         ap.error("--coverage-helper-command-template requires --coverage-helper-tests")
@@ -6029,6 +6065,7 @@ def main(argv: list[str] | None = None) -> int:
             "mutationArtifact": (
                 compiled_mutation_artifact_metadata(
                     args.artifact_backend,
+                    artifact_kind="library" if args.artifact_backend == "compiled-library" else "executable",
                     worker_tmp_dir=args.worker_tmp_dir,
                     retain_artifacts=retain_worktrees,
                     retain_artifacts_for=_compiled_backend_retain_statuses(retain_worktrees_for)
@@ -6050,6 +6087,7 @@ def main(argv: list[str] | None = None) -> int:
             "artifactPlacement": (
                 compiled_artifact_placement_policy(
                     args.artifact_backend,
+                    artifact_kind="library" if args.artifact_backend == "compiled-library" else "executable",
                     artifact_root=artifact_root,
                     worker_tmp_dir=args.worker_tmp_dir,
                     retain_artifacts=retain_worktrees,
@@ -6368,8 +6406,8 @@ def main(argv: list[str] | None = None) -> int:
     rep.total = len(discovered)
 
     def run_single_mutant(mut: Mutant) -> Mutant:
-        if args.artifact_backend == "compiled-executable":
-            return _run_mutant_once_compiled_executable(
+        if args.artifact_backend in {"compiled-executable", "compiled-library"}:
+            return _run_mutant_once_compiled_artifact(
                 mut,
                 repo=repo,
                 build_cmd=args.build_cmd,
@@ -6380,6 +6418,7 @@ def main(argv: list[str] | None = None) -> int:
                 execution_mode=args.mode,
                 skip_tests=args.skip_tests,
                 build_system=args.build_system,
+                artifact_backend=args.artifact_backend,
                 build_dir=args.build_dir,
                 build_target=args.build_target,
                 test_binary=args.test_binary,

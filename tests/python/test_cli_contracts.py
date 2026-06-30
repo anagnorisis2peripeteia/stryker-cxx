@@ -1170,6 +1170,98 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(run["compiledArtifact"]["placementPolicy"], "swap-file")
         self.assertTrue(run["artifactPlacement"]["originalArtifactsRestored"])
 
+    def test_compiled_library_backend_swaps_shared_library_and_restores_original(self) -> None:
+        self.source.write_text(
+            "int value(int input) {\n"
+            "  if (input == 1) {\n"
+            "    return 2;\n"
+            "  }\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        (self.repo / "test_main.cpp").write_text(
+            "#include <cstdlib>\n"
+            "int value(int input);\n"
+            "int main() {\n"
+            "  return value(1) == 2 ? EXIT_SUCCESS : EXIT_FAILURE;\n"
+            "}\n"
+        )
+        (self.repo / "CMakeLists.txt").write_text(
+            "cmake_minimum_required(VERSION 3.16)\n"
+            "project(stryker_cxx_compiled_library_fixture LANGUAGES CXX)\n"
+            "enable_testing()\n"
+            "add_library(mathlib SHARED sample.cpp)\n"
+            "target_compile_features(mathlib PRIVATE cxx_std_17)\n"
+            "add_executable(sample_test test_main.cpp)\n"
+            "target_compile_features(sample_test PRIVATE cxx_std_17)\n"
+            "target_link_libraries(sample_test PRIVATE mathlib)\n"
+            "add_test(NAME sample COMMAND sample_test)\n"
+        )
+        self._git("add", "sample.cpp", "test_main.cpp", "CMakeLists.txt")
+        self._git("-c", "user.name=stryker-cxx", "-c", "user.email=stryker-cxx@example.invalid", "commit", "-q", "-m", "compiled-library-backend")
+        subprocess.run(["cmake", "-S", ".", "-B", "build"], cwd=self.repo, check=True, text=True, capture_output=True)
+        subprocess.run(["cmake", "--build", "build", "--target", "mathlib"], cwd=self.repo, check=True, text=True, capture_output=True)
+        subprocess.run(["cmake", "--build", "build", "--target", "sample_test"], cwd=self.repo, check=True, text=True, capture_output=True)
+        original_source = self.source.read_text()
+        libraries = sorted((self.repo / "build").glob("libmathlib.*"))
+        self.assertTrue(libraries)
+        library = libraries[0]
+        original_library_hash = _sha256(library)
+        report = self.repo / "compiled-library.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-system",
+            "cmake",
+            "--build-dir",
+            "build",
+            "--build-target",
+            "mathlib",
+            "--test-binary",
+            "build/sample_test",
+            "--test-command",
+            "ctest --test-dir build --output-on-failure",
+            "--artifact-backend",
+            "compiled-library",
+            "--mutators",
+            "EqualityOperator",
+            "--report",
+            str(report),
+            "--max-mutants",
+            "1",
+            "--skip-initial-test",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(self.source.read_text(), original_source)
+        self.assertEqual(_sha256(library), original_library_hash)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["killed"], 1)
+        self.assertEqual(payload["mutationArtifact"]["mode"], "compiled-artifact")
+        self.assertEqual(payload["mutationArtifact"]["backend"], "compiled-library")
+        self.assertEqual(payload["mutationArtifact"]["compiledArtifacts"]["kinds"], ["library"])
+        self.assertTrue(payload["artifactPlacement"]["compiledArtifacts"]["supported"])
+        self.assertEqual(payload["artifactPlacement"]["compiledArtifacts"]["kind"], "library")
+        self.assertEqual(payload["lifecycle"]["artifactModel"], "compiled-artifact")
+        self.assertEqual(len(payload["compiledArtifacts"]), 1)
+        compiled = payload["compiledArtifacts"][0]
+        self.assertEqual(compiled["backend"], "compiled-library")
+        self.assertEqual(compiled["kind"], "library")
+        self.assertEqual(compiled["target"], "mathlib")
+        self.assertFalse(compiled["sourceCheckoutMutation"])
+        self.assertTrue(compiled["originalRestored"])
+        self.assertEqual(compiled["originalHashBefore"], original_library_hash)
+        self.assertEqual(compiled["originalHashAfter"], original_library_hash)
+        run = payload["mutants"][0]["run"]
+        self.assertEqual(run["artifactBackend"], "compiled-library")
+        self.assertEqual(run["compiledArtifact"]["placementPolicy"], "swap-file")
+        self.assertTrue(run["artifactPlacement"]["originalArtifactsRestored"])
+
     def test_worker_tmp_env_and_retained_worktree_are_reported(self) -> None:
         report = self.repo / "retained-copy.json"
         old_blocked = os.environ.get("STRYKER_CXX_BLOCKED")
