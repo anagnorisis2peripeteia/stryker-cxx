@@ -153,6 +153,9 @@ Acceptance criteria:
 
 ### Phase 2: project analysis module
 
+Status: implemented for descriptive report metadata and common fixture
+detection; deeper graph ownership remains future work.
+
 Implementation work:
 
 - add `python/stryker_cxx/project_analysis.py`;

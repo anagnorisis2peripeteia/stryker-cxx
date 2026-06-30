@@ -83,6 +83,9 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(payload["totalMutants"], 1)
         self.assertEqual(payload["survived"], 1)
         self.assertEqual(payload["score"], 0)
+        self.assertEqual(payload["projectAnalysis"]["schemaVersion"], "stryker-cxx.project-analysis.v1")
+        self.assertEqual(payload["projectAnalysis"]["confidence"], "high")
+        self.assertIn("sample.cpp", payload["projectAnalysis"]["targetFiles"])
         self.assertEqual(payload["mutationTestingElements"]["schemaVersion"], "2.0")
         first = payload["mutationTestingElements"]["files"]["sample.cpp"]["mutants"][0]
         self.assertEqual(first["status"], "Survived")

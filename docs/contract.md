@@ -68,3 +68,21 @@ The current source-level runner emits these phases:
 `compilePruning` is currently reported as `notSupported`; compile and checker
 failures still appear as native mutant statuses until the lifecycle parity
 roadmap adds a pruning loop.
+
+## Project analysis metadata
+
+Native reports may include an optional `projectAnalysis` object with
+`schemaVersion = "stryker-cxx.project-analysis.v1"`. It records the project
+analysis performed before mutation execution:
+
+- `confidence`, currently `high`, `medium`, or `low`;
+- `targetFiles`, the requested mutation source files;
+- `buildSystems`, detected or explicit build-system signals;
+- `compileDatabase`, whether `compile_commands.json` was found and loaded;
+- `sourceTargets`, source file metadata and compile-database match state;
+- `buildTargets`, discovered or explicit build targets;
+- `testTargets`, discovered or explicit test targets/frameworks/commands;
+- `commands`, the resolved build/check/test commands.
+
+This metadata is descriptive. It does not yet replace explicit build and test
+commands, and unknown projects degrade to the user-supplied command flow.

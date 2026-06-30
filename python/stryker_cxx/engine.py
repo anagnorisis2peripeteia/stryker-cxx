@@ -36,6 +36,7 @@ from .schema import (
     require_report,
 )
 from .payload_contract import native_to_mte_status
+from .project_analysis import analyze_project
 
 # Token-level mutators.
 MUTATORS: dict[str, list[tuple[str, str]]] = {
@@ -3853,6 +3854,7 @@ def _report_dict(rep: Report, repo: str | None = None, base: str | None = None,
         "dryRun": rep.dryRun or {"status": "NOT_RUN"},
         "coverage": rep.coverage or {"enabled": False, "provider": "none"},
         "baseline": rep.baseline or {"enabled": False},
+        "projectAnalysis": execution.get("projectAnalysis", {}),
         "lifecycle": _lifecycle_metadata(rep, normalized_mutants),
         "config": rep.config or {"path": None, "hash": None, "effective": {}},
         "commands": {
@@ -3898,6 +3900,24 @@ def _lifecycle_metadata(rep: Report, mutants: list[dict[str, Any]]) -> dict[str,
         for mut in mutants
         if isinstance(mut.get("run"), dict) and mut.get("run", {}).get("worktree")
     ]
+    project_analysis = rep.execution.get("projectAnalysis")
+    project_analysis_detail = (
+        {
+            "confidence": project_analysis.get("confidence"),
+            "targetFiles": len(project_analysis.get("targetFiles") or []),
+            "buildSystems": [
+                item.get("name")
+                for item in project_analysis.get("buildSystems") or []
+                if isinstance(item, dict)
+            ],
+            "testTargets": len(project_analysis.get("testTargets") or []),
+        }
+        if isinstance(project_analysis, dict) and project_analysis
+        else {
+            "targetFiles": len(rep.target_files),
+            "source": "explicit-or-file-discovery",
+        }
+    )
     phases = [
         _phase(
             "initialization",
@@ -3908,8 +3928,7 @@ def _lifecycle_metadata(rep: Report, mutants: list[dict[str, Any]]) -> dict[str,
         _phase(
             "projectAnalysis",
             "partial",
-            targetFiles=len(rep.target_files),
-            source="explicit-or-file-discovery",
+            **project_analysis_detail,
         ),
         _phase(
             "mutationDiscovery",
@@ -5234,6 +5253,19 @@ def main(argv: list[str] | None = None) -> int:
     rep.execution["reporters"] = args.reporter
     rep.execution["reporterMetadata"] = _reporter_metadata(plugins, args.reporter)
     rep.execution["providers"] = _execution_provider_summary(plugins)
+    rep.execution["projectAnalysis"] = analyze_project(
+        repo,
+        files,
+        build_system=getattr(args, "build_system", None),
+        build_dir=getattr(args, "build_dir", None),
+        build_target=getattr(args, "build_target", None),
+        test_target=getattr(args, "test_target", None),
+        test_framework=getattr(args, "test_framework", None),
+        test_binary=getattr(args, "test_binary", None),
+        build_command=getattr(args, "build_cmd", None),
+        check_command=getattr(args, "check_cmd", None),
+        test_command=getattr(args, "test_cmd", None),
+    )
     discovered: list[Mutant] = []
     for path in files:
         if path.endswith(".metal") and not args.include_metal:

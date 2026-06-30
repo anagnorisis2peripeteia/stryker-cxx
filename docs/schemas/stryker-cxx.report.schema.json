@@ -126,6 +126,36 @@
         }
       }
     },
+    "projectAnalysis": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": { "type": "string" },
+        "confidence": { "type": "string" },
+        "repo": { "type": "string" },
+        "targetFiles": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "buildSystems": {
+          "type": "array",
+          "items": { "type": "object" }
+        },
+        "compileDatabase": { "type": "object" },
+        "sourceTargets": {
+          "type": "array",
+          "items": { "type": "object" }
+        },
+        "buildTargets": {
+          "type": "array",
+          "items": { "type": "object" }
+        },
+        "testTargets": {
+          "type": "array",
+          "items": { "type": "object" }
+        },
+        "commands": { "type": "object" }
+      }
+    },
     "summary": {
       "type": "object",
       "required": ["byStatus", "byFile", "byMutator"],

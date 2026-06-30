@@ -332,6 +332,25 @@ def validate_report(payload: dict[str, Any]) -> list[str]:
             if not isinstance(reasons, dict) or not all(isinstance(k, str) and isinstance(v, int) for k, v in reasons.items()):
                 errors.append(_collect("baseline.missReasons", "expected string-to-integer map"))
 
+    project_analysis = payload.get("projectAnalysis")
+    if project_analysis is not None:
+        if not isinstance(project_analysis, dict):
+            errors.append(_collect("projectAnalysis", "expected object"))
+        else:
+            if "schemaVersion" in project_analysis and not isinstance(project_analysis.get("schemaVersion"), str):
+                errors.append(_collect("projectAnalysis.schemaVersion", "expected string"))
+            if "confidence" in project_analysis and not isinstance(project_analysis.get("confidence"), str):
+                errors.append(_collect("projectAnalysis.confidence", "expected string"))
+            for key in ("targetFiles", "buildSystems", "sourceTargets", "buildTargets", "testTargets"):
+                if key in project_analysis and not isinstance(project_analysis.get(key), list):
+                    errors.append(_collect(f"projectAnalysis.{key}", "expected array"))
+            compile_db = project_analysis.get("compileDatabase")
+            if compile_db is not None and not isinstance(compile_db, dict):
+                errors.append(_collect("projectAnalysis.compileDatabase", "expected object"))
+            commands = project_analysis.get("commands")
+            if commands is not None and not isinstance(commands, dict):
+                errors.append(_collect("projectAnalysis.commands", "expected object"))
+
     lifecycle = payload.get("lifecycle")
     if lifecycle is not None:
         if not isinstance(lifecycle, dict):

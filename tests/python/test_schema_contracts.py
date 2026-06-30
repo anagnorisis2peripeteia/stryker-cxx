@@ -30,6 +30,7 @@ from stryker_cxx.payload_contract import (
     supported_mte_statuses,
     supported_native_statuses,
 )
+from stryker_cxx.project_analysis import analyze_project
 
 
 class TestContracts(unittest.TestCase):
@@ -200,6 +201,65 @@ class TestContracts(unittest.TestCase):
         errors = validate_report(payload)
 
         self.assertTrue(any("lifecycle.phases[0].detail" in item for item in errors))
+
+    def test_report_validator_accepts_project_analysis_metadata(self) -> None:
+        rep = self._base_report()
+        rep.execution["projectAnalysis"] = {
+            "schemaVersion": "stryker-cxx.project-analysis.v1",
+            "confidence": "high",
+            "targetFiles": ["src/foo.cpp"],
+            "buildSystems": [{"name": "cmake", "source": "explicit", "confidence": "high"}],
+            "compileDatabase": {"present": False},
+            "sourceTargets": [{"file": "src/foo.cpp", "confidence": "medium"}],
+            "buildTargets": [{"name": "all", "kind": "build", "confidence": "high"}],
+            "testTargets": [{"name": "math", "kind": "ctest", "confidence": "medium"}],
+            "commands": {"build": "cmake --build build", "check": None, "test": "ctest"},
+        }
+        payload = _report_dict(rep)
+
+        self.assertEqual(payload["projectAnalysis"]["confidence"], "high")
+        self.assertEqual(validate_report(payload), [])
+        phase = {
+            item["name"]: item
+            for item in payload["lifecycle"]["phases"]
+        }["projectAnalysis"]
+        self.assertEqual(phase["detail"]["confidence"], "high")
+
+    def test_project_analysis_detects_cmake_ctest_fixture(self) -> None:
+        repo = Path(__file__).resolve().parents[2] / "fixtures" / "adapters" / "cmake-ctest"
+
+        analysis = analyze_project(
+            str(repo),
+            ["math_test.cpp"],
+            build_system="cmake",
+            build_dir="build",
+            test_command="ctest --test-dir build",
+        )
+
+        self.assertEqual(analysis["confidence"], "high")
+        self.assertIn("cmake", {item["name"] for item in analysis["buildSystems"]})
+        self.assertIn("math_test", {item["name"] for item in analysis["buildTargets"]})
+        self.assertIn("math", {item["name"] for item in analysis["testTargets"]})
+
+    def test_project_analysis_detects_compile_database(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            source = repo / "sample.cpp"
+            source.write_text("int main() { return 0; }\n")
+            compile_db = [
+                {
+                    "directory": str(repo),
+                    "command": "clang++ -std=c++17 -c sample.cpp -o sample.o",
+                    "file": str(source),
+                }
+            ]
+            (repo / "compile_commands.json").write_text(json.dumps(compile_db))
+
+            analysis = analyze_project(str(repo), ["sample.cpp"])
+
+        self.assertTrue(analysis["compileDatabase"]["present"])
+        self.assertEqual(analysis["compileDatabase"]["entries"], 1)
+        self.assertEqual(analysis["sourceTargets"][0]["compileDatabaseMatched"], True)
 
     def test_report_redacts_secret_assignments(self) -> None:
         rep = self._base_report()
