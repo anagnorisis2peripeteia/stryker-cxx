@@ -4836,6 +4836,15 @@ def _compiled_artifact_target(
         if not original:
             raise ValueError(f"compiled-library backend could not find built library artifact for target {build_target!r}")
         return build_target, os.path.abspath(original), "library"
+    if backend == "compiled-object":
+        if test_binary:
+            original = test_binary if os.path.isabs(test_binary) else os.path.join(repo, test_binary)
+            return build_target or os.path.splitext(os.path.basename(original))[0], os.path.abspath(original), "object"
+        target = build_target or _infer_cmake_executable_target(repo)
+        if not target:
+            raise ValueError("compiled-object backend requires --build-target, --test-binary, or a discoverable add_executable target")
+        original = os.path.join(repo, build_root, target) if not os.path.isabs(build_root) else os.path.join(build_root, target)
+        return target, os.path.abspath(original), "object"
     if test_binary:
         original = test_binary if os.path.isabs(test_binary) else os.path.join(repo, test_binary)
         return os.path.splitext(os.path.basename(original))[0], os.path.abspath(original), "executable"
@@ -4870,6 +4879,89 @@ def _compiled_backend_retain_statuses(retain_worktrees_for: set[str] | None) -> 
     return _retain_status_names(retain_worktrees_for)
 
 
+def _compiled_artifact_kind_for_backend(backend: str) -> str:
+    if backend == "compiled-library":
+        return "library"
+    if backend == "compiled-object":
+        return "object"
+    return "executable"
+
+
+def _compile_database_entries(build_dir: str) -> tuple[list[dict[str, Any]], str | None]:
+    path = os.path.join(build_dir, "compile_commands.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            entries = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return [], path
+    if not isinstance(entries, list):
+        return [], path
+    return [entry for entry in entries if isinstance(entry, dict)], path
+
+
+def _compile_entry_source(entry: dict[str, Any]) -> str | None:
+    file_name = entry.get("file")
+    if not isinstance(file_name, str) or not file_name:
+        return None
+    directory = entry.get("directory")
+    directory = directory if isinstance(directory, str) and directory else os.getcwd()
+    return os.path.abspath(file_name if os.path.isabs(file_name) else os.path.join(directory, file_name))
+
+
+def _compile_entry_object(entry: dict[str, Any]) -> str | None:
+    directory = entry.get("directory")
+    directory = directory if isinstance(directory, str) and directory else os.getcwd()
+    argv: list[str]
+    if isinstance(entry.get("arguments"), list):
+        argv = [str(item) for item in entry["arguments"]]
+    elif isinstance(entry.get("command"), str):
+        try:
+            argv = shlex.split(str(entry["command"]))
+        except ValueError:
+            argv = []
+    else:
+        argv = []
+    for index, item in enumerate(argv):
+        if item == "-o" and index + 1 < len(argv):
+            value = argv[index + 1]
+            return os.path.abspath(value if os.path.isabs(value) else os.path.join(directory, value))
+        if item.startswith("-o") and len(item) > 2:
+            value = item[2:]
+            return os.path.abspath(value if os.path.isabs(value) else os.path.join(directory, value))
+    return None
+
+
+def _compiled_object_records(build_dir: str, scratch_repo: str, mutants: list[Mutant]) -> list[dict[str, Any]]:
+    entries, database_path = _compile_database_entries(build_dir)
+    out: list[dict[str, Any]] = []
+    for mut in mutants:
+        source = os.path.abspath(os.path.join(scratch_repo, mut.file))
+        matched_entry: dict[str, Any] | None = None
+        for entry in entries:
+            entry_source = _compile_entry_source(entry)
+            if entry_source and os.path.normcase(os.path.normpath(entry_source)) == os.path.normcase(os.path.normpath(source)):
+                matched_entry = entry
+                break
+        object_path = _compile_entry_object(matched_entry) if matched_entry else None
+        command = matched_entry.get("command") if matched_entry else None
+        if command is None and matched_entry and isinstance(matched_entry.get("arguments"), list):
+            command = " ".join(shlex.quote(str(item)) for item in matched_entry["arguments"])
+        object_hash = _sha256_file(object_path) if object_path and os.path.isfile(object_path) else None
+        out.append(
+            {
+                "mutantId": mut.id,
+                "source": mut.file,
+                "compileDatabase": database_path,
+                "compileCommandFound": matched_entry is not None,
+                "compileCommand": command,
+                "objectArtifact": object_path,
+                "objectHash": object_hash,
+                "objectProduced": bool(object_path and os.path.isfile(object_path)),
+            }
+        )
+    return out
+
+
 def _compiled_artifact_run_metadata(
     *,
     backend: str,
@@ -4884,6 +4976,7 @@ def _compiled_artifact_run_metadata(
     retained: bool,
     original_hash_before: str | None,
     original_hash_after: str | None,
+    object_artifacts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "schemaVersion": "stryker-cxx.compiled-artifact.v1",
@@ -4907,6 +5000,8 @@ def _compiled_artifact_run_metadata(
     if retained:
         payload["retainedPath"] = scratch_root
         payload["cleanupGuidance"] = "remove retainedPath when proof capture is complete"
+    if object_artifacts is not None:
+        payload["objectArtifacts"] = object_artifacts
     return payload
 
 
@@ -5131,6 +5226,7 @@ def _run_mutant_once_compiled_artifact(
     original_hash_before = _sha256_file(original_artifact)
     original_hash_after: str | None = None
     mutated_artifact: str | None = None
+    object_artifacts: list[dict[str, Any]] | None = None
     retained = False
 
     try:
@@ -5193,6 +5289,14 @@ def _run_mutant_once_compiled_artifact(
             mut.status = "BUILD_ERROR"
             mut.detail = f"{artifact_backend} mutant did not compile"
             return mut
+
+        if artifact_backend == "compiled-object":
+            object_artifacts = _compiled_object_records(scratch_build_dir, scratch_repo, [mut])
+            mut.run["compiledObjects"] = object_artifacts
+            if not object_artifacts or not object_artifacts[0].get("objectProduced"):
+                mut.status = "BUILD_ERROR"
+                mut.detail = "compiled-object backend did not produce a mutated object artifact"
+                return mut
 
         mutated_artifact = _find_built_artifact(scratch_build_dir, target, original_artifact)
         if check_cmd:
@@ -5301,6 +5405,7 @@ def _run_mutant_once_compiled_artifact(
             retained=retained,
             original_hash_before=original_hash_before,
             original_hash_after=original_hash_after,
+            object_artifacts=object_artifacts,
         )
         mut.run["artifactPlacement"] = {
             **compiled_artifact_placement_policy(
@@ -5321,6 +5426,292 @@ def _run_mutant_once_compiled_artifact(
         }
         mut.durationMs = int((time.perf_counter() - start_ms) * 1000)
     return mut
+
+
+def _run_batch_probe_compiled_artifact(
+    batch: list[Mutant],
+    repo: str,
+    check_cmd: str | None,
+    test_cmd: str,
+    coverage_test_command_template: str | None,
+    timeout_seconds: int | None,
+    artifact_root: str,
+    execution_mode: str,
+    skip_tests: bool,
+    build_system: str | None,
+    artifact_backend: str,
+    build_dir: str | None,
+    build_target: str | None,
+    test_binary: str | None,
+    plugins: list[dict[str, Any]] | None = None,
+    worker_tmp_dir: str | None = None,
+    retain_worktrees: bool = False,
+    retain_worktrees_for: set[str] | None = None,
+    worker_label: str | None = None,
+    env_overrides: dict[str, str] | None = None,
+    env_inherit: list[str] | None = None,
+    env_block: list[str] | None = None,
+) -> tuple[str, str, int, dict[str, Any]]:
+    if build_system not in {"cmake", "ctest", None}:
+        raise ValueError(f"{artifact_backend} backend currently requires --build-system cmake/ctest")
+
+    batch_id = hashlib.sha256(",".join(mut.id for mut in batch).encode("utf-8")).hexdigest()[:12]
+    effective_test_cmd, selected_tests = _batch_selected_test_command(
+        batch,
+        test_cmd,
+        coverage_test_command_template,
+    )
+    run: dict[str, Any] = {
+        "mode": execution_mode,
+        "artifactBackend": artifact_backend,
+        "worktreeMode": "compiled-artifact",
+        "batchId": batch_id,
+        "batchSize": len(batch),
+        "scheduler": {
+            "sessionType": "batch",
+            "coverageSelected": bool(selected_tests and coverage_test_command_template),
+            "selectedTests": selected_tests,
+            "mutantIds": [mut.id for mut in batch],
+            "artifactBackend": artifact_backend,
+        },
+    }
+    if selected_tests:
+        run["coveredBy"] = selected_tests
+        run["selectedTestCommand"] = effective_test_cmd
+    if worker_label:
+        run["workerLabel"] = worker_label
+    _record_environment_policy(run, env_overrides, env_inherit, env_block)
+
+    start_ms = time.perf_counter()
+    target, original_artifact, artifact_kind = _compiled_artifact_target(
+        repo,
+        artifact_backend,
+        build_dir,
+        build_target,
+        test_binary,
+    )
+    if not os.path.isfile(original_artifact):
+        raise ValueError(f"{artifact_backend} backend requires existing built artifact: {original_artifact}")
+
+    scratch_root = tempfile.mkdtemp(prefix="stryker-cxx-compiled-batch-", dir=worker_tmp_dir)
+    scratch_repo = os.path.join(scratch_root, "source")
+    scratch_build_dir = os.path.join(scratch_root, "build")
+    backup_artifact = os.path.join(artifact_root, f"original_batch_{batch_id}_{os.path.basename(original_artifact)}")
+    configure_log = os.path.join(artifact_root, f"compiled_batch_configure_{batch_id}.log")
+    build_log = os.path.join(artifact_root, f"compiled_batch_build_{batch_id}.log")
+    check_log = os.path.join(artifact_root, f"compiled_batch_check_{batch_id}.log")
+    test_log = os.path.join(artifact_root, f"compiled_batch_test_{batch_id}.log")
+    original_hash_before = _sha256_file(original_artifact)
+    original_hash_after: str | None = None
+    mutated_artifact: str | None = None
+    object_artifacts: list[dict[str, Any]] | None = None
+    retained = False
+    result: tuple[str, str, int, dict[str, Any]] | None = None
+
+    try:
+        shutil.copytree(
+            repo,
+            scratch_repo,
+            ignore=_ignore_for_compiled_scratch(build_dir, artifact_root),
+        )
+        for mut in batch:
+            apply_mutant(scratch_repo, mut)
+
+        configure_cmd = (
+            "cmake -S "
+            f"{shlex.quote(scratch_repo)} -B {shlex.quote(scratch_build_dir)} "
+            "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
+        )
+        configure_rc, configure_ms = run_cmd(
+            configure_cmd,
+            repo,
+            configure_log,
+            timeout_seconds,
+            "build",
+            plugins,
+            env_overrides,
+            env_inherit,
+            env_block,
+        )
+        run["configureCommand"] = configure_cmd
+        run["configureReturnCode"] = configure_rc
+        run["configureMs"] = configure_ms
+        run["configureLog"] = configure_log
+        if configure_rc == 124:
+            result = ("TIMEOUT", f"{artifact_backend} batch configure timed out", int((time.perf_counter() - start_ms) * 1000), run)
+            return result
+        if configure_rc != 0:
+            result = ("BUILD_ERROR", f"{artifact_backend} batch configure failed", int((time.perf_counter() - start_ms) * 1000), run)
+            return result
+
+        compiled_build_cmd = f"cmake --build {shlex.quote(scratch_build_dir)} --target {shlex.quote(target)}"
+        build_rc, build_ms = run_cmd(
+            compiled_build_cmd,
+            repo,
+            build_log,
+            timeout_seconds,
+            "build",
+            plugins,
+            env_overrides,
+            env_inherit,
+            env_block,
+        )
+        run["buildCommand"] = compiled_build_cmd
+        run["buildReturnCode"] = build_rc
+        run["buildMs"] = build_ms
+        run["buildLog"] = build_log
+        run["buildProvider"] = _phase_provider_name(plugins, "build")
+        if build_rc == 124:
+            result = ("TIMEOUT", f"{artifact_backend} batch build timed out", int((time.perf_counter() - start_ms) * 1000), run)
+            return result
+        if build_rc != 0:
+            result = ("BUILD_ERROR", f"{artifact_backend} batch mutant set did not compile", int((time.perf_counter() - start_ms) * 1000), run)
+            return result
+
+        if artifact_backend == "compiled-object":
+            object_artifacts = _compiled_object_records(scratch_build_dir, scratch_repo, batch)
+            run["compiledObjects"] = object_artifacts
+            if not object_artifacts or any(not item.get("objectProduced") for item in object_artifacts):
+                result = (
+                    "BUILD_ERROR",
+                    "compiled-object backend did not produce every mutated object artifact",
+                    int((time.perf_counter() - start_ms) * 1000),
+                    run,
+                )
+                return result
+
+        mutated_artifact = _find_built_artifact(scratch_build_dir, target, original_artifact)
+        if check_cmd:
+            check_rc, check_ms = run_cmd(
+                check_cmd,
+                scratch_repo,
+                check_log,
+                timeout_seconds,
+                "check",
+                plugins,
+                env_overrides,
+                env_inherit,
+                env_block,
+            )
+            run["checkReturnCode"] = check_rc
+            run["checkMs"] = check_ms
+            run["checkLog"] = check_log
+            run["checkProvider"] = _phase_provider_name(plugins, "check")
+            if check_rc == 124:
+                result = ("TIMEOUT", f"{artifact_backend} batch check timed out", int((time.perf_counter() - start_ms) * 1000), run)
+                return result
+            if check_rc != 0:
+                result = ("CHECK_ERROR", f"{artifact_backend} batch checker rejected mutant set", int((time.perf_counter() - start_ms) * 1000), run)
+                return result
+
+        shutil.copy2(original_artifact, backup_artifact)
+        shutil.copy2(mutated_artifact, original_artifact)
+        run["artifactPlaced"] = True
+        if skip_tests:
+            result = (
+                "SURVIVED",
+                "tests skipped after successful compiled artifact batch build/check",
+                int((time.perf_counter() - start_ms) * 1000),
+                run,
+            )
+            return result
+
+        test_rc, test_ms = run_cmd(
+            effective_test_cmd,
+            repo,
+            test_log,
+            timeout_seconds,
+            "test",
+            plugins,
+            env_overrides,
+            env_inherit,
+            env_block,
+        )
+        run["testReturnCode"] = test_rc
+        run["testMs"] = test_ms
+        run["testLog"] = test_log
+        run["testProvider"] = _phase_provider_name(plugins, "test")
+        run["testCommand"] = effective_test_cmd
+        if test_rc == 124:
+            result = ("TIMEOUT", f"{artifact_backend} batch tests timed out", int((time.perf_counter() - start_ms) * 1000), run)
+            return result
+        if test_rc != 0:
+            result = (
+                "KILLED",
+                "compiled artifact batch killed by tests; split for attribution",
+                int((time.perf_counter() - start_ms) * 1000),
+                run,
+            )
+            return result
+        result = (
+            "SURVIVED",
+            "all targeted tests passed for compiled artifact batch",
+            int((time.perf_counter() - start_ms) * 1000),
+            run,
+        )
+        return result
+    finally:
+        status = result[0] if result else "PENDING"
+        if os.path.isfile(backup_artifact):
+            shutil.copy2(backup_artifact, original_artifact)
+            original_hash_after = _sha256_file(original_artifact)
+        elif os.path.isfile(original_artifact):
+            original_hash_after = _sha256_file(original_artifact)
+        retain_current = _should_retain_worktree(
+            retain_worktrees,
+            retain_worktrees_for,
+            status,
+            scratch_root,
+            repo,
+        )
+        if retain_current:
+            retained = True
+            run["retainedArtifact"] = scratch_root
+            run["retainedArtifactReason"] = status
+            if worker_label:
+                run["retainedArtifactLabel"] = worker_label
+        else:
+            shutil.rmtree(scratch_root, ignore_errors=True)
+        run["mutationArtifact"] = compiled_mutation_artifact_metadata(
+            artifact_backend,
+            artifact_kind=artifact_kind,
+            worker_tmp_dir=worker_tmp_dir,
+            retain_artifacts=retained,
+            retain_artifacts_for=[status] if retained else [],
+            worker_label=worker_label,
+        )
+        run["compiledArtifact"] = _compiled_artifact_run_metadata(
+            backend=artifact_backend,
+            artifact_kind=artifact_kind,
+            target=target,
+            scratch_root=scratch_root,
+            scratch_repo=scratch_repo,
+            scratch_build_dir=scratch_build_dir,
+            mutated_artifact=mutated_artifact,
+            original_artifact=original_artifact,
+            backup_artifact=backup_artifact,
+            retained=retained,
+            original_hash_before=original_hash_before,
+            original_hash_after=original_hash_after,
+            object_artifacts=object_artifacts,
+        )
+        run["artifactPlacement"] = {
+            **compiled_artifact_placement_policy(
+                artifact_backend,
+                artifact_kind=artifact_kind,
+                artifact_root=artifact_root,
+                worker_tmp_dir=worker_tmp_dir,
+                retain_artifacts=retained,
+                retain_artifacts_for=[status] if retained else [],
+                worker_label=worker_label,
+            ),
+            "workRepo": scratch_repo,
+            "workspaceRoot": scratch_root,
+            "originalArtifactsRestored": bool(original_hash_after and original_hash_after == original_hash_before),
+            "materializedArtifactRetained": retained,
+            "materializedArtifactRestored": not retained,
+            "retainedPath": scratch_root if retained else None,
+        }
 
 
 def _compile_probe_mutant(
@@ -5744,6 +6135,59 @@ def _run_batch_task(payload: tuple[Any, ...]) -> tuple[int, list[Mutant], str, s
     return batch_index, batch, status, detail, duration_ms, run
 
 
+def _run_compiled_batch_task(payload: tuple[Any, ...]) -> tuple[int, list[Mutant], str, str, int, dict[str, Any]]:
+    (
+        batch_index,
+        batch,
+        repo,
+        check_cmd,
+        test_cmd,
+        coverage_test_command_template,
+        timeout_seconds,
+        artifact_root,
+        execution_mode,
+        skip_tests,
+        build_system,
+        artifact_backend,
+        build_dir,
+        build_target,
+        test_binary,
+        plugins,
+        worker_tmp_dir,
+        retain_worktrees,
+        retain_worktrees_for,
+        worker_label,
+        env_overrides,
+        env_inherit,
+        env_block,
+    ) = payload
+    status, detail, duration_ms, run = _run_batch_probe_compiled_artifact(
+        batch,
+        repo=repo,
+        check_cmd=check_cmd,
+        test_cmd=test_cmd,
+        coverage_test_command_template=coverage_test_command_template,
+        timeout_seconds=timeout_seconds,
+        artifact_root=artifact_root,
+        execution_mode=execution_mode,
+        skip_tests=skip_tests,
+        build_system=build_system,
+        artifact_backend=artifact_backend,
+        build_dir=build_dir,
+        build_target=build_target,
+        test_binary=test_binary,
+        plugins=plugins,
+        worker_tmp_dir=worker_tmp_dir,
+        retain_worktrees=retain_worktrees,
+        retain_worktrees_for=retain_worktrees_for,
+        worker_label=worker_label,
+        env_overrides=env_overrides,
+        env_inherit=env_inherit,
+        env_block=env_block,
+    )
+    return batch_index, batch, status, detail, duration_ms, run
+
+
 def _executed_record(executed: Mutant, source: str = "executed") -> dict[str, Any]:
     rec = _normalize_mutant_record(asdict(executed))
     rec["resultSource"] = source
@@ -5870,14 +6314,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.batch_size < 1:
         ap.error("--batch-size must be >= 1")
     if args.batch_mutants and args.worktree_mode == "inplace":
-        ap.error("--batch-mutants requires --worktree-mode copy or git-worktree")
+        if args.artifact_backend == "source-overlay":
+            ap.error("--batch-mutants requires --worktree-mode copy or git-worktree")
     if args.artifact_backend != "source-overlay":
-        if args.artifact_backend not in {"compiled-executable", "compiled-library"}:
-            ap.error(f"{args.artifact_backend} backend is specified but not implemented yet; use compiled-executable or compiled-library")
+        if args.artifact_backend not in {"compiled-executable", "compiled-library", "compiled-object"}:
+            ap.error(f"{args.artifact_backend} backend is specified but not implemented yet; use compiled-executable, compiled-library, or compiled-object")
         if args.jobs > 1:
             ap.error(f"--artifact-backend {args.artifact_backend} currently requires --jobs 1")
-        if args.batch_mutants:
-            ap.error(f"--artifact-backend {args.artifact_backend} does not yet support --batch-mutants")
     coverage_helper_tests = _parse_csv_items(args.coverage_helper_tests)
     if args.coverage_helper_command_template and not coverage_helper_tests:
         ap.error("--coverage-helper-command-template requires --coverage-helper-tests")
@@ -6011,8 +6454,10 @@ def main(argv: list[str] | None = None) -> int:
             },
             "compilePruning": {
                 "enabled": True,
-                "strategy": "source-overlay-prune-and-retry",
-                "candidateArtifactMode": "source-overlay",
+                "strategy": "source-overlay-prune-and-retry"
+                if args.artifact_backend == "source-overlay"
+                else "compiled-artifact-prune-and-retry",
+                "candidateArtifactMode": args.artifact_backend,
                 "attempts": 0,
                 "candidateMutants": 0,
                 "failedBatches": 0,
@@ -6065,7 +6510,7 @@ def main(argv: list[str] | None = None) -> int:
             "mutationArtifact": (
                 compiled_mutation_artifact_metadata(
                     args.artifact_backend,
-                    artifact_kind="library" if args.artifact_backend == "compiled-library" else "executable",
+                    artifact_kind=_compiled_artifact_kind_for_backend(args.artifact_backend),
                     worker_tmp_dir=args.worker_tmp_dir,
                     retain_artifacts=retain_worktrees,
                     retain_artifacts_for=_compiled_backend_retain_statuses(retain_worktrees_for)
@@ -6087,7 +6532,7 @@ def main(argv: list[str] | None = None) -> int:
             "artifactPlacement": (
                 compiled_artifact_placement_policy(
                     args.artifact_backend,
-                    artifact_kind="library" if args.artifact_backend == "compiled-library" else "executable",
+                    artifact_kind=_compiled_artifact_kind_for_backend(args.artifact_backend),
                     artifact_root=artifact_root,
                     worker_tmp_dir=args.worker_tmp_dir,
                     retain_artifacts=retain_worktrees,
@@ -6406,7 +6851,7 @@ def main(argv: list[str] | None = None) -> int:
     rep.total = len(discovered)
 
     def run_single_mutant(mut: Mutant) -> Mutant:
-        if args.artifact_backend in {"compiled-executable", "compiled-library"}:
+        if args.artifact_backend in {"compiled-executable", "compiled-library", "compiled-object"}:
             return _run_mutant_once_compiled_artifact(
                 mut,
                 repo=repo,
@@ -6458,38 +6903,71 @@ def main(argv: list[str] | None = None) -> int:
                 batches = _batch_mutants(pending, args.batch_size)
                 rep.execution["batching"]["batches"] = len(batches)
                 rep.execution["batching"]["batchedMutants"] = sum(len(batch) for batch in batches if len(batch) > 1)
-                probe_payloads = [
-                    (
-                        batch_index,
-                        batch,
-                        repo,
-                        args.build_cmd,
-                        args.check_cmd,
-                        args.test_cmd,
-                        args.coverage_test_command_template,
-                        effective_timeout_seconds,
-                        args.worktree_mode,
-                        artifact_root,
-                        args.mode,
-                        args.skip_tests,
-                        plugins,
-                        args.worker_tmp_dir,
-                        retain_worktrees,
-                        retain_worktrees_for,
-                        worker_label,
-                        env_overrides,
-                        env_inherit,
-                        env_block,
-                    )
-                    for batch_index, batch in enumerate(batches, 1)
-                    if len(batch) > 1
-                ]
+                if args.artifact_backend == "source-overlay":
+                    probe_payloads = [
+                        (
+                            batch_index,
+                            batch,
+                            repo,
+                            args.build_cmd,
+                            args.check_cmd,
+                            args.test_cmd,
+                            args.coverage_test_command_template,
+                            effective_timeout_seconds,
+                            args.worktree_mode,
+                            artifact_root,
+                            args.mode,
+                            args.skip_tests,
+                            plugins,
+                            args.worker_tmp_dir,
+                            retain_worktrees,
+                            retain_worktrees_for,
+                            worker_label,
+                            env_overrides,
+                            env_inherit,
+                            env_block,
+                        )
+                        for batch_index, batch in enumerate(batches, 1)
+                        if len(batch) > 1
+                    ]
+                    batch_task = _run_batch_task
+                else:
+                    probe_payloads = [
+                        (
+                            batch_index,
+                            batch,
+                            repo,
+                            args.check_cmd,
+                            args.test_cmd,
+                            args.coverage_test_command_template,
+                            effective_timeout_seconds,
+                            artifact_root,
+                            args.mode,
+                            args.skip_tests,
+                            args.build_system,
+                            args.artifact_backend,
+                            args.build_dir,
+                            args.build_target,
+                            args.test_binary,
+                            plugins,
+                            args.worker_tmp_dir,
+                            retain_worktrees,
+                            retain_worktrees_for,
+                            worker_label,
+                            env_overrides,
+                            env_inherit,
+                            env_block,
+                        )
+                        for batch_index, batch in enumerate(batches, 1)
+                        if len(batch) > 1
+                    ]
+                    batch_task = _run_compiled_batch_task
                 rep.execution["batching"]["parallelWorkers"] = min(args.jobs, max(1, len(probe_payloads)))
                 if args.jobs > 1 and len(probe_payloads) > 1:
                     with ThreadPoolExecutor(max_workers=args.jobs) as executor:
-                        probe_results = list(executor.map(_run_batch_task, probe_payloads))
+                        probe_results = list(executor.map(batch_task, probe_payloads))
                 else:
-                    probe_results = [_run_batch_task(payload) for payload in probe_payloads]
+                    probe_results = [batch_task(payload) for payload in probe_payloads]
                 probe_results_by_index = {
                     batch_index: (batch, status, detail, duration_ms, run)
                     for batch_index, batch, status, detail, duration_ms, run in probe_results
@@ -6521,7 +6999,9 @@ def main(argv: list[str] | None = None) -> int:
                         continue
 
                     rep.execution["batching"]["splitBatches"] += 1
-                    if status in COMPILE_PRUNED_STATUSES:
+                    if status in COMPILE_PRUNED_STATUSES and args.artifact_backend != "source-overlay":
+                        _record_compile_pruning_attempt(rep, batch, status, run)
+                    if status in COMPILE_PRUNED_STATUSES and args.artifact_backend == "source-overlay":
                         original_batch_id = str(run.get("batchId") or "")
                         _record_compile_pruning_attempt(rep, batch, status, run)
                         retry_candidates: list[Mutant] = []

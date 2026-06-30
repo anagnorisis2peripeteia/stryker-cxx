@@ -39,17 +39,21 @@ The current implementation now has lifecycle metadata, project analysis,
 mutation artifact abstraction, compile pruning metadata, coverage-aware
 scheduling, and artifact placement metadata.
 
-It also has initial `compiled-executable` and `compiled-library` backends for CMake/CTest-style
-executable targets. That backend mutates scratch source, builds a mutated
-executable in scratch space, swaps the executable into the original build/test
-location, runs tests against it, and restores the original executable by hash.
+It also has initial `compiled-executable`, `compiled-library`, and
+`compiled-object` backends for CMake/CTest-style targets. Those backends mutate
+scratch source, build a mutated artifact in scratch space, swap the linked
+artifact into the original build/test location, run tests against it, and
+restore the original artifact by hash. `compiled-object` additionally records
+the object produced for each mutated translation unit from CMake's compile
+database.
 
 The structural gap remains:
 
 - source-overlay is still the default compatibility backend;
-- `compiled-object` is not implemented;
-- compiled artifact batching is not implemented;
-- full build graph discovery beyond the CMake executable path is incomplete.
+- compiled artifact execution is CMake/CTest-first;
+- compiled artifact batching is implemented for local single-worker sessions,
+  but parallel compiled workers are still disabled;
+- full build graph discovery beyond the CMake path is incomplete.
 
 ## Target architecture
 
@@ -58,8 +62,9 @@ The structural gap remains:
 The engine should support explicit mutation artifact backends:
 
 - `source-overlay`: legacy compatibility backend.
-- `compiled-object`: compile mutated source to object files and swap object
-  artifacts before link or test execution.
+- `compiled-object`: compile mutated source to object files, record the object
+  artifacts, relink the owning target, and swap the linked artifact before test
+  execution.
 - `compiled-library`: compile/relink mutated static or shared libraries and
   swap them into the test runtime location.
 - `compiled-executable`: relink or rebuild the target executable and run tests

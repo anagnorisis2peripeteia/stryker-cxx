@@ -1262,6 +1262,181 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(run["compiledArtifact"]["placementPolicy"], "swap-file")
         self.assertTrue(run["artifactPlacement"]["originalArtifactsRestored"])
 
+    def test_compiled_object_backend_records_object_artifact_and_restores_original(self) -> None:
+        self.source.write_text(
+            "#include <cstdlib>\n"
+            "int value(int input) {\n"
+            "  if (input == 1) {\n"
+            "    return 2;\n"
+            "  }\n"
+            "  return 0;\n"
+            "}\n"
+            "int main() {\n"
+            "  return value(1) == 2 ? EXIT_SUCCESS : EXIT_FAILURE;\n"
+            "}\n"
+        )
+        (self.repo / "CMakeLists.txt").write_text(
+            "cmake_minimum_required(VERSION 3.16)\n"
+            "project(stryker_cxx_compiled_object_fixture LANGUAGES CXX)\n"
+            "enable_testing()\n"
+            "add_executable(sample sample.cpp)\n"
+            "target_compile_features(sample PRIVATE cxx_std_17)\n"
+            "add_test(NAME sample COMMAND sample)\n"
+        )
+        self._git("add", "sample.cpp", "CMakeLists.txt")
+        self._git("-c", "user.name=stryker-cxx", "-c", "user.email=stryker-cxx@example.invalid", "commit", "-q", "-m", "compiled-object-backend")
+        subprocess.run(["cmake", "-S", ".", "-B", "build"], cwd=self.repo, check=True, text=True, capture_output=True)
+        subprocess.run(["cmake", "--build", "build", "--target", "sample"], cwd=self.repo, check=True, text=True, capture_output=True)
+        original_source = self.source.read_text()
+        executable = self.repo / "build" / "sample"
+        original_executable_hash = _sha256(executable)
+        report = self.repo / "compiled-object.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-system",
+            "cmake",
+            "--build-dir",
+            "build",
+            "--build-target",
+            "sample",
+            "--test-binary",
+            "build/sample",
+            "--test-command",
+            "ctest --test-dir build --output-on-failure",
+            "--artifact-backend",
+            "compiled-object",
+            "--mutators",
+            "EqualityOperator",
+            "--report",
+            str(report),
+            "--max-mutants",
+            "1",
+            "--skip-initial-test",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(self.source.read_text(), original_source)
+        self.assertEqual(_sha256(executable), original_executable_hash)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["killed"], 1)
+        self.assertEqual(payload["mutationArtifact"]["mode"], "compiled-artifact")
+        self.assertEqual(payload["mutationArtifact"]["backend"], "compiled-object")
+        self.assertEqual(payload["mutationArtifact"]["compiledArtifacts"]["kinds"], ["object"])
+        self.assertEqual(payload["execution"]["compilePruning"]["candidateArtifactMode"], "compiled-object")
+        self.assertEqual(payload["execution"]["compilePruning"]["strategy"], "compiled-artifact-prune-and-retry")
+        self.assertEqual(len(payload["compiledArtifacts"]), 1)
+        compiled = payload["compiledArtifacts"][0]
+        self.assertEqual(compiled["backend"], "compiled-object")
+        self.assertEqual(compiled["kind"], "object")
+        self.assertTrue(compiled["originalRestored"])
+        self.assertEqual(compiled["originalHashBefore"], original_executable_hash)
+        self.assertEqual(compiled["originalHashAfter"], original_executable_hash)
+        self.assertEqual(len(compiled["objectArtifacts"]), 1)
+        obj = compiled["objectArtifacts"][0]
+        self.assertEqual(obj["mutantId"], payload["mutants"][0]["id"])
+        self.assertTrue(obj["compileCommandFound"])
+        self.assertTrue(obj["objectProduced"])
+        self.assertTrue(obj["objectArtifact"].endswith(".o"))
+        self.assertIsInstance(obj["objectHash"], str)
+        run = payload["mutants"][0]["run"]
+        self.assertEqual(run["artifactBackend"], "compiled-object")
+        self.assertTrue(run["artifactPlacement"]["originalArtifactsRestored"])
+
+    def test_compiled_backend_batches_surviving_mutants_without_source_overlay(self) -> None:
+        self.source.write_text(
+            "bool feature_a() {\n"
+            "  return true;\n"
+            "}\n"
+            "\n"
+            "bool feature_b() {\n"
+            "  return true;\n"
+            "}\n"
+            "\n"
+            "int value() {\n"
+            "  return 2;\n"
+            "}\n"
+        )
+        (self.repo / "test_main.cpp").write_text(
+            "#include <cstdlib>\n"
+            "int value();\n"
+            "int main() {\n"
+            "  return value() == 2 ? EXIT_SUCCESS : EXIT_FAILURE;\n"
+            "}\n"
+        )
+        (self.repo / "CMakeLists.txt").write_text(
+            "cmake_minimum_required(VERSION 3.16)\n"
+            "project(stryker_cxx_compiled_batch_fixture LANGUAGES CXX)\n"
+            "enable_testing()\n"
+            "add_executable(sample_test sample.cpp test_main.cpp)\n"
+            "target_compile_features(sample_test PRIVATE cxx_std_17)\n"
+            "add_test(NAME sample COMMAND sample_test)\n"
+        )
+        self._git("add", "sample.cpp", "test_main.cpp", "CMakeLists.txt")
+        self._git("-c", "user.name=stryker-cxx", "-c", "user.email=stryker-cxx@example.invalid", "commit", "-q", "-m", "compiled-batch-backend")
+        subprocess.run(["cmake", "-S", ".", "-B", "build"], cwd=self.repo, check=True, text=True, capture_output=True)
+        subprocess.run(["cmake", "--build", "build", "--target", "sample_test"], cwd=self.repo, check=True, text=True, capture_output=True)
+        original_source = self.source.read_text()
+        executable = self.repo / "build" / "sample_test"
+        original_executable_hash = _sha256(executable)
+        report = self.repo / "compiled-batch.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-system",
+            "cmake",
+            "--build-dir",
+            "build",
+            "--build-target",
+            "sample_test",
+            "--test-binary",
+            "build/sample_test",
+            "--test-command",
+            "ctest --test-dir build --output-on-failure",
+            "--artifact-backend",
+            "compiled-executable",
+            "--batch-mutants",
+            "--batch-size",
+            "2",
+            "--mutators",
+            "BooleanLiteral",
+            "--report",
+            str(report),
+            "--max-mutants",
+            "2",
+            "--threshold-break",
+            "0",
+            "--skip-initial-test",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(self.source.read_text(), original_source)
+        self.assertEqual(_sha256(executable), original_executable_hash)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["survived"], 2)
+        self.assertEqual(payload["execution"]["batching"]["batches"], 1)
+        self.assertEqual(payload["execution"]["batching"]["batchedMutants"], 2)
+        self.assertEqual(payload["execution"]["batching"]["splitBatches"], 0)
+        self.assertEqual([mut["resultSource"] for mut in payload["mutants"]], ["batch", "batch"])
+        for mut in payload["mutants"]:
+            run = mut["run"]
+            self.assertEqual(run["artifactBackend"], "compiled-executable")
+            self.assertEqual(run["worktreeMode"], "compiled-artifact")
+            self.assertEqual(run["scheduler"]["sessionType"], "batch")
+            self.assertEqual(run["compiledArtifact"]["backend"], "compiled-executable")
+            self.assertTrue(run["compiledArtifact"]["originalRestored"])
+            self.assertFalse(run["compiledArtifact"]["sourceCheckoutMutation"])
+
     def test_worker_tmp_env_and_retained_worktree_are_reported(self) -> None:
         report = self.repo / "retained-copy.json"
         old_blocked = os.environ.get("STRYKER_CXX_BLOCKED")

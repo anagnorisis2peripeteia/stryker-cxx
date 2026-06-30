@@ -334,6 +334,9 @@ surface that still needs work for `full parity` mode.
   native `stryker-cxx.report.v1`.
 - `run`/`list-mutants`/`run-mutant` command surfaces with baseline, batching,
   sharding, coverage selection, checker phase, and threshold bands.
+- CMake/CTest compiled-artifact backends for executable, library, and object
+  materialization, including artifact swapping, restoration-by-hash, and
+  compiled batch sessions.
 - Plugin surfaces for token mutators, reporter hooks, and runner/checker/test
   providers.
 - Config-loader plugin capability via `capabilities.configLoader`, applying
@@ -541,9 +544,12 @@ Implemented CLI/config:
 
 Current constraints:
 
-- batching requires `--worktree-mode copy` or `--worktree-mode git-worktree`;
+- source-overlay batching requires `--worktree-mode copy` or
+  `--worktree-mode git-worktree`; compiled-artifact batching uses scratch
+  artifact builds and does not mutate checkout source;
 - batch probes can run in parallel, but report entries are emitted in stable
   batch order for deterministic attribution;
+- compiled-artifact batch probes are currently single-worker only;
 - same-line and adjacent-line mutants in the same file are not batched;
 - source-structure mutators such as statement/block/call removal, preprocessor
   guard flips, exception removal, and Objective-C message-send removal are

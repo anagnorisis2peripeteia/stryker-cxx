@@ -114,8 +114,9 @@ stable and does not expose local workspace paths.
 
 ## Compile pruning metadata
 
-Native reports include `execution.compilePruning` with
-`strategy = "source-overlay-prune-and-retry"`. It records:
+Native reports include `execution.compilePruning`. Source-overlay runs use
+`strategy = "source-overlay-prune-and-retry"`; compiled artifact runs use
+`strategy = "compiled-artifact-prune-and-retry"`. It records:
 
 - `attempts`, compile-failing candidate batch attempts;
 - `candidateMutants`, the number of mutants considered by those attempts;
@@ -163,14 +164,15 @@ Native reports include `artifactPlacement` with
 `schemaVersion = "stryker-cxx.artifact-placement.v1"`. It formalizes where
 mutation artifacts are placed and how originals are restored:
 
-- `mode`, currently `source-overlay`;
+- `mode`, either `source-overlay` or `compiled-artifact`;
 - `implementation`, matching `inplace`, `copy`, or `git-worktree`;
 - `artifactRoot`, `workerTmpDir`, and `workerLabel`;
-- `restoreOriginals`, which is `true` for the current source-overlay runner;
+- `restoreOriginals`, which is `true` for source-overlay and compiled-artifact
+  runners;
 - `retainArtifacts` and `retainArtifactsFor`;
 - `sourceOverlay.restorePolicy` and `sourceOverlay.placement`;
-- `compiledArtifacts.supported`, currently `false`, plus placeholder placement
-  and restore policy fields for future compiled artifact replacement.
+- `compiledArtifacts.supported`, placement, kind, and restore policy fields for
+  compiled artifact replacement.
 
 Per-run native metadata may include `run.artifactPlacement` with the materialized
 workspace, whether the materialized artifact was restored or retained, retained
@@ -181,31 +183,33 @@ workspace is removed unless retention was explicitly requested.
 ## Compiled artifact backend metadata
 
 `source-overlay` remains available as a compatibility backend, but native runs
-can now select `--artifact-backend compiled-executable` or
-`--artifact-backend compiled-library` for CMake/CTest-style
-executable targets.
+can now select `--artifact-backend compiled-executable`,
+`--artifact-backend compiled-library`, or `--artifact-backend compiled-object`
+for CMake/CTest-style targets.
 
-The compiled executable backend:
+The compiled artifact backends:
 
 - materializes mutated source in a scratch workspace, not in the user's
   checkout;
-- configures and builds the mutated executable in scratch space;
-- snapshots the original executable artifact;
-- swaps the mutated executable into the original build/test location;
-- runs the configured tests against that swapped executable;
-- restores the original executable after the session;
+- configures and builds the mutated target in scratch space;
+- records mutated object artifacts for `compiled-object`;
+- snapshots the original linked artifact;
+- swaps the mutated linked artifact into the original build/test location;
+- runs the configured tests against that swapped artifact;
+- restores the original artifact after the session;
 - records the proof under top-level `compiledArtifacts[]` and
   per-mutant `run.compiledArtifact`.
 
-Compiled executable native reports use:
+Compiled artifact native reports use:
 
 - `mutationArtifact.mode = "compiled-artifact"`;
-- `mutationArtifact.backend = "compiled-executable"` or `"compiled-library"`;
+- `mutationArtifact.backend = "compiled-executable"`, `"compiled-library"`, or
+  `"compiled-object"`;
 - `artifactPlacement.compiledArtifacts.supported = true`;
 - `compiledArtifacts[].placementPolicy = "swap-file"`;
 - `compiledArtifacts[].sourceCheckoutMutation = false`;
 - `compiledArtifacts[].originalRestored = true` when the original artifact hash
   after restoration matches the pre-session hash.
 
-`compiled-object` remains an explicit future backend; the
-CLI rejects them until their artifact builders and placement policies exist.
+Compiled batch sessions use the same metadata shape with
+`run.scheduler.sessionType = "batch"`.
