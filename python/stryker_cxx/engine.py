@@ -37,6 +37,7 @@ from .schema import (
 from .payload_contract import native_to_mte_status
 from .project_analysis import analyze_project
 from .mutation_artifacts import (
+    artifact_placement_policy,
     materialize_mutation_artifact,
     mutation_artifact_metadata,
 )
@@ -4044,6 +4045,7 @@ def _report_dict(rep: Report, repo: str | None = None, base: str | None = None,
         "baseline": rep.baseline or {"enabled": False},
         "projectAnalysis": execution.get("projectAnalysis", {}),
         "mutationArtifact": execution.get("mutationArtifact", {}),
+        "artifactPlacement": execution.get("artifactPlacement", {}),
         "lifecycle": _lifecycle_metadata(rep, normalized_mutants),
         "config": rep.config or {"path": None, "hash": None, "effective": {}},
         "commands": {
@@ -4093,6 +4095,7 @@ def _lifecycle_metadata(rep: Report, mutants: list[dict[str, Any]]) -> dict[str,
     ]
     project_analysis = rep.execution.get("projectAnalysis")
     mutation_artifact = rep.execution.get("mutationArtifact")
+    artifact_placement = rep.execution.get("artifactPlacement")
     project_analysis_detail = (
         {
             "confidence": project_analysis.get("confidence"),
@@ -4190,6 +4193,15 @@ def _lifecycle_metadata(rep: Report, mutants: list[dict[str, Any]]) -> dict[str,
         _phase(
             "artifactRestoration",
             "sourceLevel",
+            restoreOriginals=artifact_placement.get("restoreOriginals")
+            if isinstance(artifact_placement, dict)
+            else True,
+            sourceOverlayRestorePolicy=artifact_placement.get("sourceOverlay", {}).get("restorePolicy")
+            if isinstance(artifact_placement, dict) and isinstance(artifact_placement.get("sourceOverlay"), dict)
+            else None,
+            compiledArtifactsSupported=artifact_placement.get("compiledArtifacts", {}).get("supported")
+            if isinstance(artifact_placement, dict) and isinstance(artifact_placement.get("compiledArtifacts"), dict)
+            else False,
             retainedWorktrees=bool(resource.get("retainWorktrees")) if isinstance(resource, dict) else False,
             retainedPaths=[str(path) for path in retained_paths if path],
         ),
@@ -4896,6 +4908,7 @@ def _run_mutant_once(
             else:
                 restore(work_repo, mut.file, mut.line, original)
             mut.run["mutationArtifact"] = artifact.run_metadata()
+            mut.run["artifactPlacement"] = artifact.placement_metadata()
             mut.durationMs = int((time.perf_counter() - start_ms) * 1000)
     return mut
 
@@ -5014,6 +5027,7 @@ def _compile_probe_mutant(
             else:
                 restore(work_repo, mut.file, mut.line, original)
             mut.run["mutationArtifact"] = artifact.run_metadata()
+            mut.run["artifactPlacement"] = artifact.placement_metadata()
             mut.durationMs = int((time.perf_counter() - start_ms) * 1000)
     return mut
 
@@ -5270,6 +5284,7 @@ def _run_batch_probe(
                 for mut, original in reversed(originals):
                     restore(work_repo, mut.file, mut.line, original)
             run["mutationArtifact"] = artifact.run_metadata()
+            run["artifactPlacement"] = artifact.placement_metadata()
 
 
 def _run_batch_task(payload: tuple[Any, ...]) -> tuple[int, list[Mutant], str, str, int, dict[str, Any]]:
@@ -5624,6 +5639,16 @@ def main(argv: list[str] | None = None) -> int:
             },
             "mutationArtifact": mutation_artifact_metadata(
                 args.worktree_mode,
+                worker_tmp_dir=args.worker_tmp_dir,
+                retain_worktrees=retain_worktrees,
+                retain_worktrees_for=_retain_status_names(retain_worktrees_for)
+                if retain_worktrees
+                else [],
+                worker_label=worker_label,
+            ),
+            "artifactPlacement": artifact_placement_policy(
+                args.worktree_mode,
+                artifact_root=artifact_root,
                 worker_tmp_dir=args.worker_tmp_dir,
                 retain_worktrees=retain_worktrees,
                 retain_worktrees_for=_retain_status_names(retain_worktrees_for)

@@ -156,3 +156,24 @@ that actually ran:
 Batched sessions can now use coverage-selected tests. When a batch contains
 multiple covered mutants, the scheduler runs the coverage command template with
 the ordered union of covered tests for that batch.
+
+## Artifact placement and restoration metadata
+
+Native reports include `artifactPlacement` with
+`schemaVersion = "stryker-cxx.artifact-placement.v1"`. It formalizes where
+mutation artifacts are placed and how originals are restored:
+
+- `mode`, currently `source-overlay`;
+- `implementation`, matching `inplace`, `copy`, or `git-worktree`;
+- `artifactRoot`, `workerTmpDir`, and `workerLabel`;
+- `restoreOriginals`, which is `true` for the current source-overlay runner;
+- `retainArtifacts` and `retainArtifactsFor`;
+- `sourceOverlay.restorePolicy` and `sourceOverlay.placement`;
+- `compiledArtifacts.supported`, currently `false`, plus placeholder placement
+  and restore policy fields for future compiled artifact replacement.
+
+Per-run native metadata may include `run.artifactPlacement` with the materialized
+workspace, whether the materialized artifact was restored or retained, retained
+path/reason, and cleanup guidance. In `inplace` mode the source line is restored
+after each mutation session; in isolated `copy` and `git-worktree` modes the
+workspace is removed unless retention was explicitly requested.

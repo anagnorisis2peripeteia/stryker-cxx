@@ -229,6 +229,46 @@
         "retainedReason": { "type": "string" }
       }
     },
+    "artifactPlacement": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": { "type": "string" },
+        "mode": { "type": "string" },
+        "implementation": { "type": "string" },
+        "artifactRoot": { "type": ["string", "null"] },
+        "workerTmpDir": { "type": ["string", "null"] },
+        "workerLabel": { "type": ["string", "null"] },
+        "restoreOriginals": { "type": "boolean" },
+        "retainArtifacts": { "type": "boolean" },
+        "retainArtifactsFor": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "sourceOverlay": {
+          "type": "object",
+          "properties": {
+            "restorePolicy": { "type": "string" },
+            "placement": { "type": "string" }
+          }
+        },
+        "compiledArtifacts": {
+          "type": "object",
+          "properties": {
+            "supported": { "type": "boolean" },
+            "placement": { "type": "string" },
+            "restorePolicy": { "type": "string" }
+          }
+        },
+        "workRepo": { "type": "string" },
+        "workspaceRoot": { "type": "string" },
+        "originalArtifactsRestored": { "type": "boolean" },
+        "materializedArtifactRetained": { "type": "boolean" },
+        "materializedArtifactRestored": { "type": "boolean" },
+        "retainedPath": { "type": "string" },
+        "retainedReason": { "type": "string" },
+        "cleanupGuidance": { "type": "string" }
+      }
+    },
     "summary": {
       "type": "object",
       "required": ["byStatus", "byFile", "byMutator"],

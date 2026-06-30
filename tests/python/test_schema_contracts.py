@@ -129,6 +129,25 @@ class TestContracts(unittest.TestCase):
                         "restoration": "discard-copy-or-retain",
                     },
                 },
+                "artifactPlacement": {
+                    "schemaVersion": "stryker-cxx.artifact-placement.v1",
+                    "mode": "source-overlay",
+                    "implementation": "copy",
+                    "artifactRoot": "agent_space/stryker-cxx",
+                    "workerTmpDir": "/tmp/stryker-cxx-workers",
+                    "restoreOriginals": True,
+                    "retainArtifacts": True,
+                    "retainArtifactsFor": ["SURVIVED", "TIMEOUT"],
+                    "sourceOverlay": {
+                        "restorePolicy": "discard-copy-or-retain",
+                        "placement": "isolated-copy",
+                    },
+                    "compiledArtifacts": {
+                        "supported": False,
+                        "placement": "not-supported",
+                        "restorePolicy": "not-supported",
+                    },
+                },
             },
             dryRun={
                 "status": "PASSED",
@@ -208,6 +227,9 @@ class TestContracts(unittest.TestCase):
         self.assertEqual(payload["mutationArtifact"]["schemaVersion"], "stryker-cxx.mutation-artifact.v1")
         self.assertEqual(payload["mutationArtifact"]["mode"], "source-overlay")
         self.assertEqual(payload["mutationArtifact"]["implementation"], "copy")
+        self.assertEqual(payload["artifactPlacement"]["schemaVersion"], "stryker-cxx.artifact-placement.v1")
+        self.assertTrue(payload["artifactPlacement"]["restoreOriginals"])
+        self.assertFalse(payload["artifactPlacement"]["compiledArtifacts"]["supported"])
         self.assertEqual(payload["execution"]["compilePruning"]["strategy"], "source-overlay-prune-and-retry")
         self.assertEqual(payload["execution"]["testScheduler"]["schemaVersion"], "stryker-cxx.test-scheduler.v1")
         self.assertEqual(payload["execution"]["testScheduler"]["strategy"], "batched")
@@ -224,6 +246,7 @@ class TestContracts(unittest.TestCase):
         self.assertEqual(lifecycle_by_name["compilePruning"]["status"], "completed")
         self.assertEqual(lifecycle_by_name["compilePruning"]["detail"]["prunedMutants"], 0)
         self.assertEqual(lifecycle_by_name["testScheduling"]["detail"]["scheduler"], "batched")
+        self.assertTrue(lifecycle_by_name["artifactRestoration"]["detail"]["restoreOriginals"])
         self.assertEqual(payload["summary"]["byStatus"]["SURVIVED"], 1)
         self.assertEqual(payload["summary"]["byFile"]["src/foo.cpp"]["survived"], 1)
         self.assertEqual(payload["summary"]["byMutator"]["ConditionalBoundary"]["killed"], 1)
@@ -250,6 +273,14 @@ class TestContracts(unittest.TestCase):
         errors = validate_report(payload)
 
         self.assertTrue(any("mutationArtifact.workspacePerMutant" in item for item in errors))
+
+    def test_report_validator_checks_artifact_placement_shape_when_present(self) -> None:
+        payload = _report_dict(self._base_report())
+        payload["artifactPlacement"]["restoreOriginals"] = "yes"
+
+        errors = validate_report(payload)
+
+        self.assertTrue(any("artifactPlacement.restoreOriginals" in item for item in errors))
 
     def test_report_validator_checks_compile_pruning_shape_when_present(self) -> None:
         payload = _report_dict(self._base_report())

@@ -89,16 +89,25 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(payload["mutationArtifact"]["schemaVersion"], "stryker-cxx.mutation-artifact.v1")
         self.assertEqual(payload["mutationArtifact"]["mode"], "source-overlay")
         self.assertEqual(payload["mutationArtifact"]["implementation"], "inplace")
+        self.assertEqual(payload["artifactPlacement"]["schemaVersion"], "stryker-cxx.artifact-placement.v1")
+        self.assertEqual(payload["artifactPlacement"]["sourceOverlay"]["restorePolicy"], "restore-mutated-source")
+        self.assertTrue(payload["artifactPlacement"]["restoreOriginals"])
+        self.assertFalse(payload["artifactPlacement"]["compiledArtifacts"]["supported"])
         lifecycle_by_name = {
             phase["name"]: phase
             for phase in payload["lifecycle"]["phases"]
         }
         self.assertEqual(lifecycle_by_name["mutationArtifact"]["detail"]["artifactMode"], "source-overlay")
         self.assertEqual(lifecycle_by_name["mutationArtifact"]["detail"]["implementation"], "inplace")
+        self.assertTrue(lifecycle_by_name["artifactRestoration"]["detail"]["restoreOriginals"])
         self.assertEqual(payload["mutationTestingElements"]["schemaVersion"], "2.0")
         first = payload["mutationTestingElements"]["files"]["sample.cpp"]["mutants"][0]
         self.assertEqual(first["status"], "Survived")
         self.assertIn("stryker-cxx run-mutant", first["runCommand"])
+        placement = payload["mutants"][0]["run"]["artifactPlacement"]
+        self.assertTrue(placement["originalArtifactsRestored"])
+        self.assertTrue(placement["materializedArtifactRestored"])
+        self.assertFalse(placement["materializedArtifactRetained"])
 
     def test_init_writes_default_config_and_refuses_overwrite(self) -> None:
         config = self.repo / "stryker-cxx.yml"
@@ -1118,6 +1127,8 @@ class CliContractTests(unittest.TestCase):
                 self.assertTrue(isolation["retainWorktrees"])
                 self.assertEqual(isolation["retainWorktreesFor"], ["ALL"])
                 self.assertEqual(isolation["retainedWorktreeTtlHours"], 0.0)
+                self.assertTrue(payload["artifactPlacement"]["retainArtifacts"])
+                self.assertEqual(payload["artifactPlacement"]["retainArtifactsFor"], ["ALL"])
                 self.assertGreaterEqual(isolation["retainedWorktreeCleanup"]["removed"], 1)
                 self.assertFalse(stale.exists())
                 self.assertEqual(isolation["workerTmpDir"], worker_tmp)
@@ -1131,6 +1142,11 @@ class CliContractTests(unittest.TestCase):
                     ["STRYKER_CXX_FLAG=[REDACTED]", "SECRET_TOKEN=[REDACTED]"],
                 )
                 retained = payload["mutants"][0]["run"]["retainedWorktree"]
+                placement = payload["mutants"][0]["run"]["artifactPlacement"]
+                self.assertTrue(placement["materializedArtifactRetained"])
+                self.assertFalse(placement["materializedArtifactRestored"])
+                self.assertEqual(placement["retainedPath"], retained)
+                self.assertIn("cleanupGuidance", placement)
                 self.assertTrue(retained.startswith(worker_tmp))
                 self.assertIn("stryker-cxx-copy-pr-96205-proof-", retained)
                 self.assertEqual(payload["mutants"][0]["run"]["workerLabel"], "pr-96205-proof")

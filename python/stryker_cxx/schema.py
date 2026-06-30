@@ -413,6 +413,25 @@ def validate_report(payload: dict[str, Any]) -> list[str]:
             if source_overlay is not None and not isinstance(source_overlay, dict):
                 errors.append(_collect("mutationArtifact.sourceOverlay", "expected object"))
 
+    artifact_placement = payload.get("artifactPlacement")
+    if artifact_placement is not None:
+        if not isinstance(artifact_placement, dict):
+            errors.append(_collect("artifactPlacement", "expected object"))
+        else:
+            if "schemaVersion" in artifact_placement and not isinstance(artifact_placement.get("schemaVersion"), str):
+                errors.append(_collect("artifactPlacement.schemaVersion", "expected string"))
+            for key in ("mode", "implementation"):
+                if key in artifact_placement and not isinstance(artifact_placement.get(key), str):
+                    errors.append(_collect(f"artifactPlacement.{key}", "expected string"))
+            for key in ("restoreOriginals", "retainArtifacts"):
+                if key in artifact_placement and not isinstance(artifact_placement.get(key), bool):
+                    errors.append(_collect(f"artifactPlacement.{key}", "expected boolean"))
+            if "retainArtifactsFor" in artifact_placement and not isinstance(artifact_placement.get("retainArtifactsFor"), list):
+                errors.append(_collect("artifactPlacement.retainArtifactsFor", "expected array"))
+            for key in ("sourceOverlay", "compiledArtifacts"):
+                if key in artifact_placement and not isinstance(artifact_placement.get(key), dict):
+                    errors.append(_collect(f"artifactPlacement.{key}", "expected object"))
+
     lifecycle = payload.get("lifecycle")
     if lifecycle is not None:
         if not isinstance(lifecycle, dict):

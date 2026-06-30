@@ -225,6 +225,10 @@ Acceptance criteria:
 
 ### Phase 6: artifact placement and restoration
 
+Status: implemented for source-overlay restoration and retained proof
+artifacts; compiled artifact placement has a compatible policy shape but is not
+enabled.
+
 Implementation work:
 
 - add artifact placement policies for source overlays and compiled outputs;

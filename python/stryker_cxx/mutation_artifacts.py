@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Any
 
 MUTATION_ARTIFACT_SCHEMA_VERSION = "stryker-cxx.mutation-artifact.v1"
+ARTIFACT_PLACEMENT_SCHEMA_VERSION = "stryker-cxx.artifact-placement.v1"
 SOURCE_OVERLAY_MODE = "source-overlay"
 
 
@@ -80,6 +81,38 @@ def mutation_artifact_metadata(
     return payload
 
 
+def artifact_placement_policy(
+    implementation: str,
+    *,
+    artifact_root: str | None = None,
+    worker_tmp_dir: str | None = None,
+    retain_worktrees: bool = False,
+    retain_worktrees_for: list[str] | None = None,
+    worker_label: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "schemaVersion": ARTIFACT_PLACEMENT_SCHEMA_VERSION,
+        "mode": SOURCE_OVERLAY_MODE,
+        "implementation": implementation,
+        "artifactRoot": artifact_root,
+        "workerTmpDir": worker_tmp_dir,
+        "workerLabel": worker_label,
+        "restoreOriginals": True,
+        "retainArtifacts": retain_worktrees,
+        "retainArtifactsFor": list(retain_worktrees_for or []),
+        "sourceOverlay": {
+            "restorePolicy": _source_overlay_restoration(implementation),
+            "placement": _source_overlay_strategy(implementation),
+        },
+        "compiledArtifacts": {
+            "supported": False,
+            "placement": "not-supported",
+            "restorePolicy": "not-supported",
+        },
+    }
+    return payload
+
+
 @dataclass
 class MutationArtifact:
     """A materialized artifact workspace for one mutation execution."""
@@ -119,6 +152,27 @@ class MutationArtifact:
                 payload["retainedReason"] = self.retained_reason
         else:
             payload["retained"] = False
+        return payload
+
+    def placement_metadata(self) -> dict[str, Any]:
+        payload = artifact_placement_policy(
+            self.implementation,
+            worker_tmp_dir=self.worker_tmp_dir,
+            retain_worktrees=self.retained,
+            retain_worktrees_for=[self.retained_reason] if self.retained_reason else [],
+            worker_label=self.worker_label,
+        )
+        payload["workRepo"] = self.work_repo
+        if self.workspace_root:
+            payload["workspaceRoot"] = self.workspace_root
+        payload["originalArtifactsRestored"] = True
+        payload["materializedArtifactRetained"] = self.retained
+        payload["materializedArtifactRestored"] = not self.retained
+        if self.retained:
+            payload["retainedPath"] = self.work_repo
+            if self.retained_reason:
+                payload["retainedReason"] = self.retained_reason
+            payload["cleanupGuidance"] = "remove retainedPath when proof capture is complete"
         return payload
 
 
