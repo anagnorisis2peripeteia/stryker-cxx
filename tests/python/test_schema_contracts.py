@@ -17,7 +17,7 @@ from stryker_cxx.engine import (
     _rejects_macro_candidate,
     _report_dict,
 )
-from stryker_cxx.cli import _adapter_commands, _checker_command
+from stryker_cxx.build_adapters import adapter_commands, checker_command
 from stryker_cxx.schema import (
     validate_mte,
     validate_report,
@@ -210,22 +210,22 @@ class TestContracts(unittest.TestCase):
         self.assertEqual(payload["provenance"]["upload"]["status"], "notAttempted")
 
     def test_build_system_adapter_commands(self) -> None:
-        cmake = _adapter_commands("cmake", "build", "all", None, "Foo.*")
+        cmake = adapter_commands("cmake", "build", "all", None, "Foo.*")
         self.assertIn("cmake --build 'build' --target 'all'", cmake["build"])
         self.assertIn("ctest --test-dir 'build'", cmake["test"])
         self.assertIn("--tests-regex 'Foo.*'", cmake["test"])
 
-        bazel = _adapter_commands("bazel", None, "//lib:target", "//lib:test", None)
+        bazel = adapter_commands("bazel", None, "//lib:target", "//lib:test", None)
         self.assertEqual(bazel["build"], "bazel build '//lib:target'")
         self.assertEqual(bazel["test"], "bazel test '//lib:test'")
 
-        gtest = _adapter_commands(None, None, None, None, "Math.*", "gtest", "./math_tests", None)
+        gtest = adapter_commands(None, None, None, None, "Math.*", "gtest", "./math_tests", None)
         self.assertEqual(gtest["test"], "'./math_tests' --gtest_filter='Math.*'")
 
-        catch2 = _adapter_commands("ninja", "build", "all", None, "[fast]", "catch2", "./catch_tests", None)
+        catch2 = adapter_commands("ninja", "build", "all", None, "[fast]", "catch2", "./catch_tests", None)
         self.assertEqual(catch2["test"], "'./catch_tests' --reporter compact '[fast]'")
 
-        xctest = _adapter_commands(
+        xctest = adapter_commands(
             None,
             None,
             None,
@@ -249,12 +249,12 @@ class TestContracts(unittest.TestCase):
         )
 
     def test_checker_adapter_commands(self) -> None:
-        clang_tidy = _checker_command(
+        clang_tidy = checker_command(
             "clang-tidy",
             "--checks=-*,bugprone-*",
             "src/foo.cpp,src/bar.cpp",
         )
-        cppcheck = _checker_command(
+        cppcheck = checker_command(
             "cppcheck",
             "--enable=warning,style",
             "src/foo.cpp",
@@ -295,7 +295,7 @@ class TestContracts(unittest.TestCase):
             binary.write_text("#!/bin/sh\nexit 0\n")
             binary.chmod(0o755)
 
-            gtest = _adapter_commands(None, "build", None, None, "Math.*", "gtest", None, None, str(repo))
+            gtest = adapter_commands(None, "build", None, None, "Math.*", "gtest", None, None, str(repo))
 
             self.assertEqual(gtest["test"], f"'{binary}' --gtest_filter='Math.*'")
 
