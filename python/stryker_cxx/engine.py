@@ -9,7 +9,6 @@ added report modes and run-time metadata to support Stryker-level workflows.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import hashlib
 import html as html_lib
 import json
@@ -37,6 +36,10 @@ from .schema import (
 )
 from .payload_contract import native_to_mte_status
 from .project_analysis import analyze_project
+from .mutation_artifacts import (
+    materialize_mutation_artifact,
+    mutation_artifact_metadata,
+)
 
 # Token-level mutators.
 MUTATORS: dict[str, list[tuple[str, str]]] = {
@@ -3855,6 +3858,7 @@ def _report_dict(rep: Report, repo: str | None = None, base: str | None = None,
         "coverage": rep.coverage or {"enabled": False, "provider": "none"},
         "baseline": rep.baseline or {"enabled": False},
         "projectAnalysis": execution.get("projectAnalysis", {}),
+        "mutationArtifact": execution.get("mutationArtifact", {}),
         "lifecycle": _lifecycle_metadata(rep, normalized_mutants),
         "config": rep.config or {"path": None, "hash": None, "effective": {}},
         "commands": {
@@ -3901,6 +3905,7 @@ def _lifecycle_metadata(rep: Report, mutants: list[dict[str, Any]]) -> dict[str,
         if isinstance(mut.get("run"), dict) and mut.get("run", {}).get("worktree")
     ]
     project_analysis = rep.execution.get("projectAnalysis")
+    mutation_artifact = rep.execution.get("mutationArtifact")
     project_analysis_detail = (
         {
             "confidence": project_analysis.get("confidence"),
@@ -3916,6 +3921,20 @@ def _lifecycle_metadata(rep: Report, mutants: list[dict[str, Any]]) -> dict[str,
         else {
             "targetFiles": len(rep.target_files),
             "source": "explicit-or-file-discovery",
+        }
+    )
+    mutation_artifact_detail = (
+        {
+            "artifactMode": mutation_artifact.get("mode"),
+            "implementation": mutation_artifact.get("implementation"),
+            "workspacePerMutant": mutation_artifact.get("workspacePerMutant"),
+            "parallelSafe": mutation_artifact.get("parallelSafe"),
+            "supportsCompiledReplacement": mutation_artifact.get("supportsCompiledReplacement"),
+        }
+        if isinstance(mutation_artifact, dict) and mutation_artifact
+        else {
+            "artifactMode": "source-overlay",
+            "implementation": rep.execution.get("worktreeMode", "inplace"),
         }
     )
     phases = [
@@ -3941,8 +3960,7 @@ def _lifecycle_metadata(rep: Report, mutants: list[dict[str, Any]]) -> dict[str,
         _phase(
             "mutationArtifact",
             "sourceLevel",
-            artifactMode="source-rewrite",
-            worktreeMode=rep.execution.get("worktreeMode", "inplace"),
+            **mutation_artifact_detail,
         ),
         _phase(
             "compilePruning",
@@ -4554,13 +4572,15 @@ def _run_mutant_once(
     _record_environment_policy(mut.run, env_overrides, env_inherit, env_block)
     start_ms = time.perf_counter()
     retain_state = {"retain": False}
-    with _workspace(
+    with materialize_mutation_artifact(
         repo,
         worktree_mode,
         worker_tmp_dir=worker_tmp_dir,
         retain_state=retain_state,
         worker_label=worker_label,
-    ) as work_repo:
+    ) as artifact:
+        work_repo = artifact.work_repo
+        mut.run["mutationArtifact"] = artifact.run_metadata()
         original = apply_mutant(work_repo, mut)
         build_log = os.path.join(artifact_root, f"build_{_safe_basename(mut.id)}.log")
         check_log = os.path.join(artifact_root, f"check_{_safe_basename(mut.id)}.log")
@@ -4654,12 +4674,14 @@ def _run_mutant_once(
             )
             if retain_current:
                 retain_state["retain"] = True
+                artifact.mark_retained(mut.status)
                 mut.run["retainedWorktree"] = work_repo
                 mut.run["retainedWorktreeReason"] = mut.status
                 if worker_label:
                     mut.run["retainedWorktreeLabel"] = worker_label
             else:
                 restore(work_repo, mut.file, mut.line, original)
+            mut.run["mutationArtifact"] = artifact.run_metadata()
             mut.durationMs = int((time.perf_counter() - start_ms) * 1000)
     return mut
 
@@ -4771,13 +4793,15 @@ def _run_batch_probe(
     start_ms = time.perf_counter()
     result: tuple[str, str, int, dict[str, Any]] | None = None
     retain_state = {"retain": False}
-    with _workspace(
+    with materialize_mutation_artifact(
         repo,
         worktree_mode,
         worker_tmp_dir=worker_tmp_dir,
         retain_state=retain_state,
         worker_label=worker_label,
-    ) as work_repo:
+    ) as artifact:
+        work_repo = artifact.work_repo
+        run["mutationArtifact"] = artifact.run_metadata()
         originals: list[tuple[Mutant, str]] = []
         build_log = os.path.join(artifact_root, f"batch_build_{batch_id}.log")
         check_log = os.path.join(artifact_root, f"batch_check_{batch_id}.log")
@@ -4889,6 +4913,7 @@ def _run_batch_probe(
             )
             if retain_current:
                 retain_state["retain"] = True
+                artifact.mark_retained(status)
                 run["retainedWorktree"] = work_repo
                 run["retainedWorktreeReason"] = status
                 if worker_label:
@@ -4896,6 +4921,7 @@ def _run_batch_probe(
             else:
                 for mut, original in reversed(originals):
                     restore(work_repo, mut.file, mut.line, original)
+            run["mutationArtifact"] = artifact.run_metadata()
 
 
 def _run_batch_task(payload: tuple[Any, ...]) -> tuple[int, list[Mutant], str, str, int, dict[str, Any]]:
@@ -5235,6 +5261,15 @@ def main(argv: list[str] | None = None) -> int:
                 "redaction": _redaction_metadata(),
                 "network": "core-offline; explicit dashboard URLs and plugin commands may use network",
             },
+            "mutationArtifact": mutation_artifact_metadata(
+                args.worktree_mode,
+                worker_tmp_dir=args.worker_tmp_dir,
+                retain_worktrees=retain_worktrees,
+                retain_worktrees_for=_retain_status_names(retain_worktrees_for)
+                if retain_worktrees
+                else [],
+                worker_label=worker_label,
+            ),
         },
     )
     if args.effective_config_json:
@@ -5805,66 +5840,6 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     return 0
-
-
-def _workspace_is_retained(retain: bool, retain_state: dict[str, bool] | None) -> bool:
-    return retain or bool(retain_state and retain_state.get("retain"))
-
-
-@contextlib.contextmanager
-def _workspace(
-    repo: str,
-    mode: str,
-    worker_tmp_dir: str | None = None,
-    retain: bool = False,
-    retain_state: dict[str, bool] | None = None,
-    worker_label: str | None = None,
-):
-    if mode == "inplace":
-        yield repo
-        return
-
-    if worker_tmp_dir:
-        os.makedirs(worker_tmp_dir, exist_ok=True)
-    label_prefix = f"{_safe_worker_label(worker_label)}-" if _safe_worker_label(worker_label) else ""
-
-    if mode == "git-worktree":
-        if not os.path.isdir(os.path.join(repo, ".git")):
-            raise ValueError("git-worktree mode requires --repo to point at a git work tree")
-
-        workspace_root = tempfile.mkdtemp(prefix=f"stryker-cxx-worktree-{label_prefix}", dir=worker_tmp_dir)
-        workdir = os.path.join(workspace_root, "worktree")
-        try:
-            subprocess.run(
-                ["git", "-C", repo, "worktree", "add", "--detach", workdir, "HEAD"],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            yield workdir
-            if not _workspace_is_retained(retain, retain_state):
-                subprocess.run(
-                    ["git", "-C", repo, "worktree", "remove", "--force", workdir],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-        finally:
-            if not _workspace_is_retained(retain, retain_state):
-                shutil.rmtree(workspace_root, ignore_errors=True)
-        return
-
-    if mode == "copy":
-        workdir = tempfile.mkdtemp(prefix=f"stryker-cxx-copy-{label_prefix}", dir=worker_tmp_dir)
-        try:
-            shutil.copytree(repo, workdir, dirs_exist_ok=True, ignore=shutil.ignore_patterns(".git"))
-            yield workdir
-        finally:
-            if not _workspace_is_retained(retain, retain_state):
-                shutil.rmtree(workdir, ignore_errors=True)
-        return
-
-    raise ValueError(f"unsupported worktree mode: {mode}")
 
 
 if __name__ == "__main__":

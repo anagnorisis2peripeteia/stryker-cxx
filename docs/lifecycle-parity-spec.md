@@ -172,6 +172,9 @@ Acceptance criteria:
 
 ### Phase 3: mutation artifact interface
 
+Status: implemented for source-overlay materialization; compiled artifact
+replacement remains future work.
+
 Implementation work:
 
 - add a mutation artifact module that can materialize source overlays and later

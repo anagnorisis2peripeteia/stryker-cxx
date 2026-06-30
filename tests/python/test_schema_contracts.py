@@ -31,6 +31,10 @@ from stryker_cxx.payload_contract import (
     supported_native_statuses,
 )
 from stryker_cxx.project_analysis import analyze_project
+from stryker_cxx.mutation_artifacts import (
+    materialize_mutation_artifact,
+    mutation_artifact_metadata,
+)
 
 
 class TestContracts(unittest.TestCase):
@@ -96,6 +100,20 @@ class TestContracts(unittest.TestCase):
                         "environmentValues": True,
                         "secretAssignmentPatterns": True,
                         "replacement": "[REDACTED]",
+                    },
+                },
+                "mutationArtifact": {
+                    "schemaVersion": "stryker-cxx.mutation-artifact.v1",
+                    "mode": "source-overlay",
+                    "implementation": "copy",
+                    "workspacePerMutant": True,
+                    "parallelSafe": True,
+                    "supportsCompiledReplacement": False,
+                    "retainArtifacts": True,
+                    "retainArtifactsFor": ["SURVIVED", "TIMEOUT"],
+                    "sourceOverlay": {
+                        "strategy": "isolated-copy",
+                        "restoration": "discard-copy-or-retain",
                     },
                 },
             },
@@ -174,6 +192,9 @@ class TestContracts(unittest.TestCase):
         self.assertEqual(payload["execution"]["resourceIsolation"]["environmentBlockedKeys"], ["GITHUB_TOKEN"])
         self.assertTrue(payload["execution"]["resourceIsolation"]["redaction"]["enabled"])
         self.assertEqual(payload["execution"]["dashboard"]["retentionDays"], 14)
+        self.assertEqual(payload["mutationArtifact"]["schemaVersion"], "stryker-cxx.mutation-artifact.v1")
+        self.assertEqual(payload["mutationArtifact"]["mode"], "source-overlay")
+        self.assertEqual(payload["mutationArtifact"]["implementation"], "copy")
         self.assertEqual(payload["lifecycle"]["schemaVersion"], "stryker-cxx.lifecycle.v1")
         self.assertIn("projectAnalysis", payload["lifecycle"]["phaseOrder"])
         self.assertIn("coverageAnalysis", payload["lifecycle"]["phaseOrder"])
@@ -182,6 +203,8 @@ class TestContracts(unittest.TestCase):
             for phase in payload["lifecycle"]["phases"]
         }
         self.assertEqual(lifecycle_by_name["mutationArtifact"]["status"], "sourceLevel")
+        self.assertEqual(lifecycle_by_name["mutationArtifact"]["detail"]["artifactMode"], "source-overlay")
+        self.assertEqual(lifecycle_by_name["mutationArtifact"]["detail"]["implementation"], "copy")
         self.assertEqual(lifecycle_by_name["compilePruning"]["status"], "notSupported")
         self.assertEqual(payload["summary"]["byStatus"]["SURVIVED"], 1)
         self.assertEqual(payload["summary"]["byFile"]["src/foo.cpp"]["survived"], 1)
@@ -201,6 +224,48 @@ class TestContracts(unittest.TestCase):
         errors = validate_report(payload)
 
         self.assertTrue(any("lifecycle.phases[0].detail" in item for item in errors))
+
+    def test_report_validator_checks_mutation_artifact_shape_when_present(self) -> None:
+        payload = _report_dict(self._base_report())
+        payload["mutationArtifact"]["workspacePerMutant"] = "yes"
+
+        errors = validate_report(payload)
+
+        self.assertTrue(any("mutationArtifact.workspacePerMutant" in item for item in errors))
+
+    def test_mutation_artifact_metadata_describes_source_overlay(self) -> None:
+        metadata = mutation_artifact_metadata(
+            "git-worktree",
+            worker_tmp_dir="/tmp/stryker-cxx",
+            retain_worktrees=True,
+            retain_worktrees_for=["SURVIVED"],
+            worker_label="worker-1",
+        )
+
+        self.assertEqual(metadata["schemaVersion"], "stryker-cxx.mutation-artifact.v1")
+        self.assertEqual(metadata["mode"], "source-overlay")
+        self.assertEqual(metadata["implementation"], "git-worktree")
+        self.assertTrue(metadata["workspacePerMutant"])
+        self.assertEqual(metadata["sourceOverlay"]["strategy"], "isolated-git-worktree")
+
+    def test_mutation_artifact_materializes_inplace_and_copy_workspaces(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            repo = Path(root) / "repo"
+            repo.mkdir()
+            (repo / "sample.cpp").write_text("int main() { return 0; }\n")
+
+            with materialize_mutation_artifact(str(repo), "inplace") as artifact:
+                self.assertEqual(artifact.work_repo, str(repo))
+                self.assertEqual(artifact.run_metadata()["implementation"], "inplace")
+
+            copy_path = ""
+            with materialize_mutation_artifact(str(repo), "copy", worker_tmp_dir=root) as artifact:
+                copy_path = artifact.work_repo
+                self.assertNotEqual(copy_path, str(repo))
+                self.assertTrue((Path(copy_path) / "sample.cpp").exists())
+                self.assertEqual(artifact.run_metadata()["mode"], "source-overlay")
+
+            self.assertFalse(Path(copy_path).exists())
 
     def test_report_validator_accepts_project_analysis_metadata(self) -> None:
         rep = self._base_report()

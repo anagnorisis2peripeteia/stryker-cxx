@@ -86,6 +86,15 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(payload["projectAnalysis"]["schemaVersion"], "stryker-cxx.project-analysis.v1")
         self.assertEqual(payload["projectAnalysis"]["confidence"], "high")
         self.assertIn("sample.cpp", payload["projectAnalysis"]["targetFiles"])
+        self.assertEqual(payload["mutationArtifact"]["schemaVersion"], "stryker-cxx.mutation-artifact.v1")
+        self.assertEqual(payload["mutationArtifact"]["mode"], "source-overlay")
+        self.assertEqual(payload["mutationArtifact"]["implementation"], "inplace")
+        lifecycle_by_name = {
+            phase["name"]: phase
+            for phase in payload["lifecycle"]["phases"]
+        }
+        self.assertEqual(lifecycle_by_name["mutationArtifact"]["detail"]["artifactMode"], "source-overlay")
+        self.assertEqual(lifecycle_by_name["mutationArtifact"]["detail"]["implementation"], "inplace")
         self.assertEqual(payload["mutationTestingElements"]["schemaVersion"], "2.0")
         first = payload["mutationTestingElements"]["files"]["sample.cpp"]["mutants"][0]
         self.assertEqual(first["status"], "Survived")

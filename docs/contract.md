@@ -86,3 +86,26 @@ analysis performed before mutation execution:
 
 This metadata is descriptive. It does not yet replace explicit build and test
 commands, and unknown projects degrade to the user-supplied command flow.
+
+## Mutation artifact metadata
+
+Native reports may include an optional `mutationArtifact` object with
+`schemaVersion = "stryker-cxx.mutation-artifact.v1"`. It describes how mutants
+were materialized for the run:
+
+- `mode`, currently `source-overlay`;
+- `implementation`, one of the existing workspace implementations
+  (`inplace`, `copy`, or `git-worktree`);
+- `workspacePerMutant`, whether each mutant gets an isolated workspace;
+- `parallelSafe`, whether the materialization strategy is safe for parallel
+  execution;
+- `supportsCompiledReplacement`, currently `false` until compiled artifact
+  placement exists;
+- `sourceOverlay`, the strategy/restoration policy used by the source overlay;
+- `retainArtifacts` and `retainArtifactsFor`, the configured survivor/timeout
+  artifact-retention policy.
+
+Per-mutant native run records may also include `run.mutationArtifact` with the
+materialized workspace path and retained-artifact details. This is intentionally
+native-only metadata; the embedded Mutation Testing Elements projection remains
+stable and does not expose local workspace paths.

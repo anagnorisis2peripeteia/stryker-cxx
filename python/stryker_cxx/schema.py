@@ -351,6 +351,25 @@ def validate_report(payload: dict[str, Any]) -> list[str]:
             if commands is not None and not isinstance(commands, dict):
                 errors.append(_collect("projectAnalysis.commands", "expected object"))
 
+    mutation_artifact = payload.get("mutationArtifact")
+    if mutation_artifact is not None:
+        if not isinstance(mutation_artifact, dict):
+            errors.append(_collect("mutationArtifact", "expected object"))
+        else:
+            if "schemaVersion" in mutation_artifact and not isinstance(mutation_artifact.get("schemaVersion"), str):
+                errors.append(_collect("mutationArtifact.schemaVersion", "expected string"))
+            for key in ("mode", "implementation"):
+                if key in mutation_artifact and not isinstance(mutation_artifact.get(key), str):
+                    errors.append(_collect(f"mutationArtifact.{key}", "expected string"))
+            for key in ("workspacePerMutant", "parallelSafe", "supportsCompiledReplacement", "retainArtifacts"):
+                if key in mutation_artifact and not isinstance(mutation_artifact.get(key), bool):
+                    errors.append(_collect(f"mutationArtifact.{key}", "expected boolean"))
+            if "retainArtifactsFor" in mutation_artifact and not isinstance(mutation_artifact.get("retainArtifactsFor"), list):
+                errors.append(_collect("mutationArtifact.retainArtifactsFor", "expected array"))
+            source_overlay = mutation_artifact.get("sourceOverlay")
+            if source_overlay is not None and not isinstance(source_overlay, dict):
+                errors.append(_collect("mutationArtifact.sourceOverlay", "expected object"))
+
     lifecycle = payload.get("lifecycle")
     if lifecycle is not None:
         if not isinstance(lifecycle, dict):

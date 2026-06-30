@@ -156,6 +156,36 @@
         "commands": { "type": "object" }
       }
     },
+    "mutationArtifact": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": { "type": "string" },
+        "mode": { "type": "string" },
+        "implementation": { "type": "string" },
+        "workspacePerMutant": { "type": "boolean" },
+        "parallelSafe": { "type": "boolean" },
+        "supportsCompiledReplacement": { "type": "boolean" },
+        "workerTmpDir": { "type": "string" },
+        "workerLabel": { "type": "string" },
+        "retainArtifacts": { "type": "boolean" },
+        "retainArtifactsFor": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "sourceOverlay": {
+          "type": "object",
+          "properties": {
+            "strategy": { "type": "string" },
+            "restoration": { "type": "string" }
+          }
+        },
+        "workRepo": { "type": "string" },
+        "workspaceRoot": { "type": "string" },
+        "retained": { "type": "boolean" },
+        "retainedPath": { "type": "string" },
+        "retainedReason": { "type": "string" }
+      }
+    },
     "summary": {
       "type": "object",
       "required": ["byStatus", "byFile", "byMutator"],
