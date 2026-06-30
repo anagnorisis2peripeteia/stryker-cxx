@@ -40,3 +40,31 @@ The JS adapter accepts both:
 adapter summary score calculation. A mutant can become ignored through
 Stryker-style source comments or through native equivalent/noise suppression
 recorded under `execution.analysis.equivalentSuppression` in the wrapper report.
+
+## Lifecycle metadata
+
+Native `stryker-cxx.report.v1` reports may include an optional `lifecycle`
+object. The field is additive: historical reports without it remain valid.
+
+Current lifecycle metadata uses `schemaVersion = "stryker-cxx.lifecycle.v1"` and
+records:
+
+- `artifactModel`, currently `source-level`;
+- `phaseOrder`, the ordered lifecycle phase names;
+- `phases[]`, each with `name`, `status`, and optional `detail`.
+
+The current source-level runner emits these phases:
+
+- `initialization`
+- `projectAnalysis`
+- `mutationDiscovery`
+- `mutationArtifact`
+- `compilePruning`
+- `coverageAnalysis`
+- `testScheduling`
+- `artifactRestoration`
+- `reporting`
+
+`compilePruning` is currently reported as `notSupported`; compile and checker
+failures still appear as native mutant statuses until the lifecycle parity
+roadmap adds a pruning loop.

@@ -332,6 +332,37 @@ def validate_report(payload: dict[str, Any]) -> list[str]:
             if not isinstance(reasons, dict) or not all(isinstance(k, str) and isinstance(v, int) for k, v in reasons.items()):
                 errors.append(_collect("baseline.missReasons", "expected string-to-integer map"))
 
+    lifecycle = payload.get("lifecycle")
+    if lifecycle is not None:
+        if not isinstance(lifecycle, dict):
+            errors.append(_collect("lifecycle", "expected object"))
+        else:
+            if "schemaVersion" in lifecycle and not isinstance(lifecycle.get("schemaVersion"), str):
+                errors.append(_collect("lifecycle.schemaVersion", "expected string"))
+            if "artifactModel" in lifecycle and not isinstance(lifecycle.get("artifactModel"), str):
+                errors.append(_collect("lifecycle.artifactModel", "expected string"))
+            phase_order = lifecycle.get("phaseOrder")
+            if phase_order is not None and (
+                not isinstance(phase_order, list)
+                or not all(isinstance(item, str) for item in phase_order)
+            ):
+                errors.append(_collect("lifecycle.phaseOrder", "expected string array"))
+            phases = lifecycle.get("phases")
+            if phases is not None:
+                if not isinstance(phases, list):
+                    errors.append(_collect("lifecycle.phases", "expected array"))
+                else:
+                    for idx, phase in enumerate(phases):
+                        if not isinstance(phase, dict):
+                            errors.append(_collect(f"lifecycle.phases[{idx}]", "expected object"))
+                            continue
+                        if not isinstance(phase.get("name"), str):
+                            errors.append(_collect(f"lifecycle.phases[{idx}].name", "expected string"))
+                        if not isinstance(phase.get("status"), str):
+                            errors.append(_collect(f"lifecycle.phases[{idx}].status", "expected string"))
+                        if "detail" in phase and not isinstance(phase.get("detail"), dict):
+                            errors.append(_collect(f"lifecycle.phases[{idx}].detail", "expected object"))
+
     config = payload.get("config")
     if not isinstance(config, dict):
         errors.append(_collect("config", "expected object"))

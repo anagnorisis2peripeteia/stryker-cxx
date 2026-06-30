@@ -173,10 +173,33 @@ class TestContracts(unittest.TestCase):
         self.assertEqual(payload["execution"]["resourceIsolation"]["environmentBlockedKeys"], ["GITHUB_TOKEN"])
         self.assertTrue(payload["execution"]["resourceIsolation"]["redaction"]["enabled"])
         self.assertEqual(payload["execution"]["dashboard"]["retentionDays"], 14)
+        self.assertEqual(payload["lifecycle"]["schemaVersion"], "stryker-cxx.lifecycle.v1")
+        self.assertIn("projectAnalysis", payload["lifecycle"]["phaseOrder"])
+        self.assertIn("coverageAnalysis", payload["lifecycle"]["phaseOrder"])
+        lifecycle_by_name = {
+            phase["name"]: phase
+            for phase in payload["lifecycle"]["phases"]
+        }
+        self.assertEqual(lifecycle_by_name["mutationArtifact"]["status"], "sourceLevel")
+        self.assertEqual(lifecycle_by_name["compilePruning"]["status"], "notSupported")
         self.assertEqual(payload["summary"]["byStatus"]["SURVIVED"], 1)
         self.assertEqual(payload["summary"]["byFile"]["src/foo.cpp"]["survived"], 1)
         self.assertEqual(payload["summary"]["byMutator"]["ConditionalBoundary"]["killed"], 1)
         self.assertEqual(validate_report(payload), [])
+
+    def test_report_validator_accepts_legacy_payload_without_lifecycle(self) -> None:
+        payload = _report_dict(self._base_report())
+        payload.pop("lifecycle")
+
+        self.assertEqual(validate_report(payload), [])
+
+    def test_report_validator_checks_lifecycle_shape_when_present(self) -> None:
+        payload = _report_dict(self._base_report())
+        payload["lifecycle"]["phases"][0]["detail"] = "not an object"
+
+        errors = validate_report(payload)
+
+        self.assertTrue(any("lifecycle.phases[0].detail" in item for item in errors))
 
     def test_report_redacts_secret_assignments(self) -> None:
         rep = self._base_report()

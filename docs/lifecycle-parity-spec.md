@@ -135,7 +135,7 @@ Required behavior:
 
 ### Phase 1: lifecycle documentation and contract metadata
 
-Status: this spec defines the target.
+Status: implemented for additive report metadata.
 
 Implementation work:
 

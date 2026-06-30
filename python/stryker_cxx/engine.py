@@ -3853,6 +3853,7 @@ def _report_dict(rep: Report, repo: str | None = None, base: str | None = None,
         "dryRun": rep.dryRun or {"status": "NOT_RUN"},
         "coverage": rep.coverage or {"enabled": False, "provider": "none"},
         "baseline": rep.baseline or {"enabled": False},
+        "lifecycle": _lifecycle_metadata(rep, normalized_mutants),
         "config": rep.config or {"path": None, "hash": None, "effective": {}},
         "commands": {
             "build": rep.buildCommand,
@@ -3873,6 +3874,93 @@ def _report_dict(rep: Report, repo: str | None = None, base: str | None = None,
         "ignored_count": rep.ignored,
     }
     return _redact_report_artifact(payload)
+
+
+def _phase(name: str, status: str, **detail: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {"name": name, "status": status}
+    if detail:
+        payload["detail"] = detail
+    return payload
+
+
+def _lifecycle_metadata(rep: Report, mutants: list[dict[str, Any]]) -> dict[str, Any]:
+    coverage = rep.coverage or {"enabled": False, "provider": "none"}
+    batching = rep.execution.get("batching", {})
+    resource = rep.execution.get("resourceIsolation", {})
+    lifecycle = rep.execution.get("lifecycle", {})
+    if isinstance(lifecycle, dict) and lifecycle:
+        return lifecycle
+
+    coverage_status = "completed" if coverage.get("enabled") else "notConfigured"
+    scheduler = "batched" if batching.get("enabled") else "perMutant"
+    retained_paths = [
+        mut.get("run", {}).get("worktree")
+        for mut in mutants
+        if isinstance(mut.get("run"), dict) and mut.get("run", {}).get("worktree")
+    ]
+    phases = [
+        _phase(
+            "initialization",
+            "completed",
+            mode=rep.execution.get("mode", "token"),
+            worktreeMode=rep.execution.get("worktreeMode", "inplace"),
+        ),
+        _phase(
+            "projectAnalysis",
+            "partial",
+            targetFiles=len(rep.target_files),
+            source="explicit-or-file-discovery",
+        ),
+        _phase(
+            "mutationDiscovery",
+            "completed",
+            discoveredMutants=rep.total,
+            engine=rep.execution.get("analysis", {}).get("engine", rep.execution.get("mode", "token"))
+            if isinstance(rep.execution.get("analysis"), dict)
+            else rep.execution.get("mode", "token"),
+        ),
+        _phase(
+            "mutationArtifact",
+            "sourceLevel",
+            artifactMode="source-rewrite",
+            worktreeMode=rep.execution.get("worktreeMode", "inplace"),
+        ),
+        _phase(
+            "compilePruning",
+            "notSupported",
+            buildErrors=rep.buildError,
+            checkErrors=rep.checkErrors,
+            prunedMutants=0,
+        ),
+        _phase(
+            "coverageAnalysis",
+            coverage_status,
+            provider=coverage.get("provider", "none"),
+            coveredMutants=coverage.get("coveredMutants", 0),
+            noCoverageMutants=coverage.get("noCoverageMutants", 0),
+            testSelectedMutants=coverage.get("testSelectedMutants", 0),
+        ),
+        _phase(
+            "testScheduling",
+            "completed",
+            scheduler=scheduler,
+            batches=batching.get("batches", 0) if isinstance(batching, dict) else 0,
+            splitBatches=batching.get("splitBatches", 0) if isinstance(batching, dict) else 0,
+        ),
+        _phase(
+            "artifactRestoration",
+            "sourceLevel",
+            retainedWorktrees=bool(resource.get("retainWorktrees")) if isinstance(resource, dict) else False,
+            retainedPaths=[str(path) for path in retained_paths if path],
+        ),
+        _phase("reporting", "completed", nativeReport=True, mutationTestingElements=True),
+    ]
+    return {
+        "schemaVersion": "stryker-cxx.lifecycle.v1",
+        "artifactModel": "source-level",
+        "phaseOrder": [phase["name"] for phase in phases],
+        "phases": phases,
+    }
 
 
 def _new_summary_bucket() -> dict[str, Any]:
