@@ -22,6 +22,17 @@ npm pack --dry-run
 git diff --check
 ```
 
+Maintainers with Cameron's local review tooling can also run the optional
+cheap-then-strong review helper:
+
+```bash
+scripts/review-cascade.sh
+```
+
+This is a maintainer gate helper, not part of the public `stryker-cxx` CLI or
+npm package. Configure it with `STRYKER_CXX_REVIEW_BASE`,
+`STRYKER_CXX_REVIEW_TARGET_REPO`, and `STRYKER_CXX_REVIEW_CEILING` when needed.
+
 Run the optional clang fixture locally:
 
 ```bash

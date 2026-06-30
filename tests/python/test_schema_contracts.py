@@ -24,6 +24,12 @@ from stryker_cxx.schema import (
     require_mte,
     require_report,
 )
+from stryker_cxx.payload_contract import (
+    extract_mte_payload,
+    native_to_mte_status,
+    supported_mte_statuses,
+    supported_native_statuses,
+)
 
 
 class TestContracts(unittest.TestCase):
@@ -348,6 +354,30 @@ class TestContracts(unittest.TestCase):
         flat = payload["files"]["src/foo.cpp"]["mutants"]
         self.assertEqual(flat[0]["status"], "Killed")
         self.assertEqual(flat[1]["status"], "NoCoverage")
+
+    def test_payload_contract_extracts_direct_and_wrapped_mte(self) -> None:
+        rep = self._base_report()
+        payload = _mutation_testing_elements(rep)
+        self.assertIs(extract_mte_payload(payload), payload)
+
+        nested = dict(payload)
+        nested.pop("schemaVersion")
+        wrapped = {
+            "schemaVersion": "stryker-cxx.report.v1",
+            "mutationTestingElements": nested,
+        }
+        extracted = extract_mte_payload(wrapped)
+
+        self.assertEqual(extracted["schemaVersion"], "2.0")
+        self.assertEqual(validate_mte(extracted), [])
+
+    def test_payload_contract_owns_status_projection(self) -> None:
+        self.assertEqual(native_to_mte_status("KILLED"), "Killed")
+        self.assertEqual(native_to_mte_status("BUILD_ERROR"), "NoCoverage")
+        self.assertEqual(native_to_mte_status("CHECK_ERROR"), "RuntimeError")
+        self.assertEqual(native_to_mte_status("unknown"), "RuntimeError")
+        self.assertIn("NO_COVERAGE", supported_native_statuses())
+        self.assertIn("NoCoverage", supported_mte_statuses())
 
     def test_ignored_mutants_are_valid_native_and_mte_statuses(self) -> None:
         rep = Report(

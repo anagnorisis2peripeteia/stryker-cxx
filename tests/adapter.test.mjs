@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { assertMteReport, summarizeReport, toPlainMutationList } from "../src/index.js";
+import {
+  assertMteReport,
+  isMteStatus,
+  normalizeMtePayload,
+  summarizeReport,
+  supportedMteStatuses,
+  toPlainMutationList,
+} from "../src/index.js";
 
 const sample = {
   schemaVersion: "2.0",
@@ -70,6 +77,32 @@ test("valid stryker-cxx wrapper parses via mutationTestingElements", () => {
   assert.equal(flat.length, 2);
   assert.equal(flat[0].status, "Killed");
   assert.equal(flat[1].status, "Survived");
+});
+
+test("payload contract normalizes legacy wrapped MTE without nested schema version", () => {
+  const nested = structuredClone(sample);
+  delete nested.schemaVersion;
+  const parsed = normalizeMtePayload({
+    schemaVersion: "stryker-cxx.report.v1",
+    mutationTestingElements: nested,
+  });
+
+  assert.equal(parsed.schemaVersion, "2.0");
+  assert.equal(parsed.files["src/foo.cpp"].mutants.length, 2);
+});
+
+test("payload contract owns the supported MTE status set", () => {
+  assert.deepEqual(supportedMteStatuses(), [
+    "Killed",
+    "Survived",
+    "NoCoverage",
+    "Timeout",
+    "Ignored",
+    "Pending",
+    "RuntimeError",
+  ]);
+  assert.equal(isMteStatus("Killed"), true);
+  assert.equal(isMteStatus("BUILD_ERROR"), false);
 });
 
 test("summarizes standard timeout and noCoverage statuses", () => {

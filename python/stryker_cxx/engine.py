@@ -35,6 +35,7 @@ from .schema import (
     require_mte,
     require_report,
 )
+from .payload_contract import native_to_mte_status
 
 # Token-level mutators.
 MUTATORS: dict[str, list[tuple[str, str]]] = {
@@ -3998,16 +3999,7 @@ def _mutation_testing_elements(rep: Report) -> dict:
 
 
 def _mte_status(status: str) -> str:
-    return {
-        "KILLED": "Killed",
-        "SURVIVED": "Survived",
-        "BUILD_ERROR": "NoCoverage",
-        "CHECK_ERROR": "RuntimeError",
-        "NO_COVERAGE": "NoCoverage",
-        "TIMEOUT": "Timeout",
-        "IGNORED": "Ignored",
-        "PENDING": "Pending",
-    }.get(status.upper(), "RuntimeError")
+    return native_to_mte_status(status)
 
 
 def _format_markdown(rep: Report) -> str:

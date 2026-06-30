@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
-from typing import Any, Iterable
+from typing import Any
 
-REPORT_SCHEMA_VERSION = "stryker-cxx.report.v1"
-MTE_SCHEMA_VERSION = "2.0"
-TOOL_VERSION = "0.1.0"
+from .payload_contract import (
+    MTE_SCHEMA_VERSION,
+    REPORT_SCHEMA_VERSION,
+    TOOL_VERSION,
+    is_mte_status,
+    is_native_status,
+    supported_mte_statuses,
+    supported_native_statuses,
+)
 
 
 def _expect(obj: Any, key: str, kind: type | tuple[type, ...] | None = None, *, require: bool = True) -> bool:
@@ -408,17 +414,7 @@ def validate_mte(payload: dict[str, Any]) -> list[str]:
 
 
 def validate_mutant_status(status: str) -> bool:
-    return str(status) in {
-        "KILLED",
-        "SURVIVED",
-        "BUILD_ERROR",
-        "CHECK_ERROR",
-        "NO_COVERAGE",
-        "TIMEOUT",
-        "IGNORED",
-        "PENDING",
-        "RUNTIME_ERROR",
-    }
+    return is_native_status(status)
 
 
 def _validate_mutant(mut: Any, errors: list[str], *, prefix: str) -> bool:
@@ -440,17 +436,7 @@ def _validate_mutant(mut: Any, errors: list[str], *, prefix: str) -> bool:
     if "column" not in mut and "col" in mut:
         mut["column"] = mut["col"]
 
-    if mut.get("status") and str(mut.get("status")).upper() not in {
-        "KILLED",
-        "SURVIVED",
-        "BUILD_ERROR",
-        "CHECK_ERROR",
-        "NO_COVERAGE",
-        "TIMEOUT",
-        "IGNORED",
-        "PENDING",
-        "RUNTIME_ERROR",
-    }:
+    if mut.get("status") and not is_native_status(str(mut.get("status")).upper()):
         errors.append(_collect(f"{prefix}.status", f"unexpected status {mut.get('status')!r}"))
     return True
 
@@ -465,15 +451,7 @@ def _validate_mte_mutant(mut: Any, errors: list[str], *, prefix: str) -> bool:
             errors.append(_collect(f"{prefix}.{key}", "expected string"))
 
     status = mut.get("status")
-    if status and str(status) not in {
-        "Killed",
-        "Survived",
-        "NoCoverage",
-        "Timeout",
-        "Ignored",
-        "Pending",
-        "RuntimeError",
-    }:
+    if status and not is_mte_status(status):
         errors.append(_collect(f"{prefix}.status", f"unexpected status {status!r}"))
 
     for side in ("start", "end"):
@@ -499,29 +477,3 @@ def require_mte(payload: dict[str, Any]) -> None:
     errors = validate_mte(payload)
     if errors:
         raise ValueError("invalid mutation-testing-elements payload:\n" + "\n".join(errors))
-
-
-def supported_mte_statuses() -> Iterable[str]:
-    return (
-        "Killed",
-        "Survived",
-        "NoCoverage",
-        "Timeout",
-        "Ignored",
-        "Pending",
-        "RuntimeError",
-    )
-
-
-def supported_native_statuses() -> Iterable[str]:
-    return (
-        "KILLED",
-        "SURVIVED",
-        "BUILD_ERROR",
-        "CHECK_ERROR",
-        "NO_COVERAGE",
-        "TIMEOUT",
-        "IGNORED",
-        "PENDING",
-        "RUNTIME_ERROR",
-    )
