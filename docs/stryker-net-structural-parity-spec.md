@@ -45,14 +45,20 @@ scratch source, build a mutated artifact in scratch space, swap the linked
 artifact into the original build/test location, run tests against it, and
 restore the original artifact by hash. `compiled-object` additionally records
 the object produced for each mutated translation unit from CMake's compile
-database.
+database. Make/Ninja/Meson/Bazel object paths are supported when the caller
+names the linked artifact with `--artifact-path` and the build emits
+compile-database entries proving the mutated source-to-object path. Non-CMake
+library paths are supported only when the caller can name or prove the original artifact:
+Make/Ninja/Meson use `lib<target>` discovery, and Bazel/Xcode require
+`--artifact-path`.
 
 The structural gap remains:
 
 - source-overlay is still the default compatibility backend;
 - compiled artifact execution is CMake/CTest-first;
-- compiled artifact batching is implemented for local single-worker sessions,
-  but parallel compiled workers are still disabled;
+- compiled artifact batching supports parallel scratch build/check workers when
+  `--batch-mutants --jobs > 1` is selected, but swap/test/restore still serialize
+  per original artifact through placement locks;
 - full build graph discovery beyond the CMake path is incomplete.
 
 ## Target architecture
@@ -293,12 +299,20 @@ Acceptance:
 ### Phase 6: adapters beyond CMake/Ninja
 
 - Keep source-overlay command adapters for Ninja, Make, Meson, Bazel, and Xcode.
-- Keep compiled-artifact execution CMake/CTest-only until non-CMake adapters can
-  prove source-to-object-to-linked-artifact ownership.
-- Fail unsupported compiled-artifact adapters in preflight with clear
-  diagnostics.
-- Add Make/Meson/Bazel/Xcode compiled artifact adapters only when their build
-  graph discovery can satisfy the artifact ownership contract.
+- Keep `compiled-executable` support for CMake/CTest and simple
+  Make/Ninja/Meson/Bazel/Xcode executable targets when the caller supplies an
+  explicit target and original artifact path.
+- Keep `compiled-library` support for CMake/CTest library targets and explicit
+  Make/Ninja/Meson library targets when an original `lib<target>` artifact
+  exists and can be restored by hash. Support Bazel/Xcode library targets only
+  when `--artifact-path` names the original library artifact.
+- Keep `compiled-object` support for CMake/CTest and explicit
+  Make/Ninja/Meson/Bazel targets when `--artifact-path` names the linked
+  artifact and compile-database entries prove source-to-object ownership.
+- Fail unsupported compiled artifact adapter/backend combinations in preflight
+  with clear diagnostics.
+- Add Xcode object artifact adapters only when its build graph discovery can
+  satisfy the source-to-object-to-linked-artifact ownership contract.
 
 Acceptance:
 

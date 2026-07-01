@@ -10,6 +10,7 @@ thresholds:
 execution:
   buildSystem: cmake
   buildDir: build
+  artifactPath: ""
   xcodeWorkspace: Example.xcworkspace
   xcodeScheme: ExampleTests
   xcodeConfiguration: Debug
@@ -20,7 +21,10 @@ execution:
   xctestDestination: "platform=iOS Simulator,name=iPhone 15"
   xctestOnlyTesting: ["MathFixtureTests/testAdd"]
   xctestSkipTesting: ["MathFixtureTests/testSlow"]
+  dashboardUploadRetries: 1
+  dashboardUploadRetryDelayMs: 0
   mode: token
+  executionMode: source-overlay
   worktreeMode: copy
   jobs: 1
   retainWorktreesFor: ["SURVIVED", "TIMEOUT"]

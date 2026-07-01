@@ -31,6 +31,7 @@ SENSITIVE_KEY_RE = re.compile(
     r"ACCESS_?KEY|PRIVATE_?KEY|AUTH|BEARER)($|_)",
     re.IGNORECASE,
 )
+EXECUTION_MODES = {"source-overlay", "mutant-switch"}
 SHELL_ASSIGNMENT_RE = re.compile(
     r"(?P<prefix>(^|[\s;])(?:export\s+)?)"
     r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)="
@@ -55,10 +56,12 @@ thresholds:
   break: 0.6
 execution:
   mode: token
+  executionMode: source-overlay
   equivalentSuppression: conservative
   buildSystem: cmake
   buildDir: build
   buildTarget: ""
+  artifactPath: ""
   xcodeWorkspace: ""
   xcodeProject: ""
   xcodeScheme: ""
@@ -108,6 +111,9 @@ execution:
   dashboardBuildUrl: ""
   dashboardAuthTokenEnv: ""
   dashboardAuthHeader: "Authorization"
+  dashboardUploadRetries: 0
+  dashboardUploadRetryDelayMs: 1000
+  distributionManifest: ""
 report:
   failOnEmpty: true
 """
@@ -275,6 +281,7 @@ CONFIG_ALLOWED_NESTED = {
         "artifactDir",
         "artifactBackend",
         "artifactFallback",
+        "artifactPath",
         "retainWorktrees",
         "retainWorktreesFor",
         "retainedWorktreeTtlHours",
@@ -284,6 +291,7 @@ CONFIG_ALLOWED_NESTED = {
         "envInherit",
         "envBlock",
         "mode",
+        "executionMode",
         "jobs",
         "worktreeMode",
         "workTreeMode",
@@ -329,6 +337,9 @@ CONFIG_ALLOWED_NESTED = {
         "dashboardBuildUrl",
         "dashboardAuthTokenEnv",
         "dashboardAuthHeader",
+        "dashboardUploadRetries",
+        "dashboardUploadRetryDelayMs",
+        "distributionManifest",
         "batchMutants",
         "batchSize",
         "incremental",
@@ -824,6 +835,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--build-system", choices=["cmake", "ctest", "ninja", "make", "meson", "bazel", "xcodebuild"], default=None)
     run.add_argument("--build-dir", default=None)
     run.add_argument("--build-target", default=None)
+    run.add_argument("--artifact-path", default=None, dest="artifact_path")
     run.add_argument("--xcode-workspace", default=None, dest="xcode_workspace")
     run.add_argument("--xcode-project", default=None, dest="xcode_project")
     run.add_argument("--xcode-scheme", default=None, dest="xcode_scheme")
@@ -859,6 +871,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--output-format", choices=["legacy", "stryker-cxx"], default="stryker-cxx")
     run.add_argument("--format", choices=["json", "markdown", "html", "sarif", "github-annotations", "mutation-testing-elements"], default="json")
     run.add_argument("--mode", choices=["token", "clang", "clang-ast"], default=None)
+    run.add_argument("--execution-mode", choices=sorted(EXECUTION_MODES), default=None, dest="execution_mode")
     run.add_argument("--equivalent-suppression", choices=["off", "conservative", "aggressive"], default=None, dest="equivalent_suppression")
     run.add_argument("--jobs", type=int, default=None, help="Parallel mutant execution with isolated worktrees.")
     run.add_argument("--batch-mutants", action="store_true", dest="batch_mutants")
@@ -905,6 +918,9 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="dashboard_auth_token_env",
     )
     run.add_argument("--dashboard-auth-header", default=None, dest="dashboard_auth_header")
+    run.add_argument("--dashboard-upload-retries", type=int, default=None, dest="dashboard_upload_retries")
+    run.add_argument("--dashboard-upload-retry-delay-ms", type=int, default=None, dest="dashboard_upload_retry_delay_ms")
+    run.add_argument("--distribution-manifest", default=None, dest="distribution_manifest")
     run.add_argument("--incremental", action="store_true")
     run.add_argument("--baseline-file", default=None, dest="baseline_file")
     run.add_argument("--baseline-max-age-days", type=int, default=None, dest="baseline_max_age_days")
@@ -957,6 +973,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_mutant.add_argument("--build-system", choices=["cmake", "ctest", "ninja", "make", "meson", "bazel", "xcodebuild"], default=None)
     run_mutant.add_argument("--build-dir", default=None)
     run_mutant.add_argument("--build-target", default=None)
+    run_mutant.add_argument("--artifact-path", default=None, dest="artifact_path")
     run_mutant.add_argument("--xcode-workspace", default=None, dest="xcode_workspace")
     run_mutant.add_argument("--xcode-project", default=None, dest="xcode_project")
     run_mutant.add_argument("--xcode-scheme", default=None, dest="xcode_scheme")
@@ -1021,6 +1038,9 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="dashboard_auth_token_env",
     )
     run_mutant.add_argument("--dashboard-auth-header", default=None, dest="dashboard_auth_header")
+    run_mutant.add_argument("--dashboard-upload-retries", type=int, default=None, dest="dashboard_upload_retries")
+    run_mutant.add_argument("--dashboard-upload-retry-delay-ms", type=int, default=None, dest="dashboard_upload_retry_delay_ms")
+    run_mutant.add_argument("--distribution-manifest", default=None, dest="distribution_manifest")
     run_mutant.add_argument("--incremental", action="store_true")
     run_mutant.add_argument("--baseline-file", default=None, dest="baseline_file")
     run_mutant.add_argument("--baseline-max-age-days", type=int, default=None, dest="baseline_max_age_days")
@@ -1048,6 +1068,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_mutant.add_argument("--threshold-low", type=float, default=None, dest="threshold_low")
     run_mutant.add_argument("--threshold-break", type=float, default=None, dest="threshold_break")
     run_mutant.add_argument("--mode", choices=["token", "clang", "clang-ast"], default=None)
+    run_mutant.add_argument("--execution-mode", choices=sorted(EXECUTION_MODES), default=None, dest="execution_mode")
     run_mutant.add_argument("--equivalent-suppression", choices=["off", "conservative", "aggressive"], default=None, dest="equivalent_suppression")
     run_mutant.add_argument("--artifact-backend", choices=["source-overlay", "compiled-executable", "compiled-library", "compiled-object"], default=None, dest="artifact_backend")
     run_mutant.add_argument("--artifact-fallback", choices=["none", "source-overlay"], default=None, dest="artifact_fallback")
@@ -1269,6 +1290,7 @@ def _resolve_defaults(args: argparse.Namespace) -> dict[str, Any]:
     build_system = getattr(args, "build_system", None) or execution.get("buildSystem")
     build_dir = getattr(args, "build_dir", None) or execution.get("buildDir")
     build_target = getattr(args, "build_target", None) or execution.get("buildTarget")
+    artifact_path = getattr(args, "artifact_path", None) or execution.get("artifactPath")
     xcode_workspace = getattr(args, "xcode_workspace", None) or execution.get("xcodeWorkspace")
     xcode_project = getattr(args, "xcode_project", None) or execution.get("xcodeProject")
     xcode_scheme = getattr(args, "xcode_scheme", None) or execution.get("xcodeScheme")
@@ -1424,6 +1446,21 @@ def _resolve_defaults(args: argparse.Namespace) -> dict[str, Any]:
             getattr(args, "dashboard_auth_header", None)
             or execution.get("dashboardAuthHeader", "Authorization")
         ),
+        "dashboard_upload_retries": (
+            getattr(args, "dashboard_upload_retries", None)
+            if getattr(args, "dashboard_upload_retries", None) is not None
+            else execution.get("dashboardUploadRetries", 0)
+        ),
+        "dashboard_upload_retry_delay_ms": (
+            getattr(args, "dashboard_upload_retry_delay_ms", None)
+            if getattr(args, "dashboard_upload_retry_delay_ms", None) is not None
+            else execution.get("dashboardUploadRetryDelayMs", 1000)
+        ),
+        "distribution_manifest": (
+            getattr(args, "distribution_manifest", None)
+            or execution.get("distributionManifest")
+            or cfg.get("distributionManifest")
+        ),
         "incremental": bool(getattr(args, "incremental", False) or execution.get("incremental", False)),
         "baseline_file": getattr(args, "baseline_file", None) or execution.get("baselineFile") or cfg.get("baselineFile"),
         "baseline_max_age_days": (
@@ -1453,6 +1490,11 @@ def _resolve_defaults(args: argparse.Namespace) -> dict[str, Any]:
         "env_block": _coerce_list(getattr(args, "env_block", None))
         or _coerce_list(execution.get("envBlock")),
         "mode": getattr(args, "mode", None) if getattr(args, "mode", None) is not None else execution.get("mode", "token"),
+        "execution_mode": (
+            getattr(args, "execution_mode", None)
+            if getattr(args, "execution_mode", None) is not None
+            else execution.get("executionMode", "source-overlay")
+        ),
         "equivalent_suppression": (
             getattr(args, "equivalent_suppression", None)
             or execution.get("equivalentSuppression", "conservative")
@@ -1476,6 +1518,7 @@ def _resolve_defaults(args: argparse.Namespace) -> dict[str, Any]:
             or mutation_artifact_cfg.get("fallback")
             or "none"
         ),
+        "artifact_path": artifact_path,
         "worktree_mode": (
             getattr(args, "worktree_mode", None)
             if getattr(args, "worktree_mode", None) is not None
@@ -1523,6 +1566,8 @@ def _resolve_defaults(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--timeout-factor must be >= 0")
     if defaults["timeout_constant_ms"] is not None and defaults["timeout_constant_ms"] < 0:
         raise ValueError("--timeout-constant-ms must be >= 0")
+    if defaults["execution_mode"] not in EXECUTION_MODES:
+        raise ValueError("--execution-mode must be one of: mutant-switch, source-overlay")
     if defaults["dry_run_only"] and defaults["skip_initial_test"]:
         raise ValueError("--dry-run-only cannot be combined with --skip-initial-test")
 
@@ -1633,6 +1678,8 @@ def _run(args: argparse.Namespace) -> int:
         legacy_args.extend(["--timeout-constant-ms", str(cfg["timeout_constant_ms"])])
     if cfg["mode"] is not None:
         legacy_args.extend(["--mode", str(cfg["mode"])])
+    if cfg["execution_mode"] is not None:
+        legacy_args.extend(["--execution-mode", str(cfg["execution_mode"])])
     if cfg["equivalent_suppression"]:
         legacy_args.extend(["--equivalent-suppression", str(cfg["equivalent_suppression"])])
     if cfg["jobs"] is not None:
@@ -1651,6 +1698,20 @@ def _run(args: argparse.Namespace) -> int:
         legacy_args.extend(["--build-dir", cfg["build_dir"]])
     if cfg["build_target"]:
         legacy_args.extend(["--build-target", cfg["build_target"]])
+    if cfg["artifact_path"]:
+        legacy_args.extend(["--artifact-path", cfg["artifact_path"]])
+    if cfg["xcode_workspace"]:
+        legacy_args.extend(["--xcode-workspace", cfg["xcode_workspace"]])
+    if cfg["xcode_project"]:
+        legacy_args.extend(["--xcode-project", cfg["xcode_project"]])
+    if cfg["xcode_scheme"]:
+        legacy_args.extend(["--xcode-scheme", cfg["xcode_scheme"]])
+    if cfg["xcode_configuration"]:
+        legacy_args.extend(["--xcode-configuration", cfg["xcode_configuration"]])
+    if cfg["xcode_sdk"]:
+        legacy_args.extend(["--xcode-sdk", cfg["xcode_sdk"]])
+    if cfg["xcode_destination"]:
+        legacy_args.extend(["--xcode-destination", cfg["xcode_destination"]])
     if cfg["test_binary"]:
         legacy_args.extend(["--test-binary", cfg["test_binary"]])
     if cfg["shard_index"] is not None:
@@ -1725,6 +1786,12 @@ def _run(args: argparse.Namespace) -> int:
         legacy_args.extend(["--dashboard-auth-token-env", cfg["dashboard_auth_token_env"]])
     if cfg["dashboard_auth_header"]:
         legacy_args.extend(["--dashboard-auth-header", cfg["dashboard_auth_header"]])
+    if cfg["dashboard_upload_retries"] is not None:
+        legacy_args.extend(["--dashboard-upload-retries", str(cfg["dashboard_upload_retries"])])
+    if cfg["dashboard_upload_retry_delay_ms"] is not None:
+        legacy_args.extend(["--dashboard-upload-retry-delay-ms", str(cfg["dashboard_upload_retry_delay_ms"])])
+    if cfg["distribution_manifest"]:
+        legacy_args.extend(["--distribution-manifest", cfg["distribution_manifest"]])
     if cfg["incremental"]:
         legacy_args.append("--incremental")
     if cfg["baseline_file"]:
@@ -1794,7 +1861,10 @@ def _list_mutants(args: argparse.Namespace) -> int:
             "detail": mut.detail,
             "ignoreReason": mut.ignoreReason,
             "nodeKind": mut.nodeKind,
+            "rewriteStrategy": mut.rewriteStrategy,
+            "sourceRange": mut.sourceRange,
             "mode": cfg["mode"],
+            "mutantSwitchGuardId": engine.mutant_switch_guard_id(mut),
         }
         for mut in pending
     ]
@@ -1856,6 +1926,8 @@ def _run_mutant(args: argparse.Namespace) -> int:
         legacy_args.extend(["--timeout-constant-ms", str(cfg["timeout_constant_ms"])])
     if cfg["mode"] is not None:
         legacy_args.extend(["--mode", str(cfg["mode"])])
+    if cfg["execution_mode"] is not None:
+        legacy_args.extend(["--execution-mode", str(cfg["execution_mode"])])
     if cfg["equivalent_suppression"]:
         legacy_args.extend(["--equivalent-suppression", str(cfg["equivalent_suppression"])])
     if cfg["jobs"] is not None:
@@ -1870,6 +1942,20 @@ def _run_mutant(args: argparse.Namespace) -> int:
         legacy_args.extend(["--build-dir", cfg["build_dir"]])
     if cfg["build_target"]:
         legacy_args.extend(["--build-target", cfg["build_target"]])
+    if cfg["artifact_path"]:
+        legacy_args.extend(["--artifact-path", cfg["artifact_path"]])
+    if cfg["xcode_workspace"]:
+        legacy_args.extend(["--xcode-workspace", cfg["xcode_workspace"]])
+    if cfg["xcode_project"]:
+        legacy_args.extend(["--xcode-project", cfg["xcode_project"]])
+    if cfg["xcode_scheme"]:
+        legacy_args.extend(["--xcode-scheme", cfg["xcode_scheme"]])
+    if cfg["xcode_configuration"]:
+        legacy_args.extend(["--xcode-configuration", cfg["xcode_configuration"]])
+    if cfg["xcode_sdk"]:
+        legacy_args.extend(["--xcode-sdk", cfg["xcode_sdk"]])
+    if cfg["xcode_destination"]:
+        legacy_args.extend(["--xcode-destination", cfg["xcode_destination"]])
     if cfg["test_binary"]:
         legacy_args.extend(["--test-binary", cfg["test_binary"]])
     if cfg["shard_index"] is not None:
@@ -1942,6 +2028,12 @@ def _run_mutant(args: argparse.Namespace) -> int:
         legacy_args.extend(["--dashboard-auth-token-env", cfg["dashboard_auth_token_env"]])
     if cfg["dashboard_auth_header"]:
         legacy_args.extend(["--dashboard-auth-header", cfg["dashboard_auth_header"]])
+    if cfg["dashboard_upload_retries"] is not None:
+        legacy_args.extend(["--dashboard-upload-retries", str(cfg["dashboard_upload_retries"])])
+    if cfg["dashboard_upload_retry_delay_ms"] is not None:
+        legacy_args.extend(["--dashboard-upload-retry-delay-ms", str(cfg["dashboard_upload_retry_delay_ms"])])
+    if cfg["distribution_manifest"]:
+        legacy_args.extend(["--distribution-manifest", cfg["distribution_manifest"]])
     if cfg["incremental"]:
         legacy_args.append("--incremental")
     if cfg["baseline_file"]:

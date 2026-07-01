@@ -18,6 +18,9 @@ Run the default checks:
 ```bash
 npm run lint
 npm test
+npm run schema:check
+npm run docs:check
+npm run package:check
 npm pack --dry-run
 git diff --check
 ```
@@ -40,8 +43,10 @@ python -m pip install libclang
 npm test
 ```
 
-The clang fixture is skipped when the binding is unavailable and exercised in
-CI by the `optional libclang fixture` job.
+The clang fixture is skipped when the binding is unavailable. CI exercises it in
+the `optional libclang fixture` job by installing `libclang`, running `npm test`,
+and running `npm run evidence:p1` so the `clang-ast` metadata proof cannot silently
+degrade to a skipped local check.
 
 ## CI and release coverage
 
@@ -93,6 +98,47 @@ When adding or changing a mutator:
 - ensure clang mode either confirms the source span against an AST cursor or
   clearly remains unsupported for that mutator.
 
+## Build adapter changes
+
+When adding or changing a build-system adapter:
+
+- keep command-line flags kebab-case and provider config/report fields
+  lowerCamelCase;
+- update `python/stryker_cxx/build_adapters.py` for source-overlay command
+  synthesis;
+- update compiled-artifact helpers in `python/stryker_cxx/engine.py` only when
+  the adapter can prove source-to-artifact ownership and restore originals;
+- add a fixture under `fixtures/adapters/<system>/` whenever the tool can run in
+  CI or a skipped contract test when the tool is optional locally;
+- document supported and unsupported artifact backends in `docs/spec.md` and
+  `docs/contract.md`.
+
+## Reporter and plugin changes
+
+When adding reporter or plugin behavior:
+
+- keep plugin execution local-only; do not add network installation or implicit
+  plugin discovery;
+- validate manifest capability versions during initialization;
+- include focused tests for hook ordering, redacted command metadata, and final
+  report paths;
+- update `docs/contract.md` when report metadata changes;
+- keep Marmorkrebs normalization outside this repository unless the change is a
+  provider-boundary contract update.
+
+## Fixture changes
+
+When adding fixtures:
+
+- keep fixtures small and deterministic;
+- prefer standard tool entry points already exercised by `npm run
+  validate:full-spec`;
+- make optional tool fixtures skip cleanly when the tool is unavailable;
+- avoid committing generated build outputs, retained worktrees, coverage
+  reports, or package tarballs;
+- update `scripts/validate-full-spec.mjs` if the fixture should become part of
+  the full-spec gate.
+
 ## Report and schema changes
 
 When changing report shape:
@@ -109,7 +155,9 @@ When changing report shape:
 Before opening a PR:
 
 - `npm test` passes;
-- `npm pack --dry-run` includes the Python engine, docs, tests, and CLI wrapper;
+- `npm run schema:check` passes;
+- `npm run package:check` passes;
+- `npm pack --dry-run` includes the Python engine, docs, fixtures, and CLI wrapper;
 - `git diff --check` is clean;
 - new runner behavior has a focused test;
 - docs/spec updates are included for user-visible behavior;

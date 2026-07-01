@@ -16,10 +16,26 @@ The script runs:
 - syntax lint across CLI and script JS plus Python module compile checks;
 - no-network JSON Schema validation for JSON and YAML config fixtures;
 - native report JSON Schema checks for required `toolVersion`, summary buckets,
-  and dashboard upload-status metadata;
+  execution-mode metadata, and dashboard upload-status metadata;
 - `npm pack --dry-run`;
 - whitespace checks via `git diff --check`;
 - CLI version and config-init smoke checks;
+- execution-mode CLI/config checks for source-overlay, mutant-switch fallback,
+  and invalid values;
+- `npm run evidence:p0` generates temporary reports proving mutant-switch
+  execution, mutant-switch fallback to source-overlay, compile-pruning, and
+  lifecycle/restoration metadata;
+- `npm run evidence:p1` generates temporary artifacts proving list-mutants
+  source-range/rewrite metadata, expanded C++/ObjC++/Metal catalog discovery,
+  conservative/off/aggressive equivalent-suppression behavior,
+  compile-database project ownership, and deterministic batched
+  coverage-selected scheduler metadata. If optional Python clang bindings are
+  available, it also proves `clang-ast` discovery exposes `nodeKind`,
+  `sourceRange`, and `rewriteStrategy`;
+- `npm run evidence:p2` generates temporary artifacts proving local-only plugin
+  lifecycle/reporter behavior, capability-version rejection, redacted plugin
+  command metadata, CI/release workflow coverage, package allowlist policy, and
+  standalone/Marmorkrebs boundary documentation;
 - config preset checks for build-system, Xcodebuild, and framework starter
   files;
 - plugin compatibility checks for mutators, reporter hooks, reporter metadata,
@@ -34,9 +50,12 @@ The script runs:
 	- opt-in literal mutator checks for `IntegerLiteral`, `NullLiteral`,
 	  `CharacterLiteral`, `FloatingPointLiteral`, and `StringLiteral`;
 	- expanded C++/ObjC++/Metal catalog checks for `ConditionalBoundary`,
-	  `StandardLibraryCall`, `MemoryOrder`, `MemberAccessOperator`,
-	  `ExceptionHandling`, `PreprocessorGuard`, `ObjCMessageSend`,
-	  `ObjCBoolLiteral`, `MetalThreadPosition`, and `MetalAddressSpace`;
+	  `ShiftOperator` including compound shifts, `StandardLibraryCall`,
+	  `MemoryOrder`, `UnaryOperator` sign rewrites, `MemberAccessOperator`, `ExceptionHandling`,
+	  `PreprocessorGuard`, `ObjCMessageSend`, `ObjCBoolLiteral`, modulo
+	  arithmetic/compound-assignment rewrites, bitwise XOR alternatives and
+	  compound-assignment rewrites, `MetalThreadPosition`, and
+	  `MetalAddressSpace`;
 	- conservative equivalent/noise suppression checks for generated/identity-style,
 	  duplicate logical/bitwise operand, duplicate conditional branches, and
 	  duplicate standard-library operand cases plus disabled-suppression
@@ -45,8 +64,9 @@ The script runs:
 	  cache-miss reasons;
 - baseline maintenance checks for merge, info, history, prune, by-day buckets,
   and repo file-existence diagnostics;
-- parallel batch-probe checks for isolated worktree batching with stable
-  per-mutant report ordering and conservative proximity heuristics;
+- parallel batch-probe checks for isolated worktree batching and compiled
+  artifact batching, including stable per-mutant report ordering, conservative
+  proximity heuristics, and per-artifact placement-lock metadata;
 - framework adapter checks for automatic repo-local test-binary discovery;
 - Xcodebuild adapter checks for workspace/project, scheme, configuration, SDK,
   destination, only-testing, and skip-testing command synthesis;
@@ -61,6 +81,9 @@ The script runs:
   ternary conditional-expression branch swaps, integer/null/character/
   floating-point/string rewrites, statement removals, and block removals when
   libclang is available;
+- the CI `optional libclang fixture` job installs Python `libclang`, runs
+  `npm test`, and runs `npm run evidence:p1` so the optional `clang-ast`
+  proof is enforced in at least one workflow environment;
 - macro-expansion rejection diagnostic checks for clang-backed discovery;
 - dashboard payload policy checks for version, retention, upload-auth metadata,
   upload outcome metadata, CI project/branch/commit/build URL provenance fields,

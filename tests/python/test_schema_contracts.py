@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import argparse
 import json
 import tempfile
 import unittest
 from pathlib import Path
 
+from stryker_cxx import engine as engine_module
 from stryker_cxx.engine import (
     Report,
     Mutant,
@@ -12,6 +14,7 @@ from stryker_cxx.engine import (
     _clang_mutation_is_ast_confirmed,
     _clang_primary_node_kind,
     _dashboard_payload,
+    _attempt_dashboard_upload,
     _discover_clang_ast_first,
     _mutation_testing_elements,
     _rejects_macro_candidate,
@@ -34,6 +37,8 @@ from stryker_cxx.project_analysis import analyze_project
 from stryker_cxx.mutation_artifacts import (
     materialize_mutation_artifact,
     mutation_artifact_metadata,
+    mutant_switch_artifact_metadata,
+    mutant_switch_guard_id,
 )
 
 
@@ -51,6 +56,12 @@ class TestContracts(unittest.TestCase):
             testCommand="./build/bin/test_binary",
             execution={
                 "mode": "token",
+                "executionMode": "source-overlay",
+                "requestedExecutionMode": "source-overlay",
+                "artifactBackend": "source-overlay",
+                "requestedArtifactBackend": "compiled-executable",
+                "artifactFallback": "source-overlay",
+                "artifactFallbackReason": "compiled-executable unsupported; source-overlay fallback used",
                 "worktreeMode": "copy",
                 "jobs": 4,
                 "initialTest": True,
@@ -78,10 +89,24 @@ class TestContracts(unittest.TestCase):
                     "checkErrors": 0,
                     "records": [],
                 },
+                "mutantSwitch": {
+                    "enabled": False,
+                    "requested": False,
+                    "fallbackReason": None,
+                    "activationEnvironment": "STRYKER_CXX_ACTIVE_MUTANT",
+                    "runtimeGuardCount": 0,
+                },
                 "dashboard": {
                     "version": "1",
                     "retentionDays": 14,
                     "exportPath": "agent_space/stryker-cxx/dashboard.json",
+                    "export": {
+                        "enabled": True,
+                        "path": "agent_space/stryker-cxx/dashboard.json",
+                        "status": "succeeded",
+                        "bytes": 128,
+                        "writtenAt": "2026-01-01T00:00:00Z",
+                    },
                     "upload": {
                         "enabled": True,
                         "urlConfigured": True,
@@ -210,6 +235,17 @@ class TestContracts(unittest.TestCase):
         self.assertEqual(payload["toolVersion"], "0.1.0")
         self.assertEqual(payload["dryRun"]["status"], "PASSED")
         self.assertEqual(payload["execution"]["effectiveTimeoutMs"], 6200)
+        self.assertEqual(payload["execution"]["mode"], "token")
+        self.assertEqual(payload["execution"]["analysis"]["engine"], "token")
+        self.assertEqual(payload["execution"]["executionMode"], "source-overlay")
+        self.assertEqual(payload["execution"]["requestedExecutionMode"], "source-overlay")
+        self.assertEqual(payload["execution"]["artifactBackend"], "source-overlay")
+        self.assertEqual(payload["execution"]["requestedArtifactBackend"], "compiled-executable")
+        self.assertEqual(payload["execution"]["artifactFallback"], "source-overlay")
+        self.assertIn("fallback", payload["execution"]["artifactFallbackReason"])
+        self.assertFalse(payload["execution"]["mutantSwitch"]["enabled"])
+        self.assertEqual(payload["mutationTestingElements"]["executionMode"], "source-overlay")
+        self.assertEqual(payload["mutationTestingElements"]["strykerCxx"]["analysisEngine"], "token")
         self.assertEqual(payload["thresholds"]["break"], 0.7)
         self.assertEqual(payload["commands"]["check"], "clang++ -fsyntax-only src/foo.cpp")
         self.assertEqual(payload["checkErrors"], 0)
@@ -298,6 +334,30 @@ class TestContracts(unittest.TestCase):
 
         self.assertTrue(any("execution.testScheduler.sessions" in item for item in errors))
 
+    def test_report_validator_checks_execution_mode_shape_when_present(self) -> None:
+        payload = _report_dict(self._base_report())
+        payload["execution"]["executionMode"] = "unknown"
+        payload["execution"]["mutantSwitch"]["runtimeGuardCount"] = "zero"
+
+        errors = validate_report(payload)
+
+        self.assertTrue(any("execution.executionMode" in item for item in errors))
+        self.assertTrue(any("execution.mutantSwitch.runtimeGuardCount" in item for item in errors))
+
+    def test_report_validator_checks_artifact_backend_shape_when_present(self) -> None:
+        payload = _report_dict(self._base_report())
+        payload["execution"]["artifactBackend"] = "compiled-unknown"
+        payload["execution"]["requestedArtifactBackend"] = "compiled-unknown"
+        payload["execution"]["artifactFallback"] = "retry-magic"
+        payload["execution"]["artifactFallbackReason"] = 123
+
+        errors = validate_report(payload)
+
+        self.assertTrue(any("execution.artifactBackend" in item for item in errors))
+        self.assertTrue(any("execution.requestedArtifactBackend" in item for item in errors))
+        self.assertTrue(any("execution.artifactFallback" in item for item in errors))
+        self.assertTrue(any("execution.artifactFallbackReason" in item for item in errors))
+
     def test_mutation_artifact_metadata_describes_source_overlay(self) -> None:
         metadata = mutation_artifact_metadata(
             "git-worktree",
@@ -312,6 +372,33 @@ class TestContracts(unittest.TestCase):
         self.assertEqual(metadata["implementation"], "git-worktree")
         self.assertTrue(metadata["workspacePerMutant"])
         self.assertEqual(metadata["sourceOverlay"]["strategy"], "isolated-git-worktree")
+
+    def test_mutant_switch_artifact_metadata_uses_stable_guard_ids(self) -> None:
+        mutant = {
+            "id": "src/foo.cpp:1:0:EqualityOperator:abc123",
+            "file": "src/foo.cpp",
+            "line": 1,
+            "col": 0,
+            "mutator": "EqualityOperator",
+            "original": "==",
+            "mutated": "!=",
+        }
+        guard_id = mutant_switch_guard_id(mutant)
+        metadata = mutant_switch_artifact_metadata(
+            enabled=False,
+            guard_count=1,
+            guards=[{"mutantId": mutant["id"], "guardId": guard_id}],
+            fallback_reason="not ready",
+        )
+
+        self.assertEqual(guard_id, mutant_switch_guard_id(dict(mutant)))
+        self.assertTrue(guard_id.startswith("msw-"))
+        self.assertEqual(metadata["schemaVersion"], "stryker-cxx.mutation-artifact.v1")
+        self.assertEqual(metadata["mode"], "mutant-switch")
+        self.assertFalse(metadata["enabled"])
+        self.assertEqual(metadata["candidateGuardCount"], 1)
+        self.assertEqual(metadata["runtimeGuardCount"], 0)
+        self.assertEqual(metadata["guards"][0]["guardId"], guard_id)
 
     def test_mutation_artifact_materializes_inplace_and_copy_workspaces(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -370,6 +457,48 @@ class TestContracts(unittest.TestCase):
         self.assertIn("cmake", {item["name"] for item in analysis["buildSystems"]})
         self.assertIn("math_test", {item["name"] for item in analysis["buildTargets"]})
         self.assertIn("math", {item["name"] for item in analysis["testTargets"]})
+        math_target = next(item for item in analysis["buildTargets"] if item["name"] == "math_test")
+        self.assertEqual(math_target["sourceFiles"], ["math_test.cpp"])
+        self.assertEqual(math_target["analysisKey"], "build-target|CMakeLists.txt|executable|math_test")
+        source_target = analysis["sourceTargets"][0]
+        self.assertEqual(source_target["owningBuildTargets"], ["math_test"])
+        self.assertEqual(source_target["ownership"]["kind"], "cmake-target-source")
+        self.assertEqual(source_target["ownership"]["key"], "cmake-target-source|math_test.cpp|CMakeLists.txt|math_test")
+        math_test = next(item for item in analysis["testTargets"] if item["name"] == "math")
+        self.assertEqual(math_test["command"], "math_test")
+        self.assertEqual(math_test["relatedBuildTarget"], "math_test")
+
+    def test_project_analysis_detects_non_cmake_fixture_source_ownership(self) -> None:
+        fixture_root = Path(__file__).resolve().parents[2] / "fixtures" / "adapters"
+        cases = [
+            ("ninja", "ninja", "build.ninja", "ninja", "test"),
+            ("make", "make", "Makefile", "make", "test"),
+            ("meson", "meson", "meson.build", "executable", "math"),
+            ("bazel", "bazel", "BUILD.bazel", "cc_test", "math_test"),
+            ("xcode", "xcodebuild", "MathFixture.xcodeproj/project.pbxproj", "xcode-target", "MathTests"),
+        ]
+
+        for fixture, build_system_name, source, kind, test_name in cases:
+            with self.subTest(fixture=fixture):
+                repo = fixture_root / fixture
+                analysis = analyze_project(str(repo), ["math_test.cpp"])
+
+                self.assertIn(build_system_name, {item["name"] for item in analysis["buildSystems"]})
+                expected_build_target = "MathTests" if fixture == "xcode" else "math_test"
+                build_target = next(item for item in analysis["buildTargets"] if item["name"] == expected_build_target)
+                self.assertEqual(build_target["kind"], kind)
+                self.assertEqual(build_target["source"], source)
+                self.assertEqual(build_target["sourceFiles"], ["math_test.cpp"])
+                self.assertEqual(build_target["analysisKey"], f"build-target|{source}|{kind}|{expected_build_target}")
+                source_target = analysis["sourceTargets"][0]
+                self.assertEqual(source_target["owningBuildTargets"], [expected_build_target])
+                self.assertEqual(source_target["owningBuildTargetSources"], [source])
+                self.assertEqual(source_target["ownership"]["kind"], "build-target-source")
+                self.assertEqual(source_target["ownership"]["source"], source)
+                self.assertEqual(source_target["ownership"]["key"], f"build-target-source|math_test.cpp|{source}|{expected_build_target}")
+                test_target = next(item for item in analysis["testTargets"] if item["name"] == test_name)
+                self.assertEqual(test_target["relatedBuildTarget"], expected_build_target)
+                self.assertIsInstance(test_target["analysisKey"], str)
 
     def test_project_analysis_detects_compile_database(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -421,6 +550,45 @@ class TestContracts(unittest.TestCase):
         self.assertEqual(payload["thresholds"]["status"], "high")
         self.assertIn("runId", payload)
         self.assertEqual(payload["provenance"]["upload"]["status"], "notAttempted")
+
+    def test_dashboard_upload_records_retry_attempt_metadata(self) -> None:
+        rep = self._base_report()
+        args = argparse.Namespace(
+            dashboard_upload_url="https://dashboard.example/upload",
+            dashboard_auth_token_env=None,
+            dashboard_auth_header="Authorization",
+            dashboard_upload_retries=1,
+            dashboard_upload_retry_delay_ms=0,
+        )
+        calls: list[str] = []
+        original_upload = engine_module._upload_dashboard
+
+        def fake_upload(url: str, *_args: object) -> int:
+            calls.append(url)
+            if len(calls) == 1:
+                raise RuntimeError("transient dashboard failure")
+            return 202
+
+        try:
+            engine_module._upload_dashboard = fake_upload
+            error = _attempt_dashboard_upload(args, rep)
+        finally:
+            engine_module._upload_dashboard = original_upload
+
+        self.assertIsNone(error)
+        self.assertEqual(calls, ["https://dashboard.example/upload", "https://dashboard.example/upload"])
+        upload = rep.execution["dashboard"]["upload"]
+        self.assertEqual(upload["status"], "succeeded")
+        self.assertEqual(upload["statusCode"], 202)
+        self.assertEqual(upload["maxAttempts"], 2)
+        self.assertEqual(upload["retryDelayMs"], 0)
+        self.assertEqual(len(upload["attempts"]), 2)
+        self.assertEqual(upload["attempts"][0]["status"], "failed")
+        self.assertIn("transient dashboard failure", upload["attempts"][0]["error"])
+        self.assertEqual(upload["attempts"][1]["status"], "succeeded")
+        self.assertEqual(upload["attempts"][1]["statusCode"], 202)
+        payload = _dashboard_payload(rep)
+        self.assertEqual(payload["provenance"]["upload"]["attempts"][1]["statusCode"], 202)
 
     def test_build_system_adapter_commands(self) -> None:
         cmake = adapter_commands("cmake", "build", "all", None, "Foo.*")
@@ -498,6 +666,42 @@ class TestContracts(unittest.TestCase):
         self.assertEqual(analysis["macroRejectedMutants"], 1)
         self.assertEqual(len(analysis["macroRejections"]), 1)
         self.assertEqual(analysis["macroRejections"][0]["reason"], "candidate overlaps a macro expansion range")
+
+    def test_clang_ast_first_rejects_preprocessor_source_ranges(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "sample.cpp"
+            source.write_text(
+                "#define SAME(flag) ((flag) == (flag))\n"
+                "bool check(bool flag) { return SAME(flag); }\n"
+            )
+            analysis = {"engine": "clang-ast", "macroRejectedRanges": 0, "macroRangeRejections": []}
+            ranges = [
+                {
+                    "kind": "BINARY_OPERATOR",
+                    "startLine": 1,
+                    "startColumn": 1,
+                    "endLine": 1,
+                    "endColumn": 42,
+                }
+            ]
+
+            mutants = _discover_clang_ast_first(
+                tmp,
+                "sample.cpp",
+                None,
+                ["EqualityOperator"],
+                ranges,
+                None,
+                analysis,
+            )
+
+            self.assertEqual(mutants, [])
+            self.assertEqual(analysis["macroRejectedRanges"], 1)
+            self.assertEqual(len(analysis["macroRangeRejections"]), 1)
+            self.assertEqual(
+                analysis["macroRangeRejections"][0]["reason"],
+                "source range touches a preprocessor directive",
+            )
 
     def test_framework_adapter_discovers_single_repo_local_test_binary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -726,7 +930,7 @@ class TestClangAstConfirmation(unittest.TestCase):
 
             self.assertEqual(len(mutants), 1)
             self.assertEqual(mutants[0].nodeKind, "BINARY_OPERATOR")
-            self.assertEqual(mutants[0].rewriteStrategy, "clang-ast-source-range")
+            self.assertEqual(mutants[0].rewriteStrategy, "clang-ast-direct-binary")
             self.assertEqual(mutants[0].sourceRange["kind"], "BINARY_OPERATOR")
 
     def test_clang_ast_first_discovery_generates_direct_conditional_expression_mutant(self) -> None:
@@ -883,6 +1087,231 @@ class TestClangAstConfirmation(unittest.TestCase):
             )
             self.assertTrue(any(mut.mutator == "MetalAddressSpace" and mut.original == "device" for mut in metal_mutants))
             self.assertEqual(all(mut.rewriteStrategy == "clang-ast-source-range" for mut in metal_mutants), True)
+
+    def test_clang_ast_direct_range_discovers_move_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "sample.cpp"
+            source.write_text(
+                "void moved(Node node) { auto value = std::move(node); }\n"
+                "void forwarded(Node node) { auto value = std::forward<Node>(node); }\n"
+                "void container(Values values) { auto value = values.front(); }\n"
+                "void state(Values values) { auto value = values.empty(); }\n"
+                "void string_call(Text label) { auto value = label.find(\"x\"); }\n"
+                "void math_call(double x) { auto value = std::ceil(x); }\n"
+                "void iterator_call(Values values) { auto value = std::next(values.begin()); }\n"
+                "void chrono_call(Duration d) { auto value = std::chrono::floor<Seconds>(d); }\n"
+                "void regex_call(Text text, Match match, Regex re) { auto value = std::regex_match(text, match, re); }\n"
+                "void filesystem_call(Path path) { auto value = std::filesystem::exists(path); }\n"
+                "void standard_call() { auto value = std::min(1, 2); }\n"
+            )
+            ranges = [
+                {
+                    "kind": "CALL_EXPR",
+                    "startLine": 1,
+                    "startColumn": 1,
+                    "endLine": 1,
+                    "endColumn": 80,
+                },
+                {
+                    "kind": "CALL_EXPR",
+                    "startLine": 2,
+                    "startColumn": 1,
+                    "endLine": 2,
+                    "endColumn": 90,
+                },
+                {
+                    "kind": "CXX_MEMBER_CALL_EXPR",
+                    "startLine": 3,
+                    "startColumn": 1,
+                    "endLine": 3,
+                    "endColumn": 80,
+                },
+                {
+                    "kind": "CXX_MEMBER_CALL_EXPR",
+                    "startLine": 4,
+                    "startColumn": 1,
+                    "endLine": 4,
+                    "endColumn": 80,
+                },
+                {
+                    "kind": "CXX_MEMBER_CALL_EXPR",
+                    "startLine": 5,
+                    "startColumn": 1,
+                    "endLine": 5,
+                    "endColumn": 90,
+                },
+                {
+                    "kind": "CALL_EXPR",
+                    "startLine": 6,
+                    "startColumn": 1,
+                    "endLine": 6,
+                    "endColumn": 80,
+                },
+                {
+                    "kind": "CALL_EXPR",
+                    "startLine": 7,
+                    "startColumn": 1,
+                    "endLine": 7,
+                    "endColumn": 100,
+                },
+                {
+                    "kind": "CALL_EXPR",
+                    "startLine": 8,
+                    "startColumn": 1,
+                    "endLine": 8,
+                    "endColumn": 100,
+                },
+                {
+                    "kind": "CALL_EXPR",
+                    "startLine": 9,
+                    "startColumn": 1,
+                    "endLine": 9,
+                    "endColumn": 120,
+                },
+                {
+                    "kind": "CALL_EXPR",
+                    "startLine": 10,
+                    "startColumn": 1,
+                    "endLine": 10,
+                    "endColumn": 110,
+                },
+                {
+                    "kind": "CALL_EXPR",
+                    "startLine": 11,
+                    "startColumn": 1,
+                    "endLine": 11,
+                    "endColumn": 80,
+                },
+            ]
+
+            move_mutants = _discover_clang_ast_first(
+                tmp,
+                "sample.cpp",
+                None,
+                ["MoveSemantics"],
+                ranges,
+            )
+
+            pairs = {(mut.original, mut.mutated, mut.rewriteStrategy) for mut in move_mutants}
+            self.assertIn(("std::move(node)", "node", "clang-ast-direct-call-wrapper"), pairs)
+            self.assertIn(("std::forward<Node>(node)", "node", "clang-ast-direct-call-wrapper"), pairs)
+
+            container_mutants = _discover_clang_ast_first(
+                tmp,
+                "sample.cpp",
+                None,
+                ["ContainerCall"],
+                ranges,
+            )
+            container_pairs = {
+                (mut.original, mut.mutated, mut.rewriteStrategy)
+                for mut in container_mutants
+            }
+            self.assertIn(("values.front()", "values.back()", "clang-ast-direct-container-call"), container_pairs)
+
+            state_mutants = _discover_clang_ast_first(
+                tmp,
+                "sample.cpp",
+                None,
+                ["ContainerStateCall"],
+                ranges,
+            )
+            state_pairs = {
+                (mut.original, mut.mutated, mut.rewriteStrategy)
+                for mut in state_mutants
+            }
+            self.assertIn(("values.empty()", "values.size()", "clang-ast-direct-container-state-call"), state_pairs)
+
+            string_mutants = _discover_clang_ast_first(
+                tmp,
+                "sample.cpp",
+                None,
+                ["StringCall"],
+                ranges,
+            )
+            string_pairs = {
+                (mut.original, mut.mutated, mut.rewriteStrategy)
+                for mut in string_mutants
+            }
+            self.assertIn(('label.find("x")', 'label.rfind("x")', "clang-ast-direct-string-call"), string_pairs)
+
+            math_mutants = _discover_clang_ast_first(
+                tmp,
+                "sample.cpp",
+                None,
+                ["MathCall"],
+                ranges,
+            )
+            math_pairs = {
+                (mut.original, mut.mutated, mut.rewriteStrategy)
+                for mut in math_mutants
+            }
+            self.assertIn(("std::ceil(x)", "std::floor(x)", "clang-ast-direct-math-call"), math_pairs)
+
+            iterator_mutants = _discover_clang_ast_first(
+                tmp,
+                "sample.cpp",
+                None,
+                ["IteratorCall"],
+                ranges,
+            )
+            iterator_pairs = {
+                (mut.original, mut.mutated, mut.rewriteStrategy)
+                for mut in iterator_mutants
+            }
+            self.assertIn(("std::next(values.begin())", "std::prev(values.begin())", "clang-ast-direct-iterator-call"), iterator_pairs)
+
+            chrono_mutants = _discover_clang_ast_first(
+                tmp,
+                "sample.cpp",
+                None,
+                ["ChronoCall"],
+                ranges,
+            )
+            chrono_pairs = {
+                (mut.original, mut.mutated, mut.rewriteStrategy)
+                for mut in chrono_mutants
+            }
+            self.assertIn(("std::chrono::floor<Seconds>(d)", "std::chrono::ceil<Seconds>(d)", "clang-ast-direct-chrono-call"), chrono_pairs)
+
+            regex_mutants = _discover_clang_ast_first(
+                tmp,
+                "sample.cpp",
+                None,
+                ["RegexCall"],
+                ranges,
+            )
+            regex_pairs = {
+                (mut.original, mut.mutated, mut.rewriteStrategy)
+                for mut in regex_mutants
+            }
+            self.assertIn(("std::regex_match(text, match, re)", "std::regex_search(text, match, re)", "clang-ast-direct-regex-call"), regex_pairs)
+
+            filesystem_mutants = _discover_clang_ast_first(
+                tmp,
+                "sample.cpp",
+                None,
+                ["FilesystemCall"],
+                ranges,
+            )
+            filesystem_pairs = {
+                (mut.original, mut.mutated, mut.rewriteStrategy)
+                for mut in filesystem_mutants
+            }
+            self.assertIn(("std::filesystem::exists(path)", "std::filesystem::is_empty(path)", "clang-ast-direct-filesystem-call"), filesystem_pairs)
+
+            standard_mutants = _discover_clang_ast_first(
+                tmp,
+                "sample.cpp",
+                None,
+                ["StandardLibraryCall"],
+                ranges,
+            )
+            standard_pairs = {
+                (mut.original, mut.mutated, mut.rewriteStrategy)
+                for mut in standard_mutants
+            }
+            self.assertIn(("std::min(1, 2)", "std::max(1, 2)", "clang-ast-direct-standard-library-call"), standard_pairs)
 
 
 if __name__ == "__main__":

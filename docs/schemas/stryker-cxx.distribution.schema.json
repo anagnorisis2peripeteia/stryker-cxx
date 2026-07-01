@@ -1,0 +1,144 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://stryker-cxx.dev/schemas/stryker-cxx.distribution.schema.json",
+  "title": "stryker-cxx distribution manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "generatedAt",
+    "tool",
+    "toolVersion",
+    "repo",
+    "base",
+    "shard",
+    "worker",
+    "execution",
+    "commands",
+    "redaction",
+    "mutants"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "stryker-cxx.distribution.v1" },
+    "generatedAt": { "type": "string" },
+    "tool": { "const": "stryker-cxx" },
+    "toolVersion": { "type": "string" },
+    "repo": { "type": "string" },
+    "base": { "type": ["string", "null"] },
+    "shard": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["index", "total", "selectedMutants"],
+      "properties": {
+        "index": { "type": "integer", "minimum": 1 },
+        "total": { "type": "integer", "minimum": 1 },
+        "selectedMutants": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "worker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["label", "jobs", "worktreeMode", "workerTmpDir", "artifactDir"],
+      "properties": {
+        "label": { "type": ["string", "null"] },
+        "jobs": { "type": "integer", "minimum": 1 },
+        "worktreeMode": { "enum": ["inplace", "copy", "git-worktree"] },
+        "workerTmpDir": { "type": ["string", "null"] },
+        "artifactDir": { "type": "string" }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "executionMode",
+        "requestedExecutionMode",
+        "artifactBackend",
+        "requestedArtifactBackend",
+        "artifactFallback",
+        "batchMutants",
+        "batchSize"
+      ],
+      "properties": {
+        "mode": { "enum": ["token", "clang", "clang-ast"] },
+        "executionMode": { "enum": ["source-overlay", "mutant-switch"] },
+        "requestedExecutionMode": { "enum": ["source-overlay", "mutant-switch"] },
+        "artifactBackend": {
+          "enum": ["source-overlay", "compiled-executable", "compiled-library", "compiled-object"]
+        },
+        "requestedArtifactBackend": {
+          "enum": ["source-overlay", "compiled-executable", "compiled-library", "compiled-object"]
+        },
+        "artifactFallback": { "enum": ["none", "source-overlay"] },
+        "batchMutants": { "type": "boolean" },
+        "batchSize": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "commands": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["build", "check", "test"],
+      "properties": {
+        "build": { "type": ["string", "null"] },
+        "check": { "type": ["string", "null"] },
+        "test": { "type": ["string", "null"] }
+      }
+    },
+    "redaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "environmentValues",
+        "secretAssignmentPatterns",
+        "replacement"
+      ],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "environmentValues": { "type": "boolean" },
+        "secretAssignmentPatterns": { "type": "boolean" },
+        "replacement": { "type": "string" }
+      }
+    },
+    "mutants": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "file",
+          "line",
+          "column",
+          "mutator",
+          "original",
+          "mutated",
+          "status"
+        ],
+        "properties": {
+          "id": { "type": "string" },
+          "file": { "type": "string" },
+          "line": { "type": "integer", "minimum": 1 },
+          "column": { "type": "integer", "minimum": 0 },
+          "mutator": { "type": "string" },
+          "original": { "type": ["string", "null"] },
+          "mutated": { "type": ["string", "null"] },
+          "status": {
+            "enum": [
+              "PENDING",
+              "KILLED",
+              "SURVIVED",
+              "NO_COVERAGE",
+              "BUILD_ERROR",
+              "CHECK_ERROR",
+              "TIMEOUT",
+              "RUNTIME_ERROR",
+              "IGNORED"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

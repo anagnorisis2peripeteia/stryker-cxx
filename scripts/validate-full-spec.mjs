@@ -49,7 +49,10 @@ console.log("[stryker-cxx] node/npm/python contract checks");
 run("npm", ["run", "lint"]);
 run("npm", ["test"]);
 run("npm", ["run", "schema:check"]);
-run("npm", ["pack", "--dry-run"]);
+run("npm", ["run", "evidence:p0"]);
+run("npm", ["run", "evidence:p1"]);
+run("npm", ["run", "evidence:p2"]);
+run("npm", ["run", "package:check"]);
 run("git", ["diff", "--check"]);
 
 console.log("[stryker-cxx] CLI smoke checks");

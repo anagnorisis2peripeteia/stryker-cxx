@@ -9,6 +9,8 @@ added report modes and run-time metadata to support Stryker-level workflows.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
+import copy
 import hashlib
 import html as html_lib
 import json
@@ -20,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -36,12 +39,19 @@ from .schema import (
 )
 from .payload_contract import native_to_mte_status
 from .project_analysis import analyze_project
+from .scheduler import (
+    batch_scheduler_record,
+    build_test_scheduler_metadata,
+    per_mutant_scheduler_record,
+)
 from .mutation_artifacts import (
     artifact_placement_policy,
     compiled_artifact_placement_policy,
     compiled_mutation_artifact_metadata,
     materialize_mutation_artifact,
     mutation_artifact_metadata,
+    mutant_switch_artifact_metadata,
+    mutant_switch_guard_id,
 )
 
 # Token-level mutators.
@@ -54,9 +64,18 @@ MUTATORS: dict[str, list[tuple[str, str]]] = {
     "BooleanLiteral": [("true", "false"), ("false", "true")],
     "ObjCBoolLiteral": [("YES", "NO"), ("NO", "YES")],
     "UpdateOperator": [("++", "--"), ("--", "++")],
-    "ArithmeticOperator": [("+", "-"), ("-", "+"), ("*", "/"), ("/", "*")],
-    "AssignmentOperator": [("+=", "-="), ("-=", "+="), ("*=", "/="), ("/=", "*=")],
-    "BitwiseOperator": [("&", "|"), ("|", "&"), ("^", "|")],
+    "ArithmeticOperator": [("+", "-"), ("-", "+"), ("*", "/"), ("/", "*"), ("%", "*")],
+    "AssignmentOperator": [
+        ("+=", "-="),
+        ("-=", "+="),
+        ("*=", "/="),
+        ("/=", "*="),
+        ("%=", "*="),
+        ("&=", "|="),
+        ("|=", "&="),
+        ("^=", "|="),
+    ],
+    "BitwiseOperator": [("&", "|"), ("|", "&"), ("^", "|"), ("^", "&")],
     "UnaryOperator": [("!", ""), ("!", "!!")],
     "ReturnValue": [("return true", "return false"), ("return false", "return true")],
     "IntegerLiteral": [("0", "1"), ("1", "0")],
@@ -90,6 +109,15 @@ MUTATORS: dict[str, list[tuple[str, str]]] = {
         ("std::is_sorted", "std::is_heap"),
         ("std::is_heap", "std::is_sorted"),
     ],
+    "MoveSemantics": [],
+    "ContainerCall": [],
+    "ContainerStateCall": [],
+    "StringCall": [],
+    "MathCall": [],
+    "IteratorCall": [],
+    "ChronoCall": [],
+    "RegexCall": [],
+    "FilesystemCall": [],
     "MemoryOrder": [
         ("std::memory_order_relaxed", "std::memory_order_seq_cst"),
         ("std::memory_order_seq_cst", "std::memory_order_relaxed"),
@@ -142,6 +170,15 @@ MUTATOR_DESCRIPTIONS: dict[str, str] = {
     "LoopBoundary": "replaced loop boundary operator",
     "LoopCondition": "replaced loop condition",
     "StandardLibraryCall": "replaced a standard-library call target",
+    "MoveSemantics": "removed a std::move/std::forward value-category wrapper",
+    "ContainerCall": "replaced a no-argument C++ container member call",
+    "ContainerStateCall": "replaced a C++ container state/capacity member call",
+    "StringCall": "replaced a C++ string/search member call",
+    "MathCall": "replaced a C/C++ math call target",
+    "IteratorCall": "replaced a C++ iterator movement call target",
+    "ChronoCall": "replaced a C++ chrono rounding call target",
+    "RegexCall": "replaced a C++ regex predicate call target",
+    "FilesystemCall": "replaced a C++ filesystem predicate call target",
     "MemoryOrder": "replaced a C++ atomic memory-order constant",
     "MemberAccessOperator": "replaced a member-access operator",
     "ExceptionHandling": "removed a throw statement",
@@ -174,14 +211,19 @@ _TOKEN_PATTERNS: dict[str, str] = {
     "+": r"(?<![+])\+(?![+=])",
     "-": r"(?<![-])-(?![->=])",
     "*": r"(?<![*/])\*(?![*/=])",
-    "/": r"(?<!/)/(?!/)",
+    "/": r"(?<!/)/(?![=/])",
+    "%": r"%(?!=)",
     "+=": r"\+=",
     "-=": r"-=",
     "*=": r"\*=",
     "/=": r"/=",
+    "%=": r"%=",
+    "&=": r"&=",
+    "|=": r"\|=",
+    "^=": r"\^=",
     "&": r"(?<![&|])&(?!(?:[&=]))",
     "|": r"(?<!\|)\|(?!(?:\||=))",
-    "^": r"\^",
+    "^": r"\^(?!=)",
     "!": r"(?<![!])!(?![=])",
     "return true": r"\breturn\s+true\b",
     "return false": r"\breturn\s+false\b",
@@ -226,6 +268,190 @@ _TOKEN_PATTERNS: dict[str, str] = {
     "thread_index_in_threadgroup": r"\bthread_index_in_threadgroup\b",
     "threads_per_threadgroup": r"\bthreads_per_threadgroup\b",
 }
+_TOKEN_BINARY_OPERAND_RE = re.compile(
+    r"(?:[A-Za-z_][A-Za-z0-9_:]*|\d+(?:\.\d+)?|true|false|nullptr|NULL)"
+)
+_TOKEN_BINARY_EXPRESSION_PREFIXES = ("return", "case")
+
+
+def _skip_left_space(text: str, index: int) -> int:
+    while index >= 0 and text[index].isspace():
+        index -= 1
+    return index
+
+
+def _skip_right_space(text: str, index: int) -> int:
+    while index < len(text) and text[index].isspace():
+        index += 1
+    return index
+
+
+def _matching_left_delimiter(text: str, close_index: int) -> int | None:
+    pairs = {")": "(", "]": "[", "}": "{"}
+    close_char = text[close_index]
+    open_char = pairs.get(close_char)
+    if open_char is None:
+        return None
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    for index in range(close_index, -1, -1):
+        char = text[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            continue
+        if char == close_char:
+            depth += 1
+        elif char == open_char:
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def _matching_right_delimiter(text: str, open_index: int) -> int | None:
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    open_char = text[open_index]
+    close_char = pairs.get(open_char)
+    if close_char is None:
+        return None
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    for index in range(open_index, len(text)):
+        char = text[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            continue
+        if char == open_char:
+            depth += 1
+        elif char == close_char:
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def _identifier_start_left(text: str, end_exclusive: int) -> int:
+    index = end_exclusive - 1
+    while index >= 0 and re.match(r"[A-Za-z0-9_:~.]", text[index]):
+        index -= 1
+    return index + 1
+
+
+def _token_binary_left_span_start(code: str, operator_start: int) -> int | None:
+    index = _skip_left_space(code, operator_start - 1)
+    if index < 0:
+        return None
+    expression_prefix_end: int | None = None
+    if code[index] in ")]}":
+        open_index = _matching_left_delimiter(code, index)
+        if open_index is None:
+            return None
+        start = open_index
+        prefix_end = _skip_left_space(code, open_index - 1)
+        if prefix_end >= 0 and re.match(r"[A-Za-z0-9_:~]", code[prefix_end]):
+            start = _identifier_start_left(code, prefix_end + 1)
+            token = code[start : prefix_end + 1]
+            if token in _TOKEN_BINARY_EXPRESSION_PREFIXES:
+                expression_prefix_end = prefix_end + 1
+            if code[start] == "." or code[:start].rstrip().endswith("->"):
+                return None
+    else:
+        start = _identifier_start_left(code, index + 1)
+        token = code[start : index + 1]
+        if token in _TOKEN_BINARY_EXPRESSION_PREFIXES:
+            expression_prefix_end = index + 1
+    if expression_prefix_end is not None:
+        start = _skip_right_space(code, expression_prefix_end)
+    prefix = code[:start].rstrip()
+    for keyword in _TOKEN_BINARY_EXPRESSION_PREFIXES:
+        if prefix.endswith(keyword):
+            before = prefix[: -len(keyword)]
+            if not before or not re.match(r"[A-Za-z0-9_]", before[-1]):
+                start = _skip_right_space(code, len(prefix))
+                break
+    return start
+
+
+def _token_binary_right_span_end(code: str, operator_end: int) -> int | None:
+    start = _skip_right_space(code, operator_end)
+    if start >= len(code):
+        return None
+    if code[start] in "([{":
+        close_index = _matching_right_delimiter(code, start)
+        if close_index is None:
+            return None
+        end = close_index + 1
+    else:
+        end = start
+        while end < len(code) and re.match(r"[A-Za-z0-9_:~.]", code[end]):
+            end += 1
+        if end == start:
+            return None
+        call_start = _skip_right_space(code, end)
+        if call_start < len(code) and code[call_start] == "(":
+            close_index = _matching_right_delimiter(code, call_start)
+            if close_index is None:
+                return None
+            end = close_index + 1
+    return end
+
+
+def _token_binary_expression_source_range(
+    code: str,
+    line_no: int,
+    operator_start: int,
+    operator_end: int,
+) -> dict[str, int | str] | None:
+    balanced_start = _token_binary_left_span_start(code, operator_start)
+    balanced_end = _token_binary_right_span_end(code, operator_end)
+    if balanced_start is not None and balanced_end is not None:
+        if balanced_start < operator_start and balanced_end > operator_end:
+            return {
+                "kind": "TOKEN_BINARY_EXPRESSION",
+                "startLine": line_no,
+                "startColumn": balanced_start + 1,
+                "endLine": line_no,
+                "endColumn": balanced_end + 1,
+            }
+    left_part = code[:operator_start].rstrip()
+    right_padding = len(code[operator_end:]) - len(code[operator_end:].lstrip())
+    right_part = code[operator_end + right_padding :]
+    left_matches = list(_TOKEN_BINARY_OPERAND_RE.finditer(left_part))
+    left_match = left_matches[-1] if left_matches else None
+    right_match = _TOKEN_BINARY_OPERAND_RE.match(right_part)
+    if left_match is None or right_match is None:
+        return None
+    if left_match.end() != len(left_part):
+        return None
+    start_col0 = left_match.start()
+    end_col0 = operator_end + right_padding + right_match.end()
+    if start_col0 >= operator_start or end_col0 <= operator_end:
+        return None
+    return {
+        "kind": "TOKEN_BINARY_EXPRESSION",
+        "startLine": line_no,
+        "startColumn": start_col0 + 1,
+        "endLine": line_no,
+        "endColumn": end_col0 + 1,
+    }
 
 _STRING_LITERAL_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
 _CHARACTER_LITERAL_RE = re.compile(r"(?:L|u8|u|U)?'(?:[^'\\]|\\.)*'")
@@ -275,6 +501,36 @@ _STATEMENT_REMOVAL_FORBIDDEN_PREFIXES = (
     "private",
     "protected",
 )
+_STATEMENT_REMOVAL_DECLARATION_PREFIXES = {
+    "alignas",
+    "auto",
+    "bool",
+    "char",
+    "char16_t",
+    "char32_t",
+    "const",
+    "consteval",
+    "constinit",
+    "double",
+    "extern",
+    "float",
+    "friend",
+    "inline",
+    "int",
+    "long",
+    "mutable",
+    "register",
+    "short",
+    "signed",
+    "static",
+    "thread_local",
+    "typedef",
+    "unsigned",
+    "using",
+    "virtual",
+    "void",
+    "volatile",
+}
 
 SOURCE_EXTENSIONS = {
     ".cpp",
@@ -308,8 +564,35 @@ GENERATED_PATH_PATTERNS = (
     "ui_",
     "qrc_",
 )
+EQUIVALENT_SUPPRESSION_RULE_IDS = {
+    "generated code auto-suppression": "generated-code",
+    "equivalent duplicate logical operand": "duplicate-logical-operand",
+    "equivalent arithmetic identity": "arithmetic-identity",
+    "equivalent duplicate bitwise operand": "duplicate-bitwise-operand",
+    "equivalent duplicate standard-library operands": "duplicate-standard-library-operands",
+    "equivalent duplicate standard-library range": "duplicate-standard-library-range",
+    "equivalent duplicate conditional branches": "duplicate-conditional-branches",
+    "style-equivalent null literal suppression": "style-equivalent-null-literal",
+}
 
 PLUGIN_MANIFEST = "stryker-cxx-plugin.json"
+SUPPORTED_PLUGIN_CAPABILITY_VERSIONS = {"1", "1.0", "v1"}
+PLUGIN_LIFECYCLE_SCHEMA_VERSION = "stryker-cxx.plugin-lifecycle.v1"
+PLUGIN_LIFECYCLE_EVENTS = (
+    "initialization",
+    "projectAnalysis",
+    "mutationDiscovery",
+    "artifactCreation",
+    "coverageAnalysis",
+    "scheduling",
+    "execution",
+    "reporting",
+    "cleanup",
+)
+PLUGIN_LIFECYCLE_ALIASES = {
+    "initialization": ("preRun",),
+    "cleanup": ("postRun",),
+}
 REDACTED_VALUE = "[REDACTED]"
 SENSITIVE_ENV_KEY_RE = re.compile(
     r"(^|_)(TOKEN|SECRET|PASSWORD|PASSWD|PWD|CREDENTIAL|API_?KEY|"
@@ -329,6 +612,39 @@ def _utc_now_iso() -> str:
 
 def _ensure_supported_source_path(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in SOURCE_EXTENSIONS
+
+
+def _plugin_capability_versions(name: str, payload: dict[str, Any]) -> dict[str, str]:
+    capabilities = payload.get("capabilities", {})
+    if capabilities in (None, False):
+        return {}
+    if not isinstance(capabilities, dict):
+        raise ValueError(f"plugin {name}: capabilities must be an object")
+    default_version = str(
+        payload.get("capabilityVersion")
+        or payload.get("capabilitiesVersion")
+        or payload.get("apiVersion")
+        or "1"
+    )
+    versions: dict[str, str] = {}
+    for capability_name in sorted(capabilities):
+        capability = capabilities[capability_name]
+        version = default_version
+        if isinstance(capability, dict):
+            version = str(
+                capability.get("capabilityVersion")
+                or capability.get("version")
+                or capability.get("apiVersion")
+                or default_version
+            )
+        elif not isinstance(capability, bool):
+            raise ValueError(f"plugin {name}: capability {capability_name} must be an object or boolean")
+        if version not in SUPPORTED_PLUGIN_CAPABILITY_VERSIONS:
+            raise ValueError(
+                f"plugin {name}: unsupported capability version for {capability_name}: {version}"
+            )
+        versions[str(capability_name)] = version
+    return versions
 
 
 @dataclass
@@ -403,6 +719,43 @@ FATAL_STATUSES = {"KILLED", "SURVIVED", "BUILD_ERROR", "CHECK_ERROR", "NO_COVERA
 RETAINABLE_STATUSES = FATAL_STATUSES | {"RUNTIME_ERROR", "PENDING"}
 COMPILE_PRUNED_STATUSES = {"BUILD_ERROR", "CHECK_ERROR"}
 ARTIFACT_BACKENDS = {"source-overlay", "compiled-executable", "compiled-library", "compiled-object"}
+EXECUTION_MODES = {"source-overlay", "mutant-switch"}
+MUTANT_SWITCH_ACTIVE_ENV = "STRYKER_CXX_ACTIVE_MUTANT"
+MUTANT_SWITCH_EXPRESSION_MUTATORS = {
+    "BooleanLiteral",
+    "CallRemoval",
+    "ChronoCall",
+    "ContainerCall",
+    "ContainerStateCall",
+    "ConditionalExpression",
+    "FilesystemCall",
+    "IntegerLiteral",
+    "FloatingPointLiteral",
+    "CharacterLiteral",
+    "StringLiteral",
+    "IteratorCall",
+    "MathCall",
+    "MemoryOrder",
+    "MoveSemantics",
+    "NullLiteral",
+    "ObjCBoolLiteral",
+    "RegexCall",
+    "StandardLibraryCall",
+    "StringCall",
+}
+MUTANT_SWITCH_EXPRESSION_SPAN_MUTATORS = {
+    "ArithmeticOperator",
+    "AssignmentOperator",
+    "BitwiseOperator",
+    "ConditionalBoundary",
+    "EqualityOperator",
+    "LogicalOperator",
+    "LoopBoundary",
+    "LoopCondition",
+    "ShiftOperator",
+    "UnaryOperator",
+    "UpdateOperator",
+}
 BATCH_ISOLATED_MUTATORS = {
     "BlockRemoval",
     "CallRemoval",
@@ -469,6 +822,57 @@ IGNORE_MUTATOR_ALIASES: dict[str, str] = {
     "stdlibcall": "StandardLibraryCall",
     "standardlibrary": "StandardLibraryCall",
     "standardlibrarycall": "StandardLibraryCall",
+    "move": "MoveSemantics",
+    "stdmove": "MoveSemantics",
+    "forward": "MoveSemantics",
+    "stdforward": "MoveSemantics",
+    "movesemantics": "MoveSemantics",
+    "move-semantics": "MoveSemantics",
+    "container": "ContainerCall",
+    "containercall": "ContainerCall",
+    "container-call": "ContainerCall",
+    "iterator": "ContainerCall",
+    "iteratorboundary": "ContainerCall",
+    "containerstate": "ContainerStateCall",
+    "container-state": "ContainerStateCall",
+    "containerstatecall": "ContainerStateCall",
+    "container-state-call": "ContainerStateCall",
+    "capacity": "ContainerStateCall",
+    "empty": "ContainerStateCall",
+    "size": "ContainerStateCall",
+    "stringcall": "StringCall",
+    "string-call": "StringCall",
+    "stringsearch": "StringCall",
+    "string-search": "StringCall",
+    "find": "StringCall",
+    "rfind": "StringCall",
+    "math": "MathCall",
+    "mathcall": "MathCall",
+    "math-call": "MathCall",
+    "ceil": "MathCall",
+    "floor": "MathCall",
+    "round": "MathCall",
+    "trunc": "MathCall",
+    "iteratorcall": "IteratorCall",
+    "iterator-call": "IteratorCall",
+    "next": "IteratorCall",
+    "prev": "IteratorCall",
+    "chrono": "ChronoCall",
+    "chronocall": "ChronoCall",
+    "chrono-call": "ChronoCall",
+    "chronofloor": "ChronoCall",
+    "chronoceil": "ChronoCall",
+    "regex": "RegexCall",
+    "regexcall": "RegexCall",
+    "regex-call": "RegexCall",
+    "regexmatch": "RegexCall",
+    "regexsearch": "RegexCall",
+    "filesystem": "FilesystemCall",
+    "filesystemcall": "FilesystemCall",
+    "filesystem-call": "FilesystemCall",
+    "fsexists": "FilesystemCall",
+    "fsfile": "FilesystemCall",
+    "fsdirectory": "FilesystemCall",
     "memoryorder": "MemoryOrder",
     "memory-order": "MemoryOrder",
     "memberaccess": "MemberAccessOperator",
@@ -511,6 +915,15 @@ AST_MUTATOR_CURSOR_KINDS: dict[str, set[str]] = {
     "LoopBoundary": {"FOR_STMT", "WHILE_STMT", "DO_STMT"},
     "LoopCondition": {"FOR_STMT", "WHILE_STMT", "DO_STMT"},
     "StandardLibraryCall": {"CALL_EXPR", "DECL_REF_EXPR", "NAMESPACE_REF", "OVERLOADED_DECL_REF"},
+    "MoveSemantics": {"CALL_EXPR", "DECL_REF_EXPR", "UNEXPOSED_EXPR"},
+    "ContainerCall": {"CALL_EXPR", "CXX_MEMBER_CALL_EXPR", "MEMBER_REF_EXPR"},
+    "ContainerStateCall": {"CALL_EXPR", "CXX_MEMBER_CALL_EXPR", "MEMBER_REF_EXPR"},
+    "StringCall": {"CALL_EXPR", "CXX_MEMBER_CALL_EXPR", "MEMBER_REF_EXPR"},
+    "MathCall": {"CALL_EXPR", "DECL_REF_EXPR", "NAMESPACE_REF", "OVERLOADED_DECL_REF", "UNEXPOSED_EXPR"},
+    "IteratorCall": {"CALL_EXPR", "DECL_REF_EXPR", "NAMESPACE_REF", "OVERLOADED_DECL_REF", "UNEXPOSED_EXPR"},
+    "ChronoCall": {"CALL_EXPR", "DECL_REF_EXPR", "NAMESPACE_REF", "OVERLOADED_DECL_REF", "UNEXPOSED_EXPR"},
+    "RegexCall": {"CALL_EXPR", "DECL_REF_EXPR", "NAMESPACE_REF", "OVERLOADED_DECL_REF", "UNEXPOSED_EXPR"},
+    "FilesystemCall": {"CALL_EXPR", "DECL_REF_EXPR", "NAMESPACE_REF", "OVERLOADED_DECL_REF", "UNEXPOSED_EXPR"},
     "MemoryOrder": {"DECL_REF_EXPR", "MEMBER_REF_EXPR", "UNEXPOSED_EXPR"},
     "MemberAccessOperator": {"MEMBER_REF_EXPR", "CXX_DEPENDENT_SCOPE_MEMBER_EXPR", "OBJC_PROPERTY_REF_EXPR"},
     "ExceptionHandling": {"CXX_THROW_EXPR"},
@@ -520,6 +933,7 @@ AST_MUTATOR_CURSOR_KINDS: dict[str, set[str]] = {
     "MetalAddressSpace": {"PARM_DECL", "VAR_DECL", "TYPE_REF", "UNEXPOSED_ATTR", "ANNOTATE_ATTR"},
 }
 MACRO_CURSOR_KINDS = {"MACRO_INSTANTIATION", "MACRO_EXPANSION"}
+PREPROCESSOR_CURSOR_KINDS = MACRO_CURSOR_KINDS | {"MACRO_DEFINITION", "INCLUSION_DIRECTIVE"}
 
 
 def _load_plugin_manifest(path: str) -> dict[str, Any]:
@@ -550,6 +964,7 @@ def load_plugins(
     for manifest in manifests:
         payload = _load_plugin_manifest(manifest)
         name = str(payload.get("name", os.path.basename(manifest)))
+        capability_versions = _plugin_capability_versions(name, payload)
         reporter_defs: list[dict[str, Any]] = []
         reporter_metadata: list[dict[str, Any]] = []
         for mutator in payload.get("mutators", []):
@@ -604,6 +1019,7 @@ def load_plugins(
                 "version": str(payload.get("version", "")),
                 "path": manifest,
                 "capabilities": payload.get("capabilities", {}),
+                "capabilityVersions": capability_versions,
                 "mutators": [m.get("name") for m in payload.get("mutators", []) if isinstance(m, dict)],
                 "reporters": [r.get("name") for r in payload.get("reporters", []) if isinstance(r, dict)],
                 "reporterCommands": reporter_defs,
@@ -622,6 +1038,93 @@ def _plugin_commands(value: Any) -> list[str]:
     return []
 
 
+def _plugin_lifecycle_hook_names(event: str) -> list[str]:
+    out: list[str] = []
+    for name in (event, *PLUGIN_LIFECYCLE_ALIASES.get(event, ())):
+        if name not in out:
+            out.append(name)
+    return out
+
+
+def _plugin_lifecycle_event_for_hook(hook: str) -> str:
+    for event, aliases in PLUGIN_LIFECYCLE_ALIASES.items():
+        if hook in aliases:
+            return event
+    return hook
+
+
+def _plugin_redacted_environment_summary(
+    env_overrides: dict[str, str] | None = None,
+    env_inherit: list[str] | None = None,
+    env_block: list[str] | None = None,
+    extra: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "overrides": {
+            key: REDACTED_VALUE
+            for key in sorted(env_overrides or {})
+        },
+        "inherited": sorted(env_inherit) if env_inherit is not None else ["*"],
+        "blocked": sorted(env_block or []),
+        "provided": sorted(extra or {}),
+        "redacted": True,
+    }
+
+
+def _plugin_lifecycle_metadata(plugins: list[dict[str, Any]]) -> dict[str, Any]:
+    registered: list[dict[str, Any]] = []
+    load_order: list[str] = []
+    event_order = {event: idx for idx, event in enumerate(PLUGIN_LIFECYCLE_EVENTS)}
+    for plugin_index, plugin in enumerate(plugins):
+        plugin_name = str(plugin.get("name", ""))
+        load_order.append(plugin_name)
+        hooks = plugin.get("hooks", {})
+        if not isinstance(hooks, dict):
+            continue
+        hook_names = sorted(
+            (name for name in hooks if _plugin_commands(hooks.get(name))),
+            key=lambda name: (
+                event_order.get(_plugin_lifecycle_event_for_hook(str(name)), len(event_order)),
+                str(name),
+            ),
+        )
+        for hook in hook_names:
+            commands = _plugin_commands(hooks.get(hook))
+            registered.append(
+                {
+                    "plugin": plugin_name,
+                    "pluginIndex": plugin_index,
+                    "event": _plugin_lifecycle_event_for_hook(str(hook)),
+                    "hook": str(hook),
+                    "commandCount": len(commands),
+                    "commands": [_redact_sensitive_assignment_text(command) for command in commands],
+                    "legacyAlias": str(hook) in {"preRun", "postRun"},
+                }
+            )
+    return {
+        "schemaVersion": PLUGIN_LIFECYCLE_SCHEMA_VERSION,
+        "supportedEvents": list(PLUGIN_LIFECYCLE_EVENTS),
+        "legacyAliases": {
+            event: list(aliases)
+            for event, aliases in PLUGIN_LIFECYCLE_ALIASES.items()
+        },
+        "loadOrder": load_order,
+        "registeredHooks": registered,
+        "runs": [],
+        "localOnly": True,
+        "networkInstall": False,
+    }
+
+
+def _record_plugin_lifecycle_runs(rep: Report, records: list[dict[str, Any]]) -> None:
+    if not records:
+        return
+    lifecycle = rep.execution.setdefault("pluginLifecycle", _plugin_lifecycle_metadata([]))
+    runs = lifecycle.setdefault("runs", [])
+    if isinstance(runs, list):
+        runs.extend(records)
+
+
 def _run_plugin_command(
     command: str,
     repo: str,
@@ -632,26 +1135,57 @@ def _run_plugin_command(
     env_overrides: dict[str, str] | None = None,
     env_inherit: list[str] | None = None,
     env_block: list[str] | None = None,
-) -> None:
+    phase: str | None = None,
+) -> dict[str, Any]:
     os.makedirs(artifact_root, exist_ok=True)
     safe_plugin = _safe_basename(str(plugin.get("name", "plugin")))
     safe_hook = _safe_basename(hook)
     log_path = os.path.join(artifact_root, f"plugin_{safe_plugin}_{safe_hook}.log")
+    event = phase or _plugin_lifecycle_event_for_hook(hook)
+    extra_env = {
+        "STRYKER_CXX_PLUGIN": str(plugin.get("name", "")),
+        "STRYKER_CXX_HOOK": hook,
+        "STRYKER_CXX_PHASE": event,
+        "STRYKER_CXX_REPORT": report_path,
+        "STRYKER_CXX_ARTIFACT_DIR": artifact_root,
+    }
     env = _build_subprocess_env(
         env_overrides,
         env_inherit,
         env_block,
-        {
-            "STRYKER_CXX_PLUGIN": str(plugin.get("name", "")),
-            "STRYKER_CXX_HOOK": hook,
-            "STRYKER_CXX_REPORT": report_path,
-            "STRYKER_CXX_ARTIFACT_DIR": artifact_root,
-        },
+        extra_env,
     )
+    started = _utc_now_iso()
+    started_monotonic = time.monotonic()
     with open(log_path, "a") as log:
         proc = subprocess.run(command, cwd=repo, shell=True, stdout=log, stderr=subprocess.STDOUT, env=env)
+    completed = _utc_now_iso()
+    record = {
+        "phase": event,
+        "hook": hook,
+        "plugin": str(plugin.get("name", "")),
+        "command": _redact_sensitive_assignment_text(command),
+        "status": "passed" if proc.returncode == 0 else "failed",
+        "exitCode": proc.returncode,
+        "startedAt": started,
+        "completedAt": completed,
+        "durationMs": int((time.monotonic() - started_monotonic) * 1000),
+        "log": log_path,
+        "environment": _plugin_redacted_environment_summary(
+            env_overrides,
+            env_inherit,
+            env_block,
+            extra_env,
+        ),
+    }
     if proc.returncode != 0:
-        raise ValueError(f"plugin hook failed ({plugin.get('name')}:{hook}); see {log_path}")
+        env_summary = json.dumps(record["environment"], sort_keys=True)
+        raise ValueError(
+            "plugin hook failed "
+            f"(phase={event}, plugin={plugin.get('name')}, hook={hook}, "
+            f"command={record['command']}, env={env_summary}); see {log_path}"
+        )
+    return record
 
 
 def _run_plugin_hooks(
@@ -663,23 +1197,57 @@ def _run_plugin_hooks(
     env_overrides: dict[str, str] | None = None,
     env_inherit: list[str] | None = None,
     env_block: list[str] | None = None,
-) -> None:
+    phase: str | None = None,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
     for plugin in plugins:
         hooks = plugin.get("hooks", {})
         if not isinstance(hooks, dict):
             continue
         for command in _plugin_commands(hooks.get(hook)):
-            _run_plugin_command(
-                command,
+            records.append(
+                _run_plugin_command(
+                    command,
+                    repo,
+                    artifact_root,
+                    report_path,
+                    plugin,
+                    hook,
+                    env_overrides,
+                    env_inherit,
+                    env_block,
+                    phase,
+                )
+            )
+    return records
+
+
+def _run_plugin_lifecycle_hooks(
+    plugins: list[dict[str, Any]],
+    event: str,
+    repo: str,
+    artifact_root: str,
+    report_path: str,
+    env_overrides: dict[str, str] | None = None,
+    env_inherit: list[str] | None = None,
+    env_block: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for hook in _plugin_lifecycle_hook_names(event):
+        records.extend(
+            _run_plugin_hooks(
+                plugins,
+                hook,
                 repo,
                 artifact_root,
                 report_path,
-                plugin,
-                hook,
                 env_overrides,
                 env_inherit,
                 env_block,
+                phase=event,
             )
+        )
+    return records
 
 
 def _run_reporter_plugins(
@@ -691,10 +1259,11 @@ def _run_reporter_plugins(
     env_overrides: dict[str, str] | None = None,
     env_inherit: list[str] | None = None,
     env_block: list[str] | None = None,
-) -> None:
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
     requested = set(requested_reporters)
     if not requested:
-        return
+        return records
     for plugin in plugins:
         for reporter in plugin.get("reporterCommands", []):
             if not isinstance(reporter, dict):
@@ -702,17 +1271,110 @@ def _run_reporter_plugins(
             name = str(reporter.get("name", ""))
             command = str(reporter.get("command", ""))
             if name in requested and command:
-                _run_plugin_command(
-                    command,
-                    repo,
-                    artifact_root,
-                    report_path,
-                    plugin,
-                    f"reporter_{name}",
-                    env_overrides,
-                    env_inherit,
-                    env_block,
+                records.append(
+                    _run_plugin_command(
+                        command,
+                        repo,
+                        artifact_root,
+                        report_path,
+                        plugin,
+                        f"reporter_{name}",
+                        env_overrides,
+                        env_inherit,
+                        env_block,
+                        phase="reporting",
+                    )
                 )
+    return records
+
+
+def _reporter_name_from_hook(hook: Any) -> str:
+    hook_name = str(hook)
+    prefix = "reporter_"
+    return hook_name[len(prefix) :] if hook_name.startswith(prefix) else hook_name
+
+
+def _reporter_command_names(plugins: list[dict[str, Any]]) -> set[str]:
+    names: set[str] = set()
+    for plugin in plugins:
+        for reporter in plugin.get("reporterCommands", []):
+            if not isinstance(reporter, dict):
+                continue
+            name = str(reporter.get("name", ""))
+            command = str(reporter.get("command", ""))
+            if name and command:
+                names.add(name)
+    return names
+
+
+def _missing_reporter_request_records(
+    plugins: list[dict[str, Any]],
+    requested_reporters: list[str],
+) -> list[dict[str, Any]]:
+    available = sorted(_reporter_command_names(plugins))
+    available_set = set(available)
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for reporter in requested_reporters:
+        name = str(reporter)
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        if name in available_set:
+            continue
+        out.append(
+            {
+                "plugin": None,
+                "reporter": name,
+                "hook": None,
+                "phase": "reporting",
+                "command": None,
+                "status": "notFound",
+                "exitCode": None,
+                "durationMs": 0,
+                "log": None,
+                "environment": None,
+                "reason": "requested reporter was not provided by loaded plugin reporter commands",
+                "availableReporters": available,
+            }
+        )
+    return out
+
+
+def _record_reporter_plugin_runs(
+    rep: Report,
+    records: list[dict[str, Any]],
+    plugins: list[dict[str, Any]] | None = None,
+    requested_reporters: list[str] | None = None,
+) -> None:
+    _record_plugin_lifecycle_runs(rep, records)
+    diagnostic_records = _missing_reporter_request_records(
+        plugins or [],
+        requested_reporters or [],
+    )
+    if not records and not diagnostic_records:
+        return
+    reporter_runs = rep.execution.setdefault("reporterRuns", [])
+    if not isinstance(reporter_runs, list):
+        return
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        reporter_runs.append(
+            {
+                "plugin": record.get("plugin"),
+                "reporter": _reporter_name_from_hook(record.get("hook")),
+                "hook": record.get("hook"),
+                "phase": record.get("phase"),
+                "command": record.get("command"),
+                "status": record.get("status"),
+                "exitCode": record.get("exitCode"),
+                "durationMs": record.get("durationMs"),
+                "log": record.get("log"),
+                "environment": record.get("environment"),
+            }
+        )
+    reporter_runs.extend(diagnostic_records)
 
 
 def _reporter_metadata(
@@ -1248,6 +1910,57 @@ def _rejects_macro_candidate(
     return True
 
 
+def _record_macro_range_rejection(
+    analysis: dict[str, Any] | None,
+    path: str,
+    item: dict[str, int | str],
+    reason: str,
+) -> None:
+    if analysis is None:
+        return
+    analysis["macroRejectedRanges"] = int(analysis.get("macroRejectedRanges", 0)) + 1
+    rejections = analysis.setdefault("macroRangeRejections", [])
+    if isinstance(rejections, list):
+        rejections.append(
+            {
+                "file": path,
+                "startLine": int(item.get("startLine", 0) or 0),
+                "startColumn": int(item.get("startColumn", 0) or 0),
+                "endLine": int(item.get("endLine", 0) or 0),
+                "endColumn": int(item.get("endColumn", 0) or 0),
+                "nodeKind": str(item.get("kind", "")),
+                "reason": reason,
+            }
+        )
+
+
+def _range_touches_preprocessor_directive(src: list[str], item: dict[str, int | str]) -> bool:
+    start_line = int(item.get("startLine", 0) or 0)
+    end_line = int(item.get("endLine", 0) or 0)
+    if start_line <= 0 or end_line <= 0:
+        return False
+    for line_no in range(start_line, min(end_line, len(src)) + 1):
+        if src[line_no - 1].lstrip().startswith("#"):
+            return True
+    return False
+
+
+def _rejects_macro_range(
+    analysis: dict[str, Any] | None,
+    path: str,
+    src: list[str],
+    item: dict[str, int | str],
+) -> bool:
+    kind = str(item.get("kind", ""))
+    if kind in PREPROCESSOR_CURSOR_KINDS:
+        _record_macro_range_rejection(analysis, path, item, "source range is a macro or preprocessor cursor")
+        return True
+    if _range_touches_preprocessor_directive(src, item):
+        _record_macro_range_rejection(analysis, path, item, "source range touches a preprocessor directive")
+        return True
+    return False
+
+
 def _strip_noncode(
     line: str,
     in_block_comment: bool = False,
@@ -1336,6 +2049,14 @@ def _discover_call_removals(path: str, line: int, code: str, raw: str) -> list[M
             continue
         mut = Mutant("CallRemoval", path, line, match.start(1), original, "(void)0")
         mut.id = stable_id(mut)
+        mut.sourceRange = {
+            "kind": "TOKEN_CALL_EXPRESSION",
+            "startLine": line,
+            "startColumn": match.start(1) + 1,
+            "endLine": line,
+            "endColumn": match.start(1) + len(original) + 1,
+        }
+        mut.rewriteStrategy = "token-call-removal"
         out.append(mut)
     return out
 
@@ -1396,6 +2117,14 @@ def _discover_statement_removals(path: str, line: int, code: str, raw: str) -> l
             continue
         mut = Mutant("StatementRemoval", path, line, seg_start + leading, original, ";")
         mut.id = stable_id(mut)
+        mut.sourceRange = {
+            "kind": "TOKEN_STATEMENT",
+            "startLine": line,
+            "startColumn": seg_start + leading + 1,
+            "endLine": line,
+            "endColumn": seg_start + leading + len(original) + 1,
+        }
+        mut.rewriteStrategy = "token-statement-removal"
         out.append(mut)
     return out
 
@@ -1414,6 +2143,14 @@ def _discover_block_removals(path: str, line: int, code: str, raw: str) -> list[
     original = raw_line[start : end + 1]
     mut = Mutant("BlockRemoval", path, line, start, original, "{}")
     mut.id = stable_id(mut)
+    mut.sourceRange = {
+        "kind": "TOKEN_BLOCK",
+        "startLine": line,
+        "startColumn": start + 1,
+        "endLine": line,
+        "endColumn": end + 2,
+    }
+    mut.rewriteStrategy = "token-block-removal"
     return [mut]
 
 
@@ -1495,6 +2232,8 @@ def _discover_loop_boundary_mutations(path: str, line: int, code: str) -> list[M
         condition = code[cond_start:cond_end]
         if not condition.strip():
             continue
+        leading = len(condition) - len(condition.lstrip())
+        trailing = len(condition) - len(condition.rstrip())
         for orig, new in MUTATORS["LoopBoundary"]:
             pattern = _TOKEN_PATTERNS.get(orig)
             if pattern is None:
@@ -1509,6 +2248,14 @@ def _discover_loop_boundary_mutations(path: str, line: int, code: str) -> list[M
                     new,
                 )
                 mut.id = stable_id(mut)
+                mut.sourceRange = {
+                    "kind": "TOKEN_LOOP_CONDITION",
+                    "startLine": line,
+                    "startColumn": cond_start + leading + 1,
+                    "endLine": line,
+                    "endColumn": cond_end - trailing + 1,
+                }
+                mut.rewriteStrategy = "token-loop-boundary"
                 out.append(mut)
     return out
 
@@ -1530,6 +2277,14 @@ def _discover_loop_condition_mutations(path: str, line: int, code: str) -> list[
             f"!({core})",
         )
         mut.id = stable_id(mut)
+        mut.sourceRange = {
+            "kind": "TOKEN_LOOP_CONDITION",
+            "startLine": line,
+            "startColumn": cond_start + leading + 1,
+            "endLine": line,
+            "endColumn": cond_end - trailing + 1,
+        }
+        mut.rewriteStrategy = "token-loop-condition"
         out.append(mut)
     return out
 
@@ -1556,6 +2311,14 @@ def _discover_member_access_mutations(path: str, line: int, code: str) -> list[M
             replacement,
         )
         mut.id = stable_id(mut)
+        mut.sourceRange = {
+            "kind": "TOKEN_MEMBER_ACCESS_OPERATOR",
+            "startLine": line,
+            "startColumn": match.start("op") + 1,
+            "endLine": line,
+            "endColumn": match.start("op") + len(op) + 1,
+        }
+        mut.rewriteStrategy = "token-member-access-operator"
         out.append(mut)
     return out
 
@@ -1575,6 +2338,14 @@ def _discover_exception_handling_mutations(path: str, line: int, code: str, raw:
             "(void)0;",
         )
         mut.id = stable_id(mut)
+        mut.sourceRange = {
+            "kind": "TOKEN_THROW_STATEMENT",
+            "startLine": line,
+            "startColumn": match.start() + 1,
+            "endLine": line,
+            "endColumn": match.start() + len(original) + 1,
+        }
+        mut.rewriteStrategy = "token-throw-statement"
         out.append(mut)
     return out
 
@@ -1594,6 +2365,14 @@ def _discover_preprocessor_guard_mutations(path: str, line: int, raw: str) -> li
             mutated,
         )
         mut.id = stable_id(mut)
+        mut.sourceRange = {
+            "kind": "TOKEN_PREPROCESSOR_GUARD",
+            "startLine": line,
+            "startColumn": ifdef_match.start(2) + 1,
+            "endLine": line,
+            "endColumn": ifdef_match.start(2) + len(original) + 1,
+        }
+        mut.rewriteStrategy = "token-preprocessor-guard"
         out.append(mut)
         return out
 
@@ -1609,6 +2388,14 @@ def _discover_preprocessor_guard_mutations(path: str, line: int, raw: str) -> li
             "1" if original == "0" else "0",
         )
         mut.id = stable_id(mut)
+        mut.sourceRange = {
+            "kind": "TOKEN_PREPROCESSOR_GUARD",
+            "startLine": line,
+            "startColumn": if_match.start(2) + 1,
+            "endLine": line,
+            "endColumn": if_match.start(2) + len(original) + 1,
+        }
+        mut.rewriteStrategy = "token-preprocessor-guard"
         out.append(mut)
     return out
 
@@ -1629,6 +2416,14 @@ def _discover_objc_message_send_mutations(path: str, line: int, code: str, raw: 
         "(void)0",
     )
     mut.id = stable_id(mut)
+    mut.sourceRange = {
+        "kind": "TOKEN_OBJC_MESSAGE_EXPR",
+        "startLine": line,
+        "startColumn": match.start(1) + 1,
+        "endLine": line,
+        "endColumn": match.start(1) + len(original) + 1,
+    }
+    mut.rewriteStrategy = "token-objc-message-send"
     return [mut]
 
 
@@ -1655,6 +2450,14 @@ def _discover_metal_address_space_mutations(path: str, line: int, code: str) -> 
             replacement,
         )
         mut.id = stable_id(mut)
+        mut.sourceRange = {
+            "kind": "TOKEN_METAL_ADDRESS_SPACE",
+            "startLine": line,
+            "startColumn": match.start(1) + 1,
+            "endLine": line,
+            "endColumn": match.start(1) + len(original) + 1,
+        }
+        mut.rewriteStrategy = "token-metal-address-space"
         out.append(mut)
     return out
 
@@ -1714,6 +2517,230 @@ def _null_literal_range_replacement(text: str) -> tuple[int, str, str] | None:
     original = match.group(0)
     replacement = "NULL" if original == "nullptr" else "nullptr"
     return match.start(), original, replacement
+
+
+def _move_semantics_range_replacement(text: str) -> tuple[int, str, str] | None:
+    match = _MOVE_SEMANTICS_CALL_RE.search(text)
+    if not match:
+        return None
+    open_paren = match.end()
+    while open_paren < len(text) and text[open_paren].isspace():
+        open_paren += 1
+    if open_paren >= len(text) or text[open_paren] != "(":
+        return None
+    close_paren = _find_matching_paren(text, open_paren)
+    if close_paren is None:
+        return None
+    args = _split_top_level_arguments(text[open_paren + 1 : close_paren])
+    if len(args) != 1:
+        return None
+    original = text[match.start() : close_paren + 1]
+    mutated = args[0].strip()
+    if not mutated:
+        return None
+    return match.start(), original, mutated
+
+
+def _member_call_range_replacement(text: str, match: re.Match[str], replacement: str) -> tuple[int, str, str] | None:
+    target_start = match.start("target")
+    receiver_end = _skip_left_space(text, target_start - 1)
+    if receiver_end < 0:
+        return None
+    if text[receiver_end] in ")]}":
+        receiver_start = _matching_left_delimiter(text, receiver_end)
+        if receiver_start is None:
+            return None
+        prefix_end = _skip_left_space(text, receiver_start - 1)
+        if prefix_end >= 0 and re.match(r"[A-Za-z0-9_:~]", text[prefix_end]):
+            receiver_start = _identifier_start_left(text, prefix_end + 1)
+    else:
+        receiver_start = _identifier_start_left(text, receiver_end + 1)
+    if receiver_start >= target_start:
+        return None
+    open_paren = match.end("target")
+    while open_paren < len(text) and text[open_paren].isspace():
+        open_paren += 1
+    if open_paren >= len(text) or text[open_paren] != "(":
+        return None
+    close_paren = _find_matching_paren(text, open_paren)
+    if close_paren is None:
+        return None
+    original = text[receiver_start : close_paren + 1]
+    mutated = text[receiver_start:target_start] + f".{replacement}" + text[open_paren : close_paren + 1]
+    return receiver_start, original, mutated
+
+
+def _qualified_call_range_replacement(
+    text: str,
+    match: re.Match[str],
+    replacement: str,
+) -> tuple[int, str, str] | None:
+    target_start = match.start("target")
+    open_paren = match.end("target")
+    while open_paren < len(text) and text[open_paren].isspace():
+        open_paren += 1
+    if open_paren >= len(text) or text[open_paren] != "(":
+        return None
+    close_paren = _find_matching_paren(text, open_paren)
+    if close_paren is None:
+        return None
+    original = text[target_start : close_paren + 1]
+    mutated = replacement + text[open_paren : close_paren + 1]
+    return target_start, original, mutated
+
+
+def _standard_library_call_range_replacement(text: str) -> tuple[int, str, str] | None:
+    match = _STANDARD_LIBRARY_CALL_RE.search(text)
+    if not match:
+        return None
+    original_name = f"std::{match.group('name')}"
+    replacement = _STANDARD_LIBRARY_CALL_REPLACEMENTS.get(original_name)
+    if replacement is None:
+        return None
+    return _qualified_call_range_replacement(text, match, replacement)
+
+
+def _container_call_range_replacement(text: str) -> tuple[int, str, str] | None:
+    match = _CONTAINER_CALL_RE.search(text)
+    if not match:
+        return None
+    name = match.group("name")
+    replacement = _CONTAINER_CALL_REPLACEMENTS.get(name)
+    if replacement is None:
+        return None
+    return _member_call_range_replacement(text, match, replacement)
+
+
+def _container_state_call_range_replacement(text: str) -> tuple[int, str, str] | None:
+    match = _CONTAINER_STATE_CALL_RE.search(text)
+    if not match:
+        return None
+    name = match.group("name")
+    replacement = _CONTAINER_STATE_CALL_REPLACEMENTS.get(name)
+    if replacement is None:
+        return None
+    return _member_call_range_replacement(text, match, replacement)
+
+
+def _string_call_range_replacement(text: str) -> tuple[int, str, str] | None:
+    match = _STRING_CALL_RE.search(text)
+    if not match:
+        return None
+    name = match.group("name")
+    replacement = _STRING_CALL_REPLACEMENTS.get(name)
+    if replacement is None:
+        return None
+    return _member_call_range_replacement(text, match, replacement)
+
+
+def _math_call_range_replacement(text: str) -> tuple[int, str, str] | None:
+    match = _MATH_CALL_RE.search(text)
+    if not match:
+        return None
+    name = match.group("name")
+    replacement = _MATH_CALL_REPLACEMENTS.get(name)
+    if replacement is None:
+        return None
+    prefix = match.group("prefix") or ""
+    open_paren = match.end()
+    while open_paren < len(text) and text[open_paren].isspace():
+        open_paren += 1
+    if open_paren >= len(text) or text[open_paren] != "(":
+        return None
+    close_paren = _find_matching_paren(text, open_paren)
+    if close_paren is None:
+        return None
+    original = text[match.start("target") : close_paren + 1]
+    mutated = f"{prefix}{replacement}{text[open_paren : close_paren + 1]}"
+    return match.start("target"), original, mutated
+
+
+def _iterator_call_range_replacement(text: str) -> tuple[int, str, str] | None:
+    match = _ITERATOR_CALL_RE.search(text)
+    if not match:
+        return None
+    name = match.group("name")
+    replacement = _ITERATOR_CALL_REPLACEMENTS.get(name)
+    if replacement is None:
+        return None
+    prefix = match.group("prefix") or ""
+    open_paren = match.end()
+    while open_paren < len(text) and text[open_paren].isspace():
+        open_paren += 1
+    if open_paren >= len(text) or text[open_paren] != "(":
+        return None
+    close_paren = _find_matching_paren(text, open_paren)
+    if close_paren is None:
+        return None
+    original = text[match.start("target") : close_paren + 1]
+    mutated = f"{prefix}{replacement}{text[open_paren : close_paren + 1]}"
+    return match.start("target"), original, mutated
+
+
+def _chrono_call_range_replacement(text: str) -> tuple[int, str, str] | None:
+    match = _CHRONO_CALL_RE.search(text)
+    if not match:
+        return None
+    name = match.group("name")
+    replacement = _CHRONO_CALL_REPLACEMENTS.get(name)
+    if replacement is None:
+        return None
+    prefix = match.group("prefix") or ""
+    open_paren = match.end()
+    while open_paren < len(text) and text[open_paren].isspace():
+        open_paren += 1
+    if open_paren >= len(text) or text[open_paren] != "(":
+        return None
+    close_paren = _find_matching_paren(text, open_paren)
+    if close_paren is None:
+        return None
+    original = text[match.start("target") : close_paren + 1]
+    mutated = f"{prefix}{replacement}{text[match.end('target') : close_paren + 1]}"
+    return match.start("target"), original, mutated
+
+
+def _regex_call_range_replacement(text: str) -> tuple[int, str, str] | None:
+    match = _REGEX_CALL_RE.search(text)
+    if not match:
+        return None
+    name = match.group("name")
+    replacement = _REGEX_CALL_REPLACEMENTS.get(name)
+    if replacement is None:
+        return None
+    prefix = match.group("prefix") or ""
+    open_paren = match.end()
+    while open_paren < len(text) and text[open_paren].isspace():
+        open_paren += 1
+    if open_paren >= len(text) or text[open_paren] != "(":
+        return None
+    close_paren = _find_matching_paren(text, open_paren)
+    if close_paren is None:
+        return None
+    original = text[match.start("target") : close_paren + 1]
+    mutated = f"{prefix}{replacement}{text[open_paren : close_paren + 1]}"
+    return match.start("target"), original, mutated
+
+
+def _filesystem_call_range_replacement(text: str) -> tuple[int, str, str] | None:
+    match = _FILESYSTEM_CALL_RE.search(text)
+    if not match:
+        return None
+    name = match.group("name")
+    replacement = _FILESYSTEM_CALL_REPLACEMENTS.get(name)
+    if replacement is None:
+        return None
+    prefix = match.group("prefix") or ""
+    open_paren = match.end()
+    while open_paren < len(text) and text[open_paren].isspace():
+        open_paren += 1
+    if open_paren >= len(text) or text[open_paren] != "(":
+        return None
+    close_paren = _find_matching_paren(text, open_paren)
+    if close_paren is None:
+        return None
+    original = text[match.start("target") : close_paren + 1]
+    mutated = f"{prefix}{replacement}{text[open_paren : close_paren + 1]}"
+    return match.start("target"), original, mutated
 
 
 def _string_literal_range_replacement(text: str) -> tuple[int, str, str] | None:
@@ -1977,6 +3004,13 @@ def _conditional_expression_branches(text: str) -> tuple[str, str] | None:
     return None
 
 
+def _standard_library_call_name_and_args(mut: Mutant, line: str) -> tuple[str, list[str]]:
+    match = _STANDARD_LIBRARY_CALL_RE.match(mut.original)
+    if match:
+        return f"std::{match.group('name')}", _call_arguments_after(mut.original, match.end("target"))
+    return mut.original, _call_arguments_after(line, mut.col + len(mut.original))
+
+
 def _equivalent_suppression_reason(mut: Mutant, src: list[str], generated: bool, mode: str) -> str | None:
     if generated:
         return "generated code auto-suppression"
@@ -2008,15 +3042,22 @@ def _equivalent_suppression_reason(mut: Mutant, src: list[str], generated: bool,
             and _normalize_equivalent_operand(left) == _normalize_equivalent_operand(right)
         ):
             return "equivalent duplicate bitwise operand"
-    if mut.mutator == "StandardLibraryCall" and mut.original in {"std::min", "std::max"}:
-        args = _call_arguments_after(line, mut.col + len(mut.original))
-        if (
+    if mut.mutator == "StandardLibraryCall":
+        original_name, args = _standard_library_call_name_and_args(mut, line)
+        if original_name in {"std::min", "std::max"} and (
             len(args) == 2
             and _operand_is_pureish(args[0])
             and _operand_is_pureish(args[1])
             and _normalize_equivalent_operand(args[0]) == _normalize_equivalent_operand(args[1])
         ):
             return "equivalent duplicate standard-library operands"
+        if original_name in {"std::lower_bound", "std::upper_bound"} and (
+            len(args) >= 2
+            and _operand_is_pureish(args[0])
+            and _operand_is_pureish(args[1])
+            and _normalize_equivalent_operand(args[0]) == _normalize_equivalent_operand(args[1])
+        ):
+            return "equivalent duplicate standard-library range"
     if mut.mutator == "ConditionalExpression":
         branches = _conditional_expression_branches(mut.original)
         if branches is not None:
@@ -2026,6 +3067,13 @@ def _equivalent_suppression_reason(mut: Mutant, src: list[str], generated: bool,
     if mode == "aggressive" and mut.mutator == "NullLiteral":
         return "style-equivalent null literal suppression"
     return None
+
+
+def _equivalent_suppression_rule_id(reason: str) -> str:
+    return EQUIVALENT_SUPPRESSION_RULE_IDS.get(
+        reason,
+        re.sub(r"[^a-z0-9]+", "-", reason.lower()).strip("-") or "equivalent-suppression",
+    )
 
 
 def _record_equivalent_suppression(
@@ -2056,6 +3104,7 @@ def _record_equivalent_suppression(
                     "line": mut.line,
                     "column": mut.col + 1,
                     "mutator": mut.mutator,
+                    "ruleId": _equivalent_suppression_rule_id(reason),
                     "reason": reason,
                 }
             )
@@ -2088,6 +3137,8 @@ def _apply_equivalent_suppression(
         mut.detail = reason
         mut.ignoreReason = reason
         mut.run["suppression"] = "equivalent"
+        mut.run["suppressionRule"] = _equivalent_suppression_rule_id(reason)
+        mut.run["suppressionReason"] = reason
         _record_equivalent_suppression(analysis, mode, mut, reason)
     return mutants
 
@@ -2144,14 +3195,441 @@ def changed_lines(repo: str, diff_base: str, path: str) -> set[int]:
 
 
 def mutation_repro_command(mut: Mutant, repo: str, build_cmd: str, test_cmd: str, report: str | None = None) -> str:
-    return (
-        f"stryker-cxx run-mutant --repo {_quote_for_shell(repo)} "
-        f"--id {_quote_for_shell(mut.id)} "
-        f"--build-command {_quote_for_shell(build_cmd)} "
-        f"--test-command {_quote_for_shell(test_cmd)} "
-        f"--report {_quote_for_shell(report or os.path.join(repo, 'mutation.json'))} "
-        "--output-format stryker-cxx"
-    )
+    parts = [
+        "stryker-cxx",
+        "run-mutant",
+        "--repo",
+        _quote_for_shell(repo),
+        "--id",
+        _quote_for_shell(mut.id),
+        "--build-command",
+        _quote_for_shell(build_cmd),
+        "--test-command",
+        _quote_for_shell(test_cmd),
+        "--report",
+        _quote_for_shell(report or os.path.join(repo, "mutation.json")),
+        "--output-format",
+        "stryker-cxx",
+    ]
+    run = mut.run if isinstance(mut.run, dict) else {}
+    mode = run.get("mode")
+    if isinstance(mode, str) and mode:
+        parts.extend(["--mode", _quote_for_shell(mode)])
+    execution_mode = run.get("executionMode")
+    if isinstance(execution_mode, str) and execution_mode:
+        parts.extend(["--execution-mode", _quote_for_shell(execution_mode)])
+    artifact = run.get("compiledArtifact")
+    if isinstance(artifact, dict):
+        backend = artifact.get("backend")
+        if isinstance(backend, str) and backend:
+            parts.extend(["--artifact-backend", _quote_for_shell(backend)])
+        target = artifact.get("target")
+        if isinstance(target, str) and target:
+            parts.extend(["--build-target", _quote_for_shell(target)])
+    worktree_mode = run.get("worktreeMode")
+    if isinstance(worktree_mode, str) and worktree_mode and worktree_mode != "inplace":
+        parts.extend(["--worktree-mode", _quote_for_shell(worktree_mode)])
+    return " ".join(parts)
+
+
+_UNARY_SIGN_RE = re.compile(
+    r"(?P<prefix>(?:^|[=(,{?:]\s*|\breturn\s+))"
+    r"(?P<op>[+-])(?![+=-])"
+    r"(?P<operand>[A-Za-z_][A-Za-z0-9_:]*|\d+(?:\.\d+)?)"
+)
+_UPDATE_OPERATOR_RE = re.compile(
+    r"(?<![+\-])(?P<prefix>(?P<prefix_op>\+\+|--)\s*(?P<prefix_operand>[A-Za-z_][A-Za-z0-9_]*))"
+    r"|(?P<suffix>(?P<suffix_operand>[A-Za-z_][A-Za-z0-9_]*)(?P<suffix_op>\+\+|--))(?![+\-=])"
+)
+_MOVE_SEMANTICS_CALL_RE = re.compile(
+    r"\bstd\s*::\s*(?:move|forward)(?:\s*<[^;\n()]+>)?\s*(?=\()"
+)
+_STANDARD_LIBRARY_CALL_REPLACEMENTS = {
+    original: replacement for original, replacement in MUTATORS["StandardLibraryCall"]
+}
+_STANDARD_LIBRARY_CALL_RE = re.compile(
+    r"\b(?P<target>std\s*::\s*(?P<name>"
+    r"min|max|all_of|any_of|none_of|equal|mismatch|lower_bound|upper_bound|"
+    r"c?begin|c?end|stable_sort|sort|stable_partition|partition|is_sorted|is_heap"
+    r"))\s*(?=\()"
+)
+_CONTAINER_CALL_REPLACEMENTS = {
+    "front": "back",
+    "back": "front",
+    "begin": "end",
+    "end": "begin",
+    "cbegin": "cend",
+    "cend": "cbegin",
+    "rbegin": "rend",
+    "rend": "rbegin",
+}
+_CONTAINER_CALL_RE = re.compile(
+    r"(?P<target>\.(?P<name>front|back|c?begin|c?end|rbegin|rend))\s*(?=\()"
+)
+_CONTAINER_STATE_CALL_REPLACEMENTS = {
+    "empty": "size",
+    "size": "empty",
+    "capacity": "size",
+    "max_size": "size",
+}
+_CONTAINER_STATE_CALL_RE = re.compile(
+    r"(?P<target>\.(?P<name>empty|size|capacity|max_size))\s*(?=\()"
+)
+_STRING_CALL_REPLACEMENTS = {
+    "find": "rfind",
+    "rfind": "find",
+    "starts_with": "ends_with",
+    "ends_with": "starts_with",
+}
+_STRING_CALL_RE = re.compile(
+    r"(?P<target>\.(?P<name>find|rfind|starts_with|ends_with))\s*(?=\()"
+)
+_MATH_CALL_REPLACEMENTS = {
+    "ceil": "floor",
+    "floor": "ceil",
+    "round": "trunc",
+    "trunc": "round",
+}
+_MATH_CALL_RE = re.compile(
+    r"(?<![\w:.])(?P<target>(?P<prefix>std\s*::\s*)?(?P<name>ceil|floor|round|trunc))\s*(?=\()"
+)
+_ITERATOR_CALL_REPLACEMENTS = {
+    "next": "prev",
+    "prev": "next",
+}
+_ITERATOR_CALL_RE = re.compile(
+    r"(?<![\w:.])(?P<target>(?P<prefix>std\s*::\s*)?(?P<name>next|prev))\s*(?=\()"
+)
+_CHRONO_CALL_REPLACEMENTS = {
+    "floor": "ceil",
+    "ceil": "floor",
+}
+_CHRONO_CALL_RE = re.compile(
+    r"(?<![\w:.])(?P<target>(?P<prefix>(?:std\s*::\s*)?chrono\s*::\s*)"
+    r"(?P<name>floor|ceil))(?:\s*<[^;\n()]+>)?\s*(?=\()"
+)
+_REGEX_CALL_REPLACEMENTS = {
+    "regex_match": "regex_search",
+    "regex_search": "regex_match",
+}
+_REGEX_CALL_RE = re.compile(
+    r"(?<![\w:.])(?P<target>(?P<prefix>std\s*::\s*)?(?P<name>regex_match|regex_search))\s*(?=\()"
+)
+_FILESYSTEM_CALL_REPLACEMENTS = {
+    "exists": "is_empty",
+    "is_empty": "exists",
+    "is_regular_file": "is_directory",
+    "is_directory": "is_regular_file",
+}
+_FILESYSTEM_CALL_RE = re.compile(
+    r"(?<![\w:.])(?P<target>(?P<prefix>(?:std\s*::\s*)?filesystem\s*::\s*)"
+    r"(?P<name>exists|is_empty|is_regular_file|is_directory))\s*(?=\()"
+)
+
+
+def _discover_unary_operator_mutations(path: str, line_no: int, code: str) -> list[Mutant]:
+    out: list[Mutant] = []
+    for match in re.finditer(_TOKEN_PATTERNS["!"], code):
+        span_end = _token_binary_right_span_end(code, match.end())
+        if span_end is None:
+            continue
+        source_range = {
+            "kind": "TOKEN_UNARY_EXPRESSION",
+            "startLine": line_no,
+            "startColumn": match.start() + 1,
+            "endLine": line_no,
+            "endColumn": span_end + 1,
+        }
+        for mutated in ("", "!!"):
+            mut = Mutant("UnaryOperator", path, line_no, match.start(), "!", mutated)
+            mut.id = stable_id(mut)
+            mut.sourceRange = source_range
+            mut.rewriteStrategy = "token-unary-expression"
+            out.append(mut)
+    for match in _UNARY_SIGN_RE.finditer(code):
+        op = match.group("op")
+        mutated = "-" if op == "+" else "+"
+        mut = Mutant("UnaryOperator", path, line_no, match.start("op"), op, mutated)
+        mut.id = stable_id(mut)
+        span_end = _token_binary_right_span_end(code, match.end("op"))
+        if span_end is not None:
+            mut.sourceRange = {
+                "kind": "TOKEN_UNARY_EXPRESSION",
+                "startLine": line_no,
+                "startColumn": match.start("op") + 1,
+                "endLine": line_no,
+                "endColumn": span_end + 1,
+            }
+        mut.rewriteStrategy = "token-unary-sign"
+        out.append(mut)
+    return out
+
+
+def _update_operator_range_replacements(text: str) -> list[tuple[int, str, str]]:
+    out: list[tuple[int, str, str]] = []
+    for match in _UPDATE_OPERATOR_RE.finditer(text):
+        if match.group("prefix") is not None:
+            start = match.start("prefix")
+            original = match.group("prefix")
+            op_start = match.start("prefix_op") - start
+            op = match.group("prefix_op")
+        else:
+            start = match.start("suffix")
+            original = match.group("suffix")
+            op_start = match.start("suffix_op") - start
+            op = match.group("suffix_op")
+        mutated_op = "--" if op == "++" else "++"
+        mutated = original[:op_start] + mutated_op + original[op_start + len(op) :]
+        out.append((start, original, mutated))
+    return out
+
+
+def _discover_update_operator_mutations(path: str, line_no: int, code: str) -> list[Mutant]:
+    out: list[Mutant] = []
+    for col, original, mutated in _update_operator_range_replacements(code):
+        mut = Mutant("UpdateOperator", path, line_no, col, original, mutated)
+        mut.id = stable_id(mut)
+        mut.sourceRange = {
+            "kind": "TOKEN_UPDATE_EXPRESSION",
+            "startLine": line_no,
+            "startColumn": col + 1,
+            "endLine": line_no,
+            "endColumn": col + len(original) + 1,
+        }
+        mut.rewriteStrategy = "token-update-expression"
+        out.append(mut)
+    return out
+
+
+def _discover_move_semantics_mutations(path: str, line_no: int, code: str) -> list[Mutant]:
+    out: list[Mutant] = []
+    for match in _MOVE_SEMANTICS_CALL_RE.finditer(code):
+        replacement = _move_semantics_range_replacement(code[match.start() :])
+        if replacement is None:
+            continue
+        offset, original, mutated = replacement
+        mut = Mutant("MoveSemantics", path, line_no, match.start() + offset, original, mutated)
+        mut.id = stable_id(mut)
+        mut.sourceRange = {
+            "kind": "TOKEN_CALL_EXPRESSION",
+            "startLine": line_no,
+            "startColumn": match.start() + offset + 1,
+            "endLine": line_no,
+            "endColumn": match.start() + offset + len(original) + 1,
+        }
+        mut.rewriteStrategy = "token-call-wrapper-removal"
+        out.append(mut)
+    return out
+
+
+def _discover_standard_library_call_mutations(path: str, line_no: int, code: str) -> list[Mutant]:
+    out: list[Mutant] = []
+    for match in _STANDARD_LIBRARY_CALL_RE.finditer(code):
+        original_name = f"std::{match.group('name')}"
+        replacement_name = _STANDARD_LIBRARY_CALL_REPLACEMENTS.get(original_name)
+        if replacement_name is None:
+            continue
+        replacement = _qualified_call_range_replacement(code, match, replacement_name)
+        if replacement is None:
+            continue
+        col, original, mutated = replacement
+        mut = Mutant("StandardLibraryCall", path, line_no, col, original, mutated)
+        mut.id = stable_id(mut)
+        mut.sourceRange = {
+            "kind": "TOKEN_CALL_EXPRESSION",
+            "startLine": line_no,
+            "startColumn": col + 1,
+            "endLine": line_no,
+            "endColumn": col + len(original) + 1,
+        }
+        mut.rewriteStrategy = "token-standard-library-call"
+        out.append(mut)
+    return out
+
+
+def _discover_container_call_mutations(path: str, line_no: int, code: str) -> list[Mutant]:
+    out: list[Mutant] = []
+    for match in _CONTAINER_CALL_RE.finditer(code):
+        name = match.group("name")
+        replacement_name = _CONTAINER_CALL_REPLACEMENTS.get(name)
+        if replacement_name is None:
+            continue
+        replacement = _member_call_range_replacement(code, match, replacement_name)
+        if replacement is None:
+            continue
+        col, original, mutated = replacement
+        mut = Mutant("ContainerCall", path, line_no, col, original, mutated)
+        mut.id = stable_id(mut)
+        mut.sourceRange = {
+            "kind": "TOKEN_CALL_EXPRESSION",
+            "startLine": line_no,
+            "startColumn": col + 1,
+            "endLine": line_no,
+            "endColumn": col + len(original) + 1,
+        }
+        mut.rewriteStrategy = "token-container-call"
+        out.append(mut)
+    return out
+
+
+def _discover_container_state_call_mutations(path: str, line_no: int, code: str) -> list[Mutant]:
+    out: list[Mutant] = []
+    for match in _CONTAINER_STATE_CALL_RE.finditer(code):
+        name = match.group("name")
+        replacement_name = _CONTAINER_STATE_CALL_REPLACEMENTS.get(name)
+        if replacement_name is None:
+            continue
+        replacement = _member_call_range_replacement(code, match, replacement_name)
+        if replacement is None:
+            continue
+        col, original, mutated = replacement
+        mut = Mutant("ContainerStateCall", path, line_no, col, original, mutated)
+        mut.id = stable_id(mut)
+        mut.sourceRange = {
+            "kind": "TOKEN_CALL_EXPRESSION",
+            "startLine": line_no,
+            "startColumn": col + 1,
+            "endLine": line_no,
+            "endColumn": col + len(original) + 1,
+        }
+        mut.rewriteStrategy = "token-container-state-call"
+        out.append(mut)
+    return out
+
+
+def _discover_string_call_mutations(path: str, line_no: int, code: str) -> list[Mutant]:
+    out: list[Mutant] = []
+    for match in _STRING_CALL_RE.finditer(code):
+        name = match.group("name")
+        replacement_name = _STRING_CALL_REPLACEMENTS.get(name)
+        if replacement_name is None:
+            continue
+        replacement = _member_call_range_replacement(code, match, replacement_name)
+        if replacement is None:
+            continue
+        col, original, mutated = replacement
+        mut = Mutant("StringCall", path, line_no, col, original, mutated)
+        mut.id = stable_id(mut)
+        mut.sourceRange = {
+            "kind": "TOKEN_CALL_EXPRESSION",
+            "startLine": line_no,
+            "startColumn": col + 1,
+            "endLine": line_no,
+            "endColumn": col + len(original) + 1,
+        }
+        mut.rewriteStrategy = "token-string-call"
+        out.append(mut)
+    return out
+
+
+def _discover_math_call_mutations(path: str, line_no: int, code: str) -> list[Mutant]:
+    out: list[Mutant] = []
+    for match in _MATH_CALL_RE.finditer(code):
+        replacement = _math_call_range_replacement(code[match.start("target") :])
+        if replacement is None:
+            continue
+        offset, original, mutated = replacement
+        col = match.start("target") + offset
+        mut = Mutant("MathCall", path, line_no, col, original, mutated)
+        mut.id = stable_id(mut)
+        mut.sourceRange = {
+            "kind": "TOKEN_CALL_EXPRESSION",
+            "startLine": line_no,
+            "startColumn": col + 1,
+            "endLine": line_no,
+            "endColumn": col + len(original) + 1,
+        }
+        mut.rewriteStrategy = "token-math-call"
+        out.append(mut)
+    return out
+
+
+def _discover_iterator_call_mutations(path: str, line_no: int, code: str) -> list[Mutant]:
+    out: list[Mutant] = []
+    for match in _ITERATOR_CALL_RE.finditer(code):
+        replacement = _iterator_call_range_replacement(code[match.start("target") :])
+        if replacement is None:
+            continue
+        offset, original, mutated = replacement
+        col = match.start("target") + offset
+        mut = Mutant("IteratorCall", path, line_no, col, original, mutated)
+        mut.id = stable_id(mut)
+        mut.sourceRange = {
+            "kind": "TOKEN_CALL_EXPRESSION",
+            "startLine": line_no,
+            "startColumn": col + 1,
+            "endLine": line_no,
+            "endColumn": col + len(original) + 1,
+        }
+        mut.rewriteStrategy = "token-iterator-call"
+        out.append(mut)
+    return out
+
+
+def _discover_chrono_call_mutations(path: str, line_no: int, code: str) -> list[Mutant]:
+    out: list[Mutant] = []
+    for match in _CHRONO_CALL_RE.finditer(code):
+        replacement = _chrono_call_range_replacement(code[match.start("target") :])
+        if replacement is None:
+            continue
+        offset, original, mutated = replacement
+        col = match.start("target") + offset
+        mut = Mutant("ChronoCall", path, line_no, col, original, mutated)
+        mut.id = stable_id(mut)
+        mut.sourceRange = {
+            "kind": "TOKEN_CALL_EXPRESSION",
+            "startLine": line_no,
+            "startColumn": col + 1,
+            "endLine": line_no,
+            "endColumn": col + len(original) + 1,
+        }
+        mut.rewriteStrategy = "token-chrono-call"
+        out.append(mut)
+    return out
+
+
+def _discover_regex_call_mutations(path: str, line_no: int, code: str) -> list[Mutant]:
+    out: list[Mutant] = []
+    for match in _REGEX_CALL_RE.finditer(code):
+        replacement = _regex_call_range_replacement(code[match.start("target") :])
+        if replacement is None:
+            continue
+        offset, original, mutated = replacement
+        col = match.start("target") + offset
+        mut = Mutant("RegexCall", path, line_no, col, original, mutated)
+        mut.id = stable_id(mut)
+        mut.sourceRange = {
+            "kind": "TOKEN_CALL_EXPRESSION",
+            "startLine": line_no,
+            "startColumn": col + 1,
+            "endLine": line_no,
+            "endColumn": col + len(original) + 1,
+        }
+        mut.rewriteStrategy = "token-regex-call"
+        out.append(mut)
+    return out
+
+
+def _discover_filesystem_call_mutations(path: str, line_no: int, code: str) -> list[Mutant]:
+    out: list[Mutant] = []
+    for match in _FILESYSTEM_CALL_RE.finditer(code):
+        replacement = _filesystem_call_range_replacement(code[match.start("target") :])
+        if replacement is None:
+            continue
+        offset, original, mutated = replacement
+        col = match.start("target") + offset
+        mut = Mutant("FilesystemCall", path, line_no, col, original, mutated)
+        mut.id = stable_id(mut)
+        mut.sourceRange = {
+            "kind": "TOKEN_CALL_EXPRESSION",
+            "startLine": line_no,
+            "startColumn": col + 1,
+            "endLine": line_no,
+            "endColumn": col + len(original) + 1,
+        }
+        mut.rewriteStrategy = "token-filesystem-call"
+        out.append(mut)
+    return out
 
 
 def discover(
@@ -2177,12 +3655,21 @@ def discover(
             continue
         if "PreprocessorGuard" in enabled:
             muts.extend(_discover_preprocessor_guard_mutations(path, i, raw))
+        line_in_block_comment = in_block_comment
         code, in_block_comment = _strip_noncode(
             raw,
             in_block_comment=in_block_comment,
             mask_string_literals=not preserve_string_literals,
             mask_character_literals=not preserve_character_literals,
         )
+        string_call_code = code
+        if "StringCall" in enabled and not preserve_string_literals:
+            string_call_code, _ = _strip_noncode(
+                raw,
+                in_block_comment=line_in_block_comment,
+                mask_string_literals=False,
+                mask_character_literals=not preserve_character_literals,
+            )
         if "StringLiteral" in enabled:
             for match in re.finditer(_STRING_LITERAL_RE, code):
                 original = match.group(0)
@@ -2263,6 +3750,42 @@ def discover(
             if mutator == "MetalAddressSpace":
                 muts.extend(_discover_metal_address_space_mutations(path, i, code))
                 continue
+            if mutator == "UnaryOperator":
+                muts.extend(_discover_unary_operator_mutations(path, i, code))
+                continue
+            if mutator == "UpdateOperator":
+                muts.extend(_discover_update_operator_mutations(path, i, code))
+                continue
+            if mutator == "MoveSemantics":
+                muts.extend(_discover_move_semantics_mutations(path, i, code))
+                continue
+            if mutator == "StandardLibraryCall":
+                muts.extend(_discover_standard_library_call_mutations(path, i, code))
+                continue
+            if mutator == "ContainerCall":
+                muts.extend(_discover_container_call_mutations(path, i, code))
+                continue
+            if mutator == "ContainerStateCall":
+                muts.extend(_discover_container_state_call_mutations(path, i, code))
+                continue
+            if mutator == "StringCall":
+                muts.extend(_discover_string_call_mutations(path, i, string_call_code))
+                continue
+            if mutator == "MathCall":
+                muts.extend(_discover_math_call_mutations(path, i, code))
+                continue
+            if mutator == "IteratorCall":
+                muts.extend(_discover_iterator_call_mutations(path, i, code))
+                continue
+            if mutator == "ChronoCall":
+                muts.extend(_discover_chrono_call_mutations(path, i, code))
+                continue
+            if mutator == "RegexCall":
+                muts.extend(_discover_regex_call_mutations(path, i, code))
+                continue
+            if mutator == "FilesystemCall":
+                muts.extend(_discover_filesystem_call_mutations(path, i, code))
+                continue
             if mutator == "PreprocessorGuard":
                 continue
             if mutator in {"StringLiteral", "CharacterLiteral", "FloatingPointLiteral"}:
@@ -2274,6 +3797,20 @@ def discover(
                 for m in re.finditer(pattern, code):
                     mut = Mutant(mutator, path, i, m.start(), orig, new)
                     mut.id = stable_id(mut)
+                    if mutator in MUTANT_SWITCH_EXPRESSION_SPAN_MUTATORS:
+                        source_range = _token_binary_expression_source_range(code, i, m.start(), m.end())
+                        if source_range is not None:
+                            mut.sourceRange = source_range
+                            mut.rewriteStrategy = "token-binary-expression"
+                    elif mutator == "MetalThreadPosition":
+                        mut.sourceRange = {
+                            "kind": "TOKEN_METAL_THREAD_POSITION",
+                            "startLine": i,
+                            "startColumn": m.start() + 1,
+                            "endLine": i,
+                            "endColumn": m.end() + 1,
+                        }
+                        mut.rewriteStrategy = "token-metal-thread-position"
                     muts.append(mut)
         if "CallRemoval" in enabled:
             muts.extend(_discover_call_removals(path, i, code, raw))
@@ -2309,6 +3846,307 @@ def restore(repo: str, path: str, line: int, original: str) -> None:
     src[line - 1] = original
     with open(full, "w") as f:
         f.writelines(src)
+
+
+def _mutant_switch_safe_expression(text: str) -> bool:
+    stripped = text.strip()
+    return bool(stripped) and "\n" not in stripped and "\r" not in stripped and ";" not in stripped
+
+
+def _return_expression(text: str) -> str | None:
+    stripped = text.strip()
+    if not stripped.startswith("return "):
+        return None
+    expression = stripped[len("return ") :].strip()
+    return expression if _mutant_switch_safe_expression(expression) else None
+
+
+def _mutant_switch_safe_statement(text: str) -> bool:
+    stripped = text.strip()
+    return bool(stripped) and "\n" not in stripped and "\r" not in stripped and stripped.endswith(";")
+
+
+def _mutant_switch_safe_statement_removal_original(text: str) -> bool:
+    if not _mutant_switch_safe_statement(text):
+        return False
+    stripped = text.strip()
+    prefix = stripped.split(None, 1)[0].strip("*&")
+    if prefix in _STATEMENT_REMOVAL_DECLARATION_PREFIXES:
+        return False
+    if re.match(r"^(?:[A-Za-z_]\w*(?:::\w+)*)\s+[A-Za-z_]\w*\b", stripped):
+        return False
+    return any(token in stripped for token in ("=", "++", "--", "(", "+", "-", "*", "/", "%", "<<", ">>", "["))
+
+
+def _mutant_switch_safe_block(text: str) -> bool:
+    stripped = text.strip()
+    return bool(stripped) and "\n" not in stripped and "\r" not in stripped and stripped.startswith("{") and stripped.endswith("}")
+
+
+def _mutant_switch_safe_objc_message(text: str) -> bool:
+    stripped = text.strip()
+    return bool(stripped) and "\n" not in stripped and "\r" not in stripped and stripped.startswith("[") and stripped.endswith("]")
+
+
+def _mutant_switch_direct_guarded_replacement(mut: Mutant) -> str | None:
+    guard_id = mutant_switch_guard_id(mut)
+    if mut.mutator in MUTANT_SWITCH_EXPRESSION_MUTATORS:
+        if not _mutant_switch_safe_expression(mut.original) or not _mutant_switch_safe_expression(mut.mutated):
+            return None
+        return f'(__stryker_cxx_active("{guard_id}") ? ({mut.mutated}) : ({mut.original}))'
+    if mut.mutator == "ReturnValue":
+        original_expression = _return_expression(mut.original)
+        mutated_expression = _return_expression(mut.mutated)
+        if original_expression is None or mutated_expression is None:
+            return None
+        return (
+            f'return (__stryker_cxx_active("{guard_id}") '
+            f'? ({mutated_expression}) : ({original_expression}))'
+        )
+    if mut.mutator == "ExceptionHandling":
+        if not _mutant_switch_safe_statement(mut.original) or not _mutant_switch_safe_statement(mut.mutated):
+            return None
+        return (
+            f'if (__stryker_cxx_active("{guard_id}")) '
+            f"{{ {mut.mutated.strip()} }} else {{ {mut.original.strip()} }}"
+        )
+    if mut.mutator == "StatementRemoval":
+        if mut.mutated.strip() != ";" or not _mutant_switch_safe_statement_removal_original(mut.original):
+            return None
+        return (
+            f'if (__stryker_cxx_active("{guard_id}")) '
+            f"{{ ; }} else {{ {mut.original.strip()} }}"
+        )
+    if mut.mutator == "BlockRemoval":
+        if mut.mutated.strip() != "{}" or not _mutant_switch_safe_block(mut.original):
+            return None
+        return (
+            f'if (__stryker_cxx_active("{guard_id}")) '
+            f"{{ }} else {{ {mut.original.strip()} }}"
+        )
+    if mut.mutator == "ObjCMessageSend":
+        if mut.mutated.strip() != "(void)0" or not _mutant_switch_safe_objc_message(mut.original):
+            return None
+        return (
+            f'if (__stryker_cxx_active("{guard_id}")) '
+            f"{{ {mut.mutated.strip()}; }} else {{ {mut.original.strip()}; }}"
+        )
+    return None
+
+
+def _mutant_switch_expression_span_guarded_edit(
+    mut: Mutant,
+    lines: list[str],
+) -> tuple[int, int, str, str] | None:
+    if mut.mutator not in MUTANT_SWITCH_EXPRESSION_SPAN_MUTATORS:
+        return None
+    source_range = mut.sourceRange
+    if not isinstance(source_range, dict):
+        return None
+    ranged = _single_line_source_range(lines, source_range)
+    if ranged is None:
+        return None
+    line_no, col0, original_expression = ranged
+    if line_no != mut.line:
+        return None
+    rel = mut.col - col0
+    if rel < 0 or rel + len(mut.original) > len(original_expression):
+        return None
+    if original_expression[rel : rel + len(mut.original)] != mut.original:
+        return None
+    mutated_expression = (
+        original_expression[:rel]
+        + mut.mutated
+        + original_expression[rel + len(mut.original) :]
+    )
+    if not _mutant_switch_safe_expression(original_expression):
+        return None
+    if not _mutant_switch_safe_expression(mutated_expression):
+        return None
+    guard_id = mutant_switch_guard_id(mut)
+    replacement = (
+        f'(__stryker_cxx_active("{guard_id}") '
+        f'? ({mutated_expression}) : ({original_expression}))'
+    )
+    return line_no - 1, col0, original_expression, replacement
+
+
+def _mutant_switch_guarded_edit(
+    mut: Mutant,
+    lines: list[str],
+) -> tuple[int, int, str, str] | None:
+    direct = _mutant_switch_direct_guarded_replacement(mut)
+    if direct is not None:
+        return mut.line - 1, mut.col, mut.original, direct
+    return _mutant_switch_expression_span_guarded_edit(mut, lines)
+
+
+def _mutant_switch_is_guardable(mut: Mutant) -> bool:
+    if _mutant_switch_direct_guarded_replacement(mut) is not None:
+        return True
+    return mut.mutator in MUTANT_SWITCH_EXPRESSION_SPAN_MUTATORS and bool(mut.sourceRange)
+
+
+def _mutant_switch_preamble() -> list[str]:
+    return [
+        "#ifndef STRYKER_CXX_MUTANT_SWITCH_RUNTIME\n",
+        "#define STRYKER_CXX_MUTANT_SWITCH_RUNTIME\n",
+        "#include <cstdlib>\n",
+        "#include <cstring>\n",
+        "static inline bool __stryker_cxx_active(const char* id) {\n",
+        f"  const char* active = std::getenv(\"{MUTANT_SWITCH_ACTIVE_ENV}\");\n",
+        "  return active != nullptr && std::strcmp(active, id) == 0;\n",
+        "}\n",
+        "#endif\n",
+    ]
+
+
+def _mutant_switch_edit_fallback_reason(repo: str, mutants: list[Mutant]) -> str | None:
+    by_file: dict[str, list[Mutant]] = {}
+    unsupported: set[str] = set()
+    for mut in mutants:
+        if mut.file.endswith(".metal") or not _mutant_switch_is_guardable(mut):
+            unsupported.add(mut.mutator)
+            continue
+        by_file.setdefault(mut.file, []).append(mut)
+    if unsupported:
+        return "unsupported mutant-switch mutators or files: " + ", ".join(sorted(unsupported))
+    for file_name, file_mutants in by_file.items():
+        full = os.path.join(repo, file_name)
+        try:
+            with open(full) as f:
+                lines = f.readlines()
+        except OSError:
+            return f"unsupported mutant-switch source file: {file_name}"
+        spans_by_line: dict[int, list[tuple[int, int, str]]] = {}
+        for mut in file_mutants:
+            edit = _mutant_switch_guarded_edit(mut, lines)
+            if edit is None:
+                unsupported.add(mut.mutator)
+                continue
+            line_index, col, original_text, _replacement = edit
+            spans_by_line.setdefault(line_index, []).append((col, col + len(original_text), mut.id))
+        if unsupported:
+            return "unsupported mutant-switch mutators or files: " + ", ".join(sorted(unsupported))
+        for line_index, spans in spans_by_line.items():
+            ordered = sorted(spans)
+            previous_start = -1
+            previous_end = -1
+            previous_id = ""
+            for start, end, mutant_id in ordered:
+                if start < previous_end and not (start == previous_start and end == previous_end):
+                    return (
+                        "overlapping mutant-switch expression spans: "
+                        f"{file_name}:{line_index + 1} ({previous_id}, {mutant_id})"
+                    )
+                previous_start = start
+                previous_end = end
+                previous_id = mutant_id
+    return None
+
+
+def _mutant_switch_fallback_reason(repo: str, mutants: list[Mutant], args: argparse.Namespace) -> str | None:
+    if args.artifact_backend != "source-overlay":
+        return "mutant-switch currently requires --artifact-backend source-overlay"
+    if args.jobs != 1:
+        return "mutant-switch currently requires --jobs 1"
+    if args.batch_mutants:
+        return "mutant-switch currently owns session batching; disable --batch-mutants"
+    if not mutants:
+        return None
+    return _mutant_switch_edit_fallback_reason(repo, mutants)
+
+
+def _mutant_switch_span_mutated_expression(mut: Mutant, col: int, original_text: str) -> str | None:
+    if mut.mutator in MUTANT_SWITCH_EXPRESSION_MUTATORS:
+        return mut.mutated
+    if mut.mutator in MUTANT_SWITCH_EXPRESSION_SPAN_MUTATORS:
+        rel = mut.col - col
+        if rel < 0 or rel + len(mut.original) > len(original_text):
+            return None
+        if original_text[rel : rel + len(mut.original)] != mut.original:
+            return None
+        mutated = original_text[:rel] + mut.mutated + original_text[rel + len(mut.original) :]
+        return mutated if _mutant_switch_safe_expression(mutated) else None
+    return None
+
+
+def _mutant_switch_chained_guarded_replacement(
+    original_text: str,
+    alternatives: list[tuple[Mutant, str]],
+) -> str | None:
+    if not _mutant_switch_safe_expression(original_text):
+        return None
+    expression = f"({original_text})"
+    for mut, mutated_expression in reversed(alternatives):
+        if not _mutant_switch_safe_expression(mutated_expression):
+            return None
+        guard_id = mutant_switch_guard_id(mut)
+        expression = (
+            f'(__stryker_cxx_active("{guard_id}") '
+            f"? ({mutated_expression}) : {expression})"
+        )
+    return expression
+
+
+def _apply_mutant_switch_overlay(repo: str, mutants: list[Mutant]) -> dict[str, list[str]]:
+    originals: dict[str, list[str]] = {}
+    by_file: dict[str, list[Mutant]] = {}
+    for mut in mutants:
+        by_file.setdefault(mut.file, []).append(mut)
+
+    for file_name, file_mutants in by_file.items():
+        full = os.path.join(repo, file_name)
+        with open(full) as f:
+            lines = f.readlines()
+        originals[file_name] = list(lines)
+        edits: list[tuple[int, int, str, str, Mutant]] = []
+        for mut in file_mutants:
+            edit = _mutant_switch_guarded_edit(mut, lines)
+            if edit is None:
+                raise ValueError(f"mutant is not guardable in mutant-switch mode: {mut.id}")
+            line_index, col, original_text, replacement = edit
+            edits.append((line_index, col, original_text, replacement, mut))
+        grouped: dict[tuple[int, int, str], list[tuple[str, Mutant]]] = {}
+        for line_index, col, original_text, replacement, mut in edits:
+            grouped.setdefault((line_index, col, original_text), []).append((replacement, mut))
+        grouped_edits: list[tuple[int, int, str, str, Mutant]] = []
+        for (line_index, col, original_text), replacements in grouped.items():
+            first_mut = replacements[0][1]
+            if len(replacements) == 1:
+                grouped_edits.append((line_index, col, original_text, replacements[0][0], first_mut))
+                continue
+            alternatives: list[tuple[Mutant, str]] = []
+            for _replacement, mut in replacements:
+                mutated_expression = _mutant_switch_span_mutated_expression(mut, col, original_text)
+                if mutated_expression is None:
+                    raise ValueError(f"mutant is not chainable in mutant-switch mode: {mut.id}")
+                alternatives.append((mut, mutated_expression))
+            chained = _mutant_switch_chained_guarded_replacement(original_text, alternatives)
+            if chained is None:
+                raise ValueError(f"mutant span is not chainable in mutant-switch mode: {first_mut.id}")
+            grouped_edits.append((line_index, col, original_text, chained, first_mut))
+        for line_index, col, original_text, replacement, mut in sorted(
+            grouped_edits,
+            key=lambda item: (item[0], item[1], len(item[2])),
+            reverse=True,
+        ):
+            line = lines[line_index]
+            actual = line[col : col + len(original_text)]
+            if actual != original_text:
+                raise ValueError(f"source span mismatch for mutant-switch guard: {mut.id}")
+            lines[line_index] = line[:col] + replacement + line[col + len(original_text) :]
+        if not any("STRYKER_CXX_MUTANT_SWITCH_RUNTIME" in line for line in lines):
+            lines = _mutant_switch_preamble() + lines
+        with open(full, "w") as f:
+            f.writelines(lines)
+    return originals
+
+
+def _restore_mutant_switch_overlay(repo: str, originals: dict[str, list[str]]) -> None:
+    for file_name, lines in originals.items():
+        with open(os.path.join(repo, file_name), "w") as f:
+            f.writelines(lines)
 
 
 def run_cmd(
@@ -3280,7 +5118,7 @@ def _conditional_expression_start(
 def _conditional_expression_range_replacements(
     text: str,
     *,
-    include_condition: bool = False,
+    include_condition: bool = True,
 ) -> list[tuple[int, str, str]]:
     out: list[tuple[int, str, str]] = []
     for i, char in enumerate(text):
@@ -3323,6 +5161,58 @@ def _conditional_expression_range_replacements(
     return out
 
 
+_AST_DIRECT_BINARY_MUTATORS = {
+    "ConditionalBoundary",
+    "EqualityOperator",
+    "LogicalOperator",
+    "ShiftOperator",
+    "ArithmeticOperator",
+    "AssignmentOperator",
+    "BitwiseOperator",
+}
+_AST_DIRECT_BINARY_OPERATOR_RE = re.compile(
+    r"(?<![!<>=&|+\-*/%^])"
+    r"(<<=|>>=|==|!=|&&|\|\||<<|>>|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<=|>=|<|>|\+|-|\*|/|%|&|\||\^)"
+    r"(?![!<>=&|+\-*/%^])"
+)
+
+
+def _direct_ast_binary_mutants(
+    path: str,
+    item: dict[str, int | str],
+    line_no: int,
+    col0: int,
+    text: str,
+    enabled: list[str],
+) -> list[Mutant]:
+    kind = str(item.get("kind", ""))
+    enabled_binary = [
+        mutator
+        for mutator in enabled
+        if mutator in _AST_DIRECT_BINARY_MUTATORS
+        and kind in AST_MUTATOR_CURSOR_KINDS.get(mutator, set())
+    ]
+    if not enabled_binary:
+        return []
+    operator_matches = list(_AST_DIRECT_BINARY_OPERATOR_RE.finditer(text))
+    operator_positions = {(match.start(), match.end(), match.group(1)) for match in operator_matches}
+    if len(operator_positions) != 1:
+        return []
+    op_start, _op_end, operator_token = next(iter(operator_positions))
+    out: list[Mutant] = []
+    for mutator in enabled_binary:
+        for original, mutated in MUTATORS[mutator]:
+            if original != operator_token:
+                continue
+            mut = Mutant(mutator, path, line_no, col0 + op_start, original, mutated)
+            mut.id = stable_id(mut)
+            mut.nodeKind = kind
+            mut.sourceRange = dict(item)
+            mut.rewriteStrategy = "clang-ast-direct-binary"
+            out.append(mut)
+    return out
+
+
 def _direct_ast_range_mutants(
     path: str,
     item: dict[str, int | str],
@@ -3341,6 +5231,8 @@ def _direct_ast_range_mutants(
     out: list[Mutant] = []
     leading = len(text) - len(text.lstrip())
     stripped = text.strip()
+
+    out.extend(_direct_ast_binary_mutants(path, item, line_no, col0, text, enabled))
 
     if "BooleanLiteral" in enabled and kind in AST_MUTATOR_CURSOR_KINDS["BooleanLiteral"]:
         if stripped in {"true", "false"}:
@@ -3387,6 +5279,16 @@ def _direct_ast_range_mutants(
         mut.rewriteStrategy = "clang-ast-direct-block"
         out.append(mut)
 
+    if "UnaryOperator" in enabled and kind in AST_MUTATOR_CURSOR_KINDS["UnaryOperator"]:
+        if stripped.startswith("!") and not stripped.startswith("!="):
+            for mutated in ("", "!!"):
+                mut = Mutant("UnaryOperator", path, line_no, col0 + leading, "!", mutated)
+                mut.id = stable_id(mut)
+                mut.nodeKind = kind
+                mut.sourceRange = dict(item)
+                mut.rewriteStrategy = "clang-ast-direct-unary"
+                out.append(mut)
+
     if (
         "ConditionalExpression" in enabled
         and kind in AST_MUTATOR_CURSOR_KINDS["ConditionalExpression"]
@@ -3405,6 +5307,186 @@ def _direct_ast_range_mutants(
             mut.nodeKind = kind
             mut.sourceRange = dict(item)
             mut.rewriteStrategy = "clang-ast-direct-conditional"
+            out.append(mut)
+
+    if "StandardLibraryCall" in enabled and kind in AST_MUTATOR_CURSOR_KINDS["StandardLibraryCall"]:
+        replacement = _standard_library_call_range_replacement(text)
+        if replacement is not None:
+            token_offset, original, mutated = replacement
+            mut = Mutant(
+                "StandardLibraryCall",
+                path,
+                line_no,
+                col0 + leading + token_offset,
+                original,
+                mutated,
+            )
+            mut.id = stable_id(mut)
+            mut.nodeKind = kind
+            mut.sourceRange = dict(item)
+            mut.rewriteStrategy = "clang-ast-direct-standard-library-call"
+            out.append(mut)
+
+    if "MoveSemantics" in enabled and kind in AST_MUTATOR_CURSOR_KINDS["MoveSemantics"]:
+        replacement = _move_semantics_range_replacement(text)
+        if replacement is not None:
+            token_offset, original, mutated = replacement
+            mut = Mutant(
+                "MoveSemantics",
+                path,
+                line_no,
+                col0 + leading + token_offset,
+                original,
+                mutated,
+            )
+            mut.id = stable_id(mut)
+            mut.nodeKind = kind
+            mut.sourceRange = dict(item)
+            mut.rewriteStrategy = "clang-ast-direct-call-wrapper"
+            out.append(mut)
+
+    if "ContainerCall" in enabled and kind in AST_MUTATOR_CURSOR_KINDS["ContainerCall"]:
+        replacement = _container_call_range_replacement(text)
+        if replacement is not None:
+            token_offset, original, mutated = replacement
+            mut = Mutant(
+                "ContainerCall",
+                path,
+                line_no,
+                col0 + leading + token_offset,
+                original,
+                mutated,
+            )
+            mut.id = stable_id(mut)
+            mut.nodeKind = kind
+            mut.sourceRange = dict(item)
+            mut.rewriteStrategy = "clang-ast-direct-container-call"
+            out.append(mut)
+
+    if "ContainerStateCall" in enabled and kind in AST_MUTATOR_CURSOR_KINDS["ContainerStateCall"]:
+        replacement = _container_state_call_range_replacement(text)
+        if replacement is not None:
+            token_offset, original, mutated = replacement
+            mut = Mutant(
+                "ContainerStateCall",
+                path,
+                line_no,
+                col0 + leading + token_offset,
+                original,
+                mutated,
+            )
+            mut.id = stable_id(mut)
+            mut.nodeKind = kind
+            mut.sourceRange = dict(item)
+            mut.rewriteStrategy = "clang-ast-direct-container-state-call"
+            out.append(mut)
+
+    if "StringCall" in enabled and kind in AST_MUTATOR_CURSOR_KINDS["StringCall"]:
+        replacement = _string_call_range_replacement(text)
+        if replacement is not None:
+            token_offset, original, mutated = replacement
+            mut = Mutant(
+                "StringCall",
+                path,
+                line_no,
+                col0 + leading + token_offset,
+                original,
+                mutated,
+            )
+            mut.id = stable_id(mut)
+            mut.nodeKind = kind
+            mut.sourceRange = dict(item)
+            mut.rewriteStrategy = "clang-ast-direct-string-call"
+            out.append(mut)
+
+    if "MathCall" in enabled and kind in AST_MUTATOR_CURSOR_KINDS["MathCall"]:
+        replacement = _math_call_range_replacement(text)
+        if replacement is not None:
+            token_offset, original, mutated = replacement
+            mut = Mutant(
+                "MathCall",
+                path,
+                line_no,
+                col0 + leading + token_offset,
+                original,
+                mutated,
+            )
+            mut.id = stable_id(mut)
+            mut.nodeKind = kind
+            mut.sourceRange = dict(item)
+            mut.rewriteStrategy = "clang-ast-direct-math-call"
+            out.append(mut)
+
+    if "IteratorCall" in enabled and kind in AST_MUTATOR_CURSOR_KINDS["IteratorCall"]:
+        replacement = _iterator_call_range_replacement(text)
+        if replacement is not None:
+            token_offset, original, mutated = replacement
+            mut = Mutant(
+                "IteratorCall",
+                path,
+                line_no,
+                col0 + leading + token_offset,
+                original,
+                mutated,
+            )
+            mut.id = stable_id(mut)
+            mut.nodeKind = kind
+            mut.sourceRange = dict(item)
+            mut.rewriteStrategy = "clang-ast-direct-iterator-call"
+            out.append(mut)
+
+    if "ChronoCall" in enabled and kind in AST_MUTATOR_CURSOR_KINDS["ChronoCall"]:
+        replacement = _chrono_call_range_replacement(text)
+        if replacement is not None:
+            token_offset, original, mutated = replacement
+            mut = Mutant(
+                "ChronoCall",
+                path,
+                line_no,
+                col0 + leading + token_offset,
+                original,
+                mutated,
+            )
+            mut.id = stable_id(mut)
+            mut.nodeKind = kind
+            mut.sourceRange = dict(item)
+            mut.rewriteStrategy = "clang-ast-direct-chrono-call"
+            out.append(mut)
+
+    if "RegexCall" in enabled and kind in AST_MUTATOR_CURSOR_KINDS["RegexCall"]:
+        replacement = _regex_call_range_replacement(text)
+        if replacement is not None:
+            token_offset, original, mutated = replacement
+            mut = Mutant(
+                "RegexCall",
+                path,
+                line_no,
+                col0 + leading + token_offset,
+                original,
+                mutated,
+            )
+            mut.id = stable_id(mut)
+            mut.nodeKind = kind
+            mut.sourceRange = dict(item)
+            mut.rewriteStrategy = "clang-ast-direct-regex-call"
+            out.append(mut)
+
+    if "FilesystemCall" in enabled and kind in AST_MUTATOR_CURSOR_KINDS["FilesystemCall"]:
+        replacement = _filesystem_call_range_replacement(text)
+        if replacement is not None:
+            token_offset, original, mutated = replacement
+            mut = Mutant(
+                "FilesystemCall",
+                path,
+                line_no,
+                col0 + leading + token_offset,
+                original,
+                mutated,
+            )
+            mut.id = stable_id(mut)
+            mut.nodeKind = kind
+            mut.sourceRange = dict(item)
+            mut.rewriteStrategy = "clang-ast-direct-filesystem-call"
             out.append(mut)
 
     if "StringLiteral" in enabled and kind in AST_MUTATOR_CURSOR_KINDS["StringLiteral"]:
@@ -3637,6 +5719,8 @@ def _discover_clang_ast_first(
         start_line = int(item.get("startLine", 0) or 0)
         end_line = int(item.get("endLine", 0) or 0)
         if start_line <= 0 or end_line <= 0:
+            continue
+        if _rejects_macro_range(analysis, path, src, item):
             continue
         for mut in _direct_ast_range_mutants(path, item, src, enabled, only):
             if _rejects_macro_candidate(analysis, path, macro_ranges or [], mut):
@@ -3910,6 +5994,90 @@ def _apply_shard(mutants: list[Mutant], shard_index: int | None, shard_total: in
     return [m for idx, m in enumerate(mutants) if idx % shard_total == shard_index - 1]
 
 
+DISTRIBUTION_MANIFEST_SCHEMA_VERSION = "stryker-cxx.distribution.v1"
+
+
+def _distribution_manifest_payload(
+    rep: Report,
+    mutants: list[Mutant],
+    args: argparse.Namespace,
+    worker_label: str | None,
+) -> dict[str, Any]:
+    shard_index = args.shard_index or 1
+    shard_total = args.shard_total or 1
+    artifact_root = args.artifact_dir or os.path.join(rep.repo, "agent_space", "stryker-cxx")
+
+    def mutant_record(mut: Mutant) -> dict[str, Any]:
+        rec = _normalize_mutant_record(mut)
+        return {
+            "id": rec.get("id"),
+            "file": rec.get("file"),
+            "line": rec.get("line"),
+            "column": rec.get("column", rec.get("col", 0)),
+            "mutator": rec.get("mutator"),
+            "original": rec.get("original"),
+            "mutated": rec.get("mutated"),
+            "status": rec.get("status", "PENDING"),
+        }
+
+    return {
+        "schemaVersion": DISTRIBUTION_MANIFEST_SCHEMA_VERSION,
+        "generatedAt": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "tool": rep.tool,
+        "toolVersion": TOOL_VERSION,
+        "repo": rep.repo,
+        "base": rep.base,
+        "shard": {
+            "index": shard_index,
+            "total": shard_total,
+            "selectedMutants": len(mutants),
+        },
+        "worker": {
+            "label": worker_label,
+            "jobs": args.jobs,
+            "worktreeMode": args.worktree_mode,
+            "workerTmpDir": args.worker_tmp_dir,
+            "artifactDir": artifact_root,
+        },
+        "execution": {
+            "mode": args.mode,
+            "executionMode": rep.execution.get("executionMode"),
+            "requestedExecutionMode": rep.execution.get("requestedExecutionMode"),
+            "artifactBackend": rep.execution.get("artifactBackend"),
+            "requestedArtifactBackend": rep.execution.get("requestedArtifactBackend"),
+            "artifactFallback": rep.execution.get("artifactFallback"),
+            "batchMutants": bool(args.batch_mutants),
+            "batchSize": args.batch_size,
+        },
+        "commands": {
+            "build": rep.buildCommand,
+            "check": rep.checkCommand,
+            "test": rep.testCommand,
+        },
+        "redaction": _redaction_metadata(),
+        "mutants": [mutant_record(mut) for mut in mutants],
+    }
+
+
+def _write_distribution_manifest(
+    path: str | None,
+    rep: Report,
+    mutants: list[Mutant],
+    args: argparse.Namespace,
+    worker_label: str | None,
+) -> None:
+    if not path:
+        return
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    payload = _redact_report_artifact(
+        _distribution_manifest_payload(rep, mutants, args, worker_label)
+    )
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+
 def _write_report(path: str, rep: Report, output_mode: str = "legacy") -> None:
     if output_mode == "stryker-cxx":
         payload = _report_dict(rep)
@@ -3938,72 +6106,27 @@ def _legacy_report(rep: Report) -> dict:
 
 
 def _test_scheduler_metadata(rep: Report, mutants: list[dict[str, Any]]) -> dict[str, Any]:
-    batching = rep.execution.get("batching", {})
-    groups: dict[str, dict[str, Any]] = {}
-    order = 0
-    for mut in mutants:
-        source = str(mut.get("resultSource", "executed"))
-        if source in {"baseline", "coverage", "ignored", "compile-pruning"}:
-            continue
-        run = mut.get("run", {})
-        if not isinstance(run, dict):
-            continue
-        scheduler = run.get("scheduler", {})
-        if not isinstance(scheduler, dict):
-            scheduler = {}
-        batch_id = run.get("batchId")
-        session_type = str(scheduler.get("sessionType") or ("batch" if source == "batch" and batch_id else "per-mutant"))
-        key = f"batch:{batch_id}" if session_type == "batch" and batch_id else f"mutant:{mut.get('id')}"
-        group = groups.get(key)
-        if group is None:
-            order += 1
-            selected_tests = scheduler.get("selectedTests", run.get("coveredBy", []))
-            if not isinstance(selected_tests, list):
-                selected_tests = []
-            group = {
-                "order": order,
-                "sessionType": session_type,
-                "batchId": batch_id,
-                "splitFromBatchId": scheduler.get("splitFromBatchId") or run.get("splitFromBatchId"),
-                "coverageSelected": bool(scheduler.get("coverageSelected")),
-                "selectedTests": [str(test) for test in selected_tests],
-                "testCommand": run.get("testCommand") or run.get("selectedTestCommand"),
-                "mutantIds": [],
-                "statuses": [],
-            }
-            groups[key] = group
-        group["mutantIds"].append(mut.get("id"))
-        group["statuses"].append(str(mut.get("status", "PENDING")).upper())
-
-    sessions = []
-    for group in sorted(groups.values(), key=lambda item: int(item.get("order", 0))):
-        statuses = [str(status) for status in group.pop("statuses", [])]
-        group["status"] = statuses[0] if statuses and all(status == statuses[0] for status in statuses) else "MIXED"
-        sessions.append(group)
-
-    return {
-        "schemaVersion": "stryker-cxx.test-scheduler.v1",
-        "strategy": "batched" if isinstance(batching, dict) and batching.get("enabled") else "per-mutant",
-        "sessions": len(sessions),
-        "batchSessions": len([item for item in sessions if item.get("sessionType") == "batch"]),
-        "perMutantSessions": len([item for item in sessions if item.get("sessionType") == "per-mutant"]),
-        "splitSessions": len([item for item in sessions if item.get("splitFromBatchId")]),
-        "coverageSelectedSessions": len([item for item in sessions if item.get("coverageSelected")]),
-        "groups": sessions,
-    }
+    return build_test_scheduler_metadata(mutants, rep.execution.get("batching", {}))
 
 
 def _report_dict(rep: Report, repo: str | None = None, base: str | None = None,
                  threshold: float | None = None, startedAt: str | None = None) -> dict:
     normalized_mutants = [_normalize_mutant_record(mut) for mut in rep.mutants]
+    analysis = rep.execution.get("analysis") if isinstance(rep.execution.get("analysis"), dict) else {}
+    analysis_engine = analysis.get("engine") if isinstance(analysis, dict) else None
     execution = {
-        "mode": rep.execution.get("mode", "token"),
+        "mode": rep.execution.get("mode", analysis_engine or "token"),
+        "executionMode": rep.execution.get("executionMode", "source-overlay"),
         "worktreeMode": rep.execution.get("worktreeMode", "inplace"),
         "jobs": rep.execution.get("jobs", 1),
     }
     for key, value in rep.execution.items():
         if key not in execution:
             execution[key] = value
+    if not isinstance(execution.get("analysis"), dict):
+        execution["analysis"] = {"engine": execution.get("mode", "token")}
+    elif "engine" not in execution["analysis"]:
+        execution["analysis"]["engine"] = execution.get("mode", "token")
     execution["testScheduler"] = _test_scheduler_metadata(rep, normalized_mutants)
     thresholds = dict(rep.thresholds or {})
     if "break" not in thresholds:
@@ -4097,9 +6220,18 @@ def _lifecycle_metadata(rep: Report, mutants: list[dict[str, Any]]) -> dict[str,
     coverage_status = "completed" if coverage.get("enabled") else "notConfigured"
     scheduler = test_scheduler.get("strategy", "batched" if batching.get("enabled") else "per-mutant")
     retained_paths = [
-        mut.get("run", {}).get("worktree")
+        (
+            mut.get("run", {}).get("worktree")
+            or mut.get("run", {}).get("retainedWorktree")
+            or mut.get("run", {}).get("retainedArtifact")
+        )
         for mut in mutants
-        if isinstance(mut.get("run"), dict) and mut.get("run", {}).get("worktree")
+        if isinstance(mut.get("run"), dict)
+        and (
+            mut.get("run", {}).get("worktree")
+            or mut.get("run", {}).get("retainedWorktree")
+            or mut.get("run", {}).get("retainedArtifact")
+        )
     ]
     project_analysis = rep.execution.get("projectAnalysis")
     mutation_artifact = rep.execution.get("mutationArtifact")
@@ -4129,6 +6261,9 @@ def _lifecycle_metadata(rep: Report, mutants: list[dict[str, Any]]) -> dict[str,
             "workspacePerMutant": mutation_artifact.get("workspacePerMutant"),
             "parallelSafe": mutation_artifact.get("parallelSafe"),
             "supportsCompiledReplacement": mutation_artifact.get("supportsCompiledReplacement"),
+            "runtimeGuardCount": mutation_artifact.get("runtimeGuardCount"),
+            "candidateGuardCount": mutation_artifact.get("candidateGuardCount"),
+            "activationEnvironment": mutation_artifact.get("activationEnvironment"),
         }
         if isinstance(mutation_artifact, dict) and mutation_artifact
         else {
@@ -4136,17 +6271,26 @@ def _lifecycle_metadata(rep: Report, mutants: list[dict[str, Any]]) -> dict[str,
             "implementation": rep.execution.get("worktreeMode", "inplace"),
         }
     )
-    artifact_model = (
-        "compiled-artifact"
-        if isinstance(mutation_artifact, dict) and mutation_artifact.get("mode") == "compiled-artifact"
-        else "source-level"
-    )
-    mutation_artifact_status = "compiledArtifact" if artifact_model == "compiled-artifact" else "sourceLevel"
+    artifact_mode = mutation_artifact.get("mode") if isinstance(mutation_artifact, dict) else None
+    if artifact_mode == "compiled-artifact":
+        artifact_model = "compiled-artifact"
+        mutation_artifact_status = "compiledArtifact"
+    elif artifact_mode == "mutant-switch":
+        artifact_model = "mutant-switch"
+        mutation_artifact_status = "mutantSwitch"
+    else:
+        artifact_model = "source-level"
+        mutation_artifact_status = "sourceLevel"
     phases = [
         _phase(
             "initialization",
             "completed",
             mode=rep.execution.get("mode", "token"),
+            executionMode=rep.execution.get("executionMode", "source-overlay"),
+            requestedExecutionMode=rep.execution.get(
+                "requestedExecutionMode",
+                rep.execution.get("executionMode", "source-overlay"),
+            ),
             worktreeMode=rep.execution.get("worktreeMode", "inplace"),
         ),
         _phase(
@@ -4207,7 +6351,11 @@ def _lifecycle_metadata(rep: Report, mutants: list[dict[str, Any]]) -> dict[str,
         ),
         _phase(
             "artifactRestoration",
-            "sourceLevel",
+            (
+                "mutantSwitch"
+                if artifact_model == "mutant-switch"
+                else ("compiledArtifact" if artifact_model == "compiled-artifact" else "sourceLevel")
+            ),
             restoreOriginals=artifact_placement.get("restoreOriginals")
             if isinstance(artifact_placement, dict)
             else True,
@@ -4350,6 +6498,19 @@ def _mutation_testing_elements(rep: Report) -> dict:
         "testFiles": {},
         "projectRoot": rep.repo,
         "language": "cpp",
+        "executionMode": rep.execution.get("executionMode", "source-overlay"),
+        "strykerCxx": {
+            "executionMode": rep.execution.get("executionMode", "source-overlay"),
+            "requestedExecutionMode": rep.execution.get(
+                "requestedExecutionMode",
+                rep.execution.get("executionMode", "source-overlay"),
+            ),
+            "analysisEngine": (
+                rep.execution.get("analysis", {}).get("engine")
+                if isinstance(rep.execution.get("analysis"), dict)
+                else rep.execution.get("mode", "token")
+            ),
+        },
     }
 
 
@@ -4663,8 +6824,24 @@ def _dashboard_payload(rep: Report) -> dict[str, Any]:
 
 def _write_dashboard_export(path: str, rep: Report) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
-    with open(path, "w") as f:
-        json.dump(_redact_report_artifact(_dashboard_payload(rep)), f, indent=2)
+    dashboard = rep.execution.setdefault("dashboard", {})
+    export = dashboard.setdefault("export", {})
+    export["enabled"] = True
+    export["path"] = path
+    export["status"] = "writing"
+    export["writtenAt"] = None
+    export.pop("bytes", None)
+    export.pop("error", None)
+    try:
+        with open(path, "w") as f:
+            json.dump(_redact_report_artifact(_dashboard_payload(rep)), f, indent=2)
+        export["status"] = "succeeded"
+        export["bytes"] = os.path.getsize(path)
+        export["writtenAt"] = _utc_now_iso()
+    except Exception as exc:
+        export["status"] = "failed"
+        export["error"] = str(exc)
+        raise
 
 
 def _upload_dashboard(
@@ -4698,10 +6875,29 @@ def _record_dashboard_upload_status(
     *,
     status_code: int | None = None,
     error: Exception | None = None,
+    attempt: int | None = None,
+    max_attempts: int | None = None,
+    retry_delay_ms: int | None = None,
 ) -> None:
     dashboard = rep.execution.setdefault("dashboard", {})
     upload = dashboard.setdefault("upload", {})
     upload["status"] = status
+    if max_attempts is not None:
+        upload["maxAttempts"] = max_attempts
+    if retry_delay_ms is not None:
+        upload["retryDelayMs"] = retry_delay_ms
+    if attempt is not None:
+        attempts = upload.setdefault("attempts", [])
+        if isinstance(attempts, list):
+            attempt_record: dict[str, Any] = {
+                "attempt": attempt,
+                "status": status,
+            }
+            if status_code is not None:
+                attempt_record["statusCode"] = status_code
+            if error is not None:
+                attempt_record["error"] = str(error)
+            attempts.append(attempt_record)
     if status_code is not None:
         upload["statusCode"] = status_code
     if error is not None:
@@ -4712,19 +6908,47 @@ def _attempt_dashboard_upload(args: argparse.Namespace, rep: Report) -> Exceptio
     if not args.dashboard_upload_url:
         _record_dashboard_upload_status(rep, "disabled")
         return None
-    _record_dashboard_upload_status(rep, "attempting")
-    try:
-        status_code = _upload_dashboard(
-            args.dashboard_upload_url,
+    retries = max(0, int(getattr(args, "dashboard_upload_retries", 0) or 0))
+    retry_delay_ms = max(0, int(getattr(args, "dashboard_upload_retry_delay_ms", 0) or 0))
+    max_attempts = retries + 1
+    _record_dashboard_upload_status(
+        rep,
+        "attempting",
+        max_attempts=max_attempts,
+        retry_delay_ms=retry_delay_ms,
+    )
+    last_error: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            status_code = _upload_dashboard(
+                args.dashboard_upload_url,
+                rep,
+                args.dashboard_auth_token_env,
+                args.dashboard_auth_header,
+            )
+        except Exception as exc:
+            last_error = exc
+            _record_dashboard_upload_status(
+                rep,
+                "failed",
+                error=exc,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                retry_delay_ms=retry_delay_ms,
+            )
+            if attempt < max_attempts and retry_delay_ms > 0:
+                time.sleep(retry_delay_ms / 1000)
+            continue
+        _record_dashboard_upload_status(
             rep,
-            args.dashboard_auth_token_env,
-            args.dashboard_auth_header,
+            "succeeded",
+            status_code=status_code,
+            attempt=attempt,
+            max_attempts=max_attempts,
+            retry_delay_ms=retry_delay_ms,
         )
-    except Exception as exc:
-        _record_dashboard_upload_status(rep, "failed", error=exc)
-        return exc
-    _record_dashboard_upload_status(rep, "succeeded", status_code=status_code)
-    return None
+        return None
+    return last_error
 
 
 def _write_human_artifact(path: str, report: str, payload: Any) -> str:
@@ -4788,7 +7012,7 @@ def _ignore_for_compiled_scratch(build_dir: str | None, artifact_root: str | Non
         ignored.add(os.path.normpath(artifact_root).split(os.sep)[0])
 
     def ignore(_dir: str, names: list[str]) -> set[str]:
-        return {name for name in names if name in ignored}
+        return {name for name in names if name in ignored or name.startswith("bazel-")}
 
     return ignore
 
@@ -4823,12 +7047,34 @@ def _find_library_artifact(build_root: str, target: str) -> str | None:
 def _compiled_artifact_target(
     repo: str,
     backend: str,
+    build_system: str | None,
     build_dir: str | None,
     build_target: str | None,
     test_binary: str | None,
+    artifact_path: str | None = None,
+    xcode_scheme: str | None = None,
 ) -> tuple[str, str, str]:
-    build_root = build_dir or "build"
+    build_root = build_dir or ("." if build_system in {"make", "ninja"} else "build")
     build_root_abs = build_root if os.path.isabs(build_root) else os.path.join(repo, build_root)
+    if artifact_path:
+        original = artifact_path if os.path.isabs(artifact_path) else os.path.join(repo, artifact_path)
+        if backend == "compiled-library":
+            target = build_target or xcode_scheme
+            if not target:
+                raise ValueError("compiled-library backend requires --build-target or --xcode-scheme when --artifact-path is used")
+            return target, os.path.abspath(original), "library"
+        if backend == "compiled-object":
+            target = build_target or os.path.splitext(os.path.basename(original))[0]
+            return target, os.path.abspath(original), "object"
+        if build_system == "bazel" and not build_target:
+            raise ValueError("compiled-executable bazel backend requires --build-target and --test-binary or --artifact-path")
+        if build_system == "xcodebuild":
+            target = build_target or xcode_scheme
+            if not target:
+                raise ValueError("compiled-executable xcodebuild backend requires --build-target or --xcode-scheme, plus --test-binary or --artifact-path")
+            return target, os.path.abspath(original), "executable"
+        target = build_target or os.path.splitext(os.path.basename(original))[0]
+        return target, os.path.abspath(original), "executable"
     if backend == "compiled-library":
         if not build_target:
             raise ValueError("compiled-library backend requires --build-target for the library target")
@@ -4845,6 +7091,17 @@ def _compiled_artifact_target(
             raise ValueError("compiled-object backend requires --build-target, --test-binary, or a discoverable add_executable target")
         original = os.path.join(repo, build_root, target) if not os.path.isabs(build_root) else os.path.join(build_root, target)
         return target, os.path.abspath(original), "object"
+    if build_system == "bazel":
+        if not build_target or not test_binary:
+            raise ValueError("compiled-executable bazel backend requires --build-target and --test-binary")
+        original = test_binary if os.path.isabs(test_binary) else os.path.join(repo, test_binary)
+        return build_target, os.path.abspath(original), "executable"
+    if build_system == "xcodebuild":
+        target = build_target or xcode_scheme
+        if not target or not test_binary:
+            raise ValueError("compiled-executable xcodebuild backend requires --build-target or --xcode-scheme, plus --test-binary")
+        original = test_binary if os.path.isabs(test_binary) else os.path.join(repo, test_binary)
+        return target, os.path.abspath(original), "executable"
     if test_binary:
         original = test_binary if os.path.isabs(test_binary) else os.path.join(repo, test_binary)
         return os.path.splitext(os.path.basename(original))[0], os.path.abspath(original), "executable"
@@ -4855,11 +7112,131 @@ def _compiled_artifact_target(
     return target, os.path.abspath(original), "executable"
 
 
+def _compiled_artifact_scratch_build_dir(
+    scratch_root: str,
+    scratch_repo: str,
+    build_system: str | None,
+    build_dir: str | None,
+) -> str:
+    if build_system == "bazel":
+        return scratch_repo
+    if build_system in {"make", "ninja"}:
+        if not build_dir or build_dir == ".":
+            return scratch_repo
+        return build_dir if os.path.isabs(build_dir) else os.path.join(scratch_repo, build_dir)
+    return os.path.join(scratch_root, "build")
+
+
+def _compiled_artifact_configure_command(
+    scratch_repo: str,
+    scratch_build_dir: str,
+    build_system: str | None,
+) -> str | None:
+    if build_system in {"make", "ninja", "bazel", "xcodebuild"}:
+        return None
+    if build_system == "meson":
+        return f"meson setup {shlex.quote(scratch_build_dir)} {shlex.quote(scratch_repo)}"
+    return (
+        "cmake -S "
+        f"{shlex.quote(scratch_repo)} -B {shlex.quote(scratch_build_dir)} "
+        "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
+    )
+
+
+def _compiled_artifact_build_command(
+    scratch_build_dir: str,
+    build_system: str | None,
+    target: str,
+    xcode_options: dict[str, str | None] | None = None,
+) -> str:
+    if build_system == "make":
+        return f"make -C {shlex.quote(scratch_build_dir)} {shlex.quote(target)}"
+    if build_system == "ninja":
+        return f"ninja -C {shlex.quote(scratch_build_dir)} {shlex.quote(target)}"
+    if build_system == "meson":
+        return f"meson compile -C {shlex.quote(scratch_build_dir)} {shlex.quote(target)}"
+    if build_system == "bazel":
+        return f"cd {shlex.quote(scratch_build_dir)} && bazel build {shlex.quote(target)}"
+    if build_system == "xcodebuild":
+        return _compiled_xcodebuild_command(scratch_build_dir, target, xcode_options or {})
+    return f"cmake --build {shlex.quote(scratch_build_dir)} --target {shlex.quote(target)}"
+
+
+def _compiled_xcodebuild_command(
+    scratch_build_dir: str,
+    target: str,
+    options: dict[str, str | None],
+) -> str:
+    scratch_repo = str(options.get("scratchRepo") or ".")
+    workspace = options.get("workspace")
+    project = options.get("project")
+    scheme = options.get("scheme")
+    configuration = options.get("configuration")
+    sdk = options.get("sdk")
+    destination = options.get("destination")
+    cmd = ["cd", shlex.quote(scratch_repo), "&&", "xcodebuild", "build"]
+    if workspace:
+        cmd.extend(["-workspace", shlex.quote(str(workspace))])
+    if project:
+        cmd.extend(["-project", shlex.quote(str(project))])
+    if scheme:
+        cmd.extend(["-scheme", shlex.quote(str(scheme))])
+    else:
+        cmd.extend(["-target", shlex.quote(target)])
+    if configuration:
+        cmd.extend(["-configuration", shlex.quote(str(configuration))])
+    if sdk:
+        cmd.extend(["-sdk", shlex.quote(str(sdk))])
+    if destination:
+        cmd.extend(["-destination", shlex.quote(str(destination))])
+    cmd.extend([
+        f"CONFIGURATION_BUILD_DIR={shlex.quote(scratch_build_dir)}",
+        f"SYMROOT={shlex.quote(scratch_build_dir)}",
+        f"OBJROOT={shlex.quote(os.path.join(scratch_build_dir, 'obj'))}",
+    ])
+    return " ".join(cmd)
+
+
+def _remove_stale_scratch_artifact(
+    scratch_build_dir: str,
+    target: str,
+    original_artifact: str,
+    build_system: str | None,
+) -> None:
+    if build_system not in {"make", "ninja"}:
+        return
+    for candidate in {
+        os.path.join(scratch_build_dir, target),
+        os.path.join(scratch_build_dir, os.path.basename(original_artifact)),
+    }:
+        if os.path.isfile(candidate):
+            os.remove(candidate)
+
+
+_COMPILED_ARTIFACT_PLACEMENT_LOCKS: dict[str, threading.Lock] = {}
+_COMPILED_ARTIFACT_PLACEMENT_LOCKS_GUARD = threading.Lock()
+
+
+def _compiled_artifact_placement_lock(original_artifact: str) -> threading.Lock:
+    key = os.path.abspath(original_artifact)
+    with _COMPILED_ARTIFACT_PLACEMENT_LOCKS_GUARD:
+        lock = _COMPILED_ARTIFACT_PLACEMENT_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _COMPILED_ARTIFACT_PLACEMENT_LOCKS[key] = lock
+        return lock
+
+
 def _find_built_artifact(build_dir: str, target: str, original_artifact: str) -> str:
+    bazel_relative = _bazel_artifact_relative(target)
     candidates = [
         os.path.join(build_dir, os.path.basename(original_artifact)),
-        os.path.join(build_dir, target),
+        os.path.join(build_dir, "bazel-bin", os.path.basename(original_artifact)),
     ]
+    if not os.path.isabs(target) and not target.startswith("//"):
+        candidates.append(os.path.join(build_dir, target))
+    if bazel_relative:
+        candidates.append(os.path.join(build_dir, "bazel-bin", bazel_relative))
     for candidate in candidates:
         if os.path.isfile(candidate):
             return candidate
@@ -4869,6 +7246,20 @@ def _find_built_artifact(build_dir: str, target: str, original_artifact: str) ->
             if file_name in {os.path.basename(original_artifact), target}:
                 return os.path.join(current, file_name)
     raise ValueError(f"compiled artifact backend did not produce artifact for target {target!r}")
+
+
+def _bazel_artifact_relative(target: str) -> str | None:
+    if not target.startswith("//"):
+        return None
+    label = target[2:]
+    if ":" in label:
+        package, name = label.split(":", 1)
+    else:
+        package = label
+        name = os.path.basename(label.rstrip("/"))
+    if not name:
+        return None
+    return os.path.join(package, name) if package else name
 
 
 def _compiled_backend_retain_statuses(retain_worktrees_for: set[str] | None) -> list[str]:
@@ -4936,10 +7327,11 @@ def _compiled_object_records(build_dir: str, scratch_repo: str, mutants: list[Mu
     out: list[dict[str, Any]] = []
     for mut in mutants:
         source = os.path.abspath(os.path.join(scratch_repo, mut.file))
+        source_key = os.path.normcase(os.path.realpath(source))
         matched_entry: dict[str, Any] | None = None
         for entry in entries:
             entry_source = _compile_entry_source(entry)
-            if entry_source and os.path.normcase(os.path.normpath(entry_source)) == os.path.normcase(os.path.normpath(source)):
+            if entry_source and os.path.normcase(os.path.realpath(entry_source)) == source_key:
                 matched_entry = entry
                 break
         object_path = _compile_entry_object(matched_entry) if matched_entry else None
@@ -5005,6 +7397,196 @@ def _compiled_artifact_run_metadata(
     return payload
 
 
+def _run_mutant_switch_session(
+    mutants: list[Mutant],
+    repo: str,
+    build_cmd: str,
+    check_cmd: str | None,
+    test_cmd: str,
+    timeout_seconds: int | None,
+    worktree_mode: str,
+    artifact_root: str,
+    analysis_mode: str,
+    skip_tests: bool,
+    plugins: list[dict[str, Any]] | None = None,
+    worker_tmp_dir: str | None = None,
+    retain_worktrees: bool = False,
+    retain_worktrees_for: set[str] | None = None,
+    worker_label: str | None = None,
+    env_overrides: dict[str, str] | None = None,
+    env_inherit: list[str] | None = None,
+    env_block: list[str] | None = None,
+) -> list[Mutant]:
+    if not mutants:
+        return []
+    os.makedirs(artifact_root, exist_ok=True)
+    start_ms = time.perf_counter()
+    retain_state = {"retain": False}
+    build_log = os.path.join(artifact_root, "mutant_switch_build.log")
+    check_log = os.path.join(artifact_root, "mutant_switch_check.log")
+    guards = [
+        {"mutantId": mut.id, "guardId": mutant_switch_guard_id(mut)}
+        for mut in mutants
+    ]
+    with materialize_mutation_artifact(
+        repo,
+        worktree_mode,
+        worker_tmp_dir=worker_tmp_dir,
+        retain_state=retain_state,
+        worker_label=worker_label,
+    ) as artifact:
+        work_repo = artifact.work_repo
+        originals: dict[str, list[str]] = {}
+        try:
+            originals = _apply_mutant_switch_overlay(work_repo, mutants)
+            build_rc, build_ms = run_cmd(
+                build_cmd,
+                work_repo,
+                build_log,
+                timeout_seconds,
+                "build",
+                plugins,
+                env_overrides,
+                env_inherit,
+                env_block,
+            )
+            check_rc: int | None = None
+            check_ms = 0
+            if build_rc == 0 and check_cmd:
+                check_rc, check_ms = run_cmd(
+                    check_cmd,
+                    work_repo,
+                    check_log,
+                    timeout_seconds,
+                    "check",
+                    plugins,
+                    env_overrides,
+                    env_inherit,
+                    env_block,
+                )
+
+            compile_status = "PENDING"
+            compile_detail = ""
+            if build_rc == 124:
+                compile_status = "TIMEOUT"
+                compile_detail = "mutant-switch build timed out"
+            elif build_rc != 0:
+                compile_status = "BUILD_ERROR"
+                compile_detail = "mutant-switch artifact did not compile"
+            elif check_rc == 124:
+                compile_status = "TIMEOUT"
+                compile_detail = "mutant-switch check timed out"
+            elif check_rc not in {None, 0}:
+                compile_status = "CHECK_ERROR"
+                compile_detail = "mutant-switch checker rejected artifact"
+
+            for mut in mutants:
+                guard_id = mutant_switch_guard_id(mut)
+                mut.run = {
+                    **dict(mut.run),
+                    "mode": analysis_mode,
+                    "executionMode": "mutant-switch",
+                    "worktreeMode": worktree_mode,
+                    "mutantSwitchGuardId": guard_id,
+                    "mutantSwitchActiveEnvironment": MUTANT_SWITCH_ACTIVE_ENV,
+                    "mutationArtifact": mutant_switch_artifact_metadata(
+                        enabled=True,
+                        guard_count=len(guards),
+                        guards=guards,
+                        activation_environment=MUTANT_SWITCH_ACTIVE_ENV,
+                    ),
+                    "artifactPlacement": artifact.placement_metadata(),
+                    "scheduler": per_mutant_scheduler_record(
+                        coverage_selected=bool(mut.run.get("selectedTestCommand")),
+                        selected_tests=mut.run.get("coveredBy", []),
+                        split_from_batch_id=mut.run.get("splitFromBatchId"),
+                        active_mutant=guard_id,
+                    ),
+                    "buildReturnCode": build_rc,
+                    "buildMs": build_ms,
+                    "buildLog": build_log,
+                }
+                if check_rc is not None:
+                    mut.run["checkReturnCode"] = check_rc
+                    mut.run["checkMs"] = check_ms
+                    mut.run["checkLog"] = check_log
+                mut.buildLog = build_log
+                mut.checkLog = check_log if check_cmd else ""
+
+                if compile_status != "PENDING":
+                    mut.status = compile_status
+                    mut.detail = compile_detail
+                    mut.durationMs = int((time.perf_counter() - start_ms) * 1000)
+                    continue
+
+                if skip_tests:
+                    mut.status = "SURVIVED"
+                    mut.detail = "tests skipped after successful mutant-switch build/check"
+                    mut.durationMs = build_ms + check_ms
+                    continue
+
+                effective_test_cmd = str(mut.run.get("selectedTestCommand") or test_cmd)
+                test_log = os.path.join(artifact_root, f"mutant_switch_test_{_safe_basename(mut.id)}.log")
+                active_env = dict(env_overrides or {})
+                active_env[MUTANT_SWITCH_ACTIVE_ENV] = guard_id
+                test_rc, test_ms = run_cmd(
+                    effective_test_cmd,
+                    work_repo,
+                    test_log,
+                    timeout_seconds,
+                    "test",
+                    plugins,
+                    active_env,
+                    env_inherit,
+                    env_block,
+                )
+                mut.testLog = test_log
+                mut.run["testReturnCode"] = test_rc
+                mut.run["testMs"] = test_ms
+                mut.run["testCommand"] = effective_test_cmd
+                mut.run["testLog"] = test_log
+                mut.durationMs = build_ms + check_ms + test_ms
+                if test_rc == 124:
+                    mut.status = "TIMEOUT"
+                    mut.detail = "mutant-switch tests timed out"
+                elif test_rc != 0:
+                    mut.status = "KILLED"
+                    mut.detail = "mutant-switch active mutant killed tests"
+                else:
+                    mut.status = "SURVIVED"
+                    mut.detail = "all targeted tests passed"
+        finally:
+            retain_current = any(
+                _should_retain_worktree(
+                    retain_worktrees,
+                    retain_worktrees_for,
+                    mut.status,
+                    work_repo,
+                    repo,
+                )
+                for mut in mutants
+            )
+            if retain_current:
+                retain_state["retain"] = True
+                artifact.mark_retained("mutant-switch")
+            elif worktree_mode == "inplace" and originals:
+                _restore_mutant_switch_overlay(work_repo, originals)
+            placement = artifact.placement_metadata()
+            placement["mode"] = "mutant-switch"
+            placement["mutantSwitch"] = {
+                "activationEnvironment": MUTANT_SWITCH_ACTIVE_ENV,
+                "guardedSourceOverlay": True,
+            }
+            for mut in mutants:
+                mut.run["artifactPlacement"] = placement
+                if retain_current:
+                    mut.run["retainedWorktree"] = work_repo
+                    mut.run["retainedWorktreeReason"] = "mutant-switch"
+                    if worker_label:
+                        mut.run["retainedWorktreeLabel"] = worker_label
+    return mutants
+
+
 def _run_mutant_once(
     mut: Mutant,
     repo: str,
@@ -5055,14 +7637,11 @@ def _run_mutant_once(
         mut.checkLog = check_log
         mut.testLog = test_log
         effective_test_cmd = str(mut.run.get("selectedTestCommand") or test_cmd)
-        mut.run["scheduler"] = {
-            "sessionType": "per-mutant",
-            "coverageSelected": bool(mut.run.get("selectedTestCommand")),
-            "selectedTests": list(mut.run.get("coveredBy", []))
-            if isinstance(mut.run.get("coveredBy"), list)
-            else [],
-            "splitFromBatchId": mut.run.get("splitFromBatchId"),
-        }
+        mut.run["scheduler"] = per_mutant_scheduler_record(
+            coverage_selected=bool(mut.run.get("selectedTestCommand")),
+            selected_tests=mut.run.get("coveredBy", []),
+            split_from_batch_id=mut.run.get("splitFromBatchId"),
+        )
 
         try:
             build_rc, build_ms = run_cmd(
@@ -5176,6 +7755,13 @@ def _run_mutant_once_compiled_artifact(
     build_dir: str | None,
     build_target: str | None,
     test_binary: str | None,
+    artifact_path: str | None,
+    xcode_workspace: str | None = None,
+    xcode_project: str | None = None,
+    xcode_scheme: str | None = None,
+    xcode_configuration: str | None = None,
+    xcode_sdk: str | None = None,
+    xcode_destination: str | None = None,
     plugins: list[dict[str, Any]] | None = None,
     worker_tmp_dir: str | None = None,
     retain_worktrees: bool = False,
@@ -5185,9 +7771,6 @@ def _run_mutant_once_compiled_artifact(
     env_inherit: list[str] | None = None,
     env_block: list[str] | None = None,
 ) -> Mutant:
-    if build_system not in {"cmake", "ctest", None}:
-        raise ValueError(f"{artifact_backend} backend currently requires --build-system cmake/ctest")
-
     existing_run = dict(mut.run)
     run_record = dict(existing_run)
     run_record["mode"] = execution_mode
@@ -5205,16 +7788,33 @@ def _run_mutant_once_compiled_artifact(
     target, original_artifact, artifact_kind = _compiled_artifact_target(
         repo,
         artifact_backend,
+        build_system,
         build_dir,
         build_target,
         test_binary,
+        artifact_path=artifact_path,
+        xcode_scheme=xcode_scheme,
     )
     if not os.path.isfile(original_artifact):
         raise ValueError(f"{artifact_backend} backend requires existing built artifact: {original_artifact}")
 
     scratch_root = tempfile.mkdtemp(prefix="stryker-cxx-compiled-", dir=worker_tmp_dir)
     scratch_repo = os.path.join(scratch_root, "source")
-    scratch_build_dir = os.path.join(scratch_root, "build")
+    scratch_build_dir = _compiled_artifact_scratch_build_dir(
+        scratch_root,
+        scratch_repo,
+        build_system,
+        build_dir,
+    )
+    xcode_options = {
+        "scratchRepo": scratch_repo,
+        "workspace": xcode_workspace,
+        "project": xcode_project,
+        "scheme": xcode_scheme,
+        "configuration": xcode_configuration,
+        "sdk": xcode_sdk,
+        "destination": xcode_destination,
+    }
     backup_artifact = os.path.join(artifact_root, f"original_{_safe_basename(mut.id)}_{os.path.basename(original_artifact)}")
     configure_log = os.path.join(artifact_root, f"compiled_configure_{_safe_basename(mut.id)}.log")
     build_log = os.path.join(artifact_root, f"compiled_build_{_safe_basename(mut.id)}.log")
@@ -5228,6 +7828,8 @@ def _run_mutant_once_compiled_artifact(
     mutated_artifact: str | None = None
     object_artifacts: list[dict[str, Any]] | None = None
     retained = False
+    placement_lock: threading.Lock | None = None
+    placement_lock_acquired = False
 
     try:
         shutil.copytree(
@@ -5236,36 +7838,51 @@ def _run_mutant_once_compiled_artifact(
             ignore=_ignore_for_compiled_scratch(build_dir, artifact_root),
         )
         apply_mutant(scratch_repo, mut)
-
-        configure_cmd = (
-            "cmake -S "
-            f"{shlex.quote(scratch_repo)} -B {shlex.quote(scratch_build_dir)} "
-            "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
+        _remove_stale_scratch_artifact(
+            scratch_build_dir,
+            target,
+            original_artifact,
+            build_system,
         )
-        configure_rc, configure_ms = run_cmd(
-            configure_cmd,
-            repo,
-            configure_log,
-            timeout_seconds,
-            "build",
-            plugins,
-            env_overrides,
-            env_inherit,
-            env_block,
+
+        configure_cmd = _compiled_artifact_configure_command(
+            scratch_repo,
+            scratch_build_dir,
+            build_system,
         )
         mut.run["configureCommand"] = configure_cmd
-        mut.run["configureReturnCode"] = configure_rc
-        mut.run["configureMs"] = configure_ms
-        if configure_rc == 124:
-            mut.status = "TIMEOUT"
-            mut.detail = f"{artifact_backend} configure timed out"
-            return mut
-        if configure_rc != 0:
-            mut.status = "BUILD_ERROR"
-            mut.detail = f"{artifact_backend} configure failed"
-            return mut
+        if configure_cmd:
+            configure_rc, configure_ms = run_cmd(
+                configure_cmd,
+                repo,
+                configure_log,
+                timeout_seconds,
+                "build",
+                plugins,
+                env_overrides,
+                env_inherit,
+                env_block,
+            )
+            mut.run["configureReturnCode"] = configure_rc
+            mut.run["configureMs"] = configure_ms
+            if configure_rc == 124:
+                mut.status = "TIMEOUT"
+                mut.detail = f"{artifact_backend} configure timed out"
+                return mut
+            if configure_rc != 0:
+                mut.status = "BUILD_ERROR"
+                mut.detail = f"{artifact_backend} configure failed"
+                return mut
+        else:
+            mut.run["configureReturnCode"] = None
+            mut.run["configureMs"] = 0
 
-        compiled_build_cmd = f"cmake --build {shlex.quote(scratch_build_dir)} --target {shlex.quote(target)}"
+        compiled_build_cmd = _compiled_artifact_build_command(
+            scratch_build_dir,
+            build_system,
+            target,
+            xcode_options=xcode_options,
+        )
         build_rc, build_ms = run_cmd(
             compiled_build_cmd,
             repo,
@@ -5323,18 +7940,23 @@ def _run_mutant_once_compiled_artifact(
                 mut.detail = f"{artifact_backend} checker rejected mutant"
                 return mut
 
+        placement_lock = _compiled_artifact_placement_lock(original_artifact)
+        lock_wait_start = time.perf_counter()
+        placement_lock.acquire()
+        placement_lock_acquired = True
+        mut.run["artifactPlacementLock"] = {
+            "key": os.path.abspath(original_artifact),
+            "waitMs": int((time.perf_counter() - lock_wait_start) * 1000),
+        }
         shutil.copy2(original_artifact, backup_artifact)
         shutil.copy2(mutated_artifact, original_artifact)
         mut.run["artifactPlaced"] = True
-        mut.run["scheduler"] = {
-            "sessionType": "per-mutant",
-            "coverageSelected": bool(mut.run.get("selectedTestCommand")),
-            "selectedTests": list(mut.run.get("coveredBy", []))
-            if isinstance(mut.run.get("coveredBy"), list)
-            else [],
-            "splitFromBatchId": mut.run.get("splitFromBatchId"),
-            "artifactBackend": artifact_backend,
-        }
+        mut.run["scheduler"] = per_mutant_scheduler_record(
+            coverage_selected=bool(mut.run.get("selectedTestCommand")),
+            selected_tests=mut.run.get("coveredBy", []),
+            split_from_batch_id=mut.run.get("splitFromBatchId"),
+            artifact_backend=artifact_backend,
+        )
         effective_test_cmd = str(mut.run.get("selectedTestCommand") or test_cmd)
         if skip_tests:
             mut.status = "SURVIVED"
@@ -5364,11 +7986,15 @@ def _run_mutant_once_compiled_artifact(
                 mut.status = "SURVIVED"
                 mut.detail = "all targeted tests passed against compiled artifact"
     finally:
-        if os.path.isfile(backup_artifact):
-            shutil.copy2(backup_artifact, original_artifact)
-            original_hash_after = _sha256_file(original_artifact)
-        elif os.path.isfile(original_artifact):
-            original_hash_after = _sha256_file(original_artifact)
+        try:
+            if os.path.isfile(backup_artifact):
+                shutil.copy2(backup_artifact, original_artifact)
+                original_hash_after = _sha256_file(original_artifact)
+            elif os.path.isfile(original_artifact):
+                original_hash_after = _sha256_file(original_artifact)
+        finally:
+            if placement_lock_acquired and placement_lock is not None:
+                placement_lock.release()
         retain_current = _should_retain_worktree(
             retain_worktrees,
             retain_worktrees_for,
@@ -5443,6 +8069,13 @@ def _run_batch_probe_compiled_artifact(
     build_dir: str | None,
     build_target: str | None,
     test_binary: str | None,
+    artifact_path: str | None,
+    xcode_workspace: str | None = None,
+    xcode_project: str | None = None,
+    xcode_scheme: str | None = None,
+    xcode_configuration: str | None = None,
+    xcode_sdk: str | None = None,
+    xcode_destination: str | None = None,
     plugins: list[dict[str, Any]] | None = None,
     worker_tmp_dir: str | None = None,
     retain_worktrees: bool = False,
@@ -5452,10 +8085,7 @@ def _run_batch_probe_compiled_artifact(
     env_inherit: list[str] | None = None,
     env_block: list[str] | None = None,
 ) -> tuple[str, str, int, dict[str, Any]]:
-    if build_system not in {"cmake", "ctest", None}:
-        raise ValueError(f"{artifact_backend} backend currently requires --build-system cmake/ctest")
-
-    batch_id = hashlib.sha256(",".join(mut.id for mut in batch).encode("utf-8")).hexdigest()[:12]
+    batch_id = _batch_id(batch)
     effective_test_cmd, selected_tests = _batch_selected_test_command(
         batch,
         test_cmd,
@@ -5467,13 +8097,12 @@ def _run_batch_probe_compiled_artifact(
         "worktreeMode": "compiled-artifact",
         "batchId": batch_id,
         "batchSize": len(batch),
-        "scheduler": {
-            "sessionType": "batch",
-            "coverageSelected": bool(selected_tests and coverage_test_command_template),
-            "selectedTests": selected_tests,
-            "mutantIds": [mut.id for mut in batch],
-            "artifactBackend": artifact_backend,
-        },
+        "scheduler": batch_scheduler_record(
+            coverage_selected=bool(selected_tests and coverage_test_command_template),
+            selected_tests=selected_tests,
+            mutant_ids=[mut.id for mut in batch],
+            artifact_backend=artifact_backend,
+        ),
     }
     if selected_tests:
         run["coveredBy"] = selected_tests
@@ -5486,16 +8115,33 @@ def _run_batch_probe_compiled_artifact(
     target, original_artifact, artifact_kind = _compiled_artifact_target(
         repo,
         artifact_backend,
+        build_system,
         build_dir,
         build_target,
         test_binary,
+        artifact_path=artifact_path,
+        xcode_scheme=xcode_scheme,
     )
     if not os.path.isfile(original_artifact):
         raise ValueError(f"{artifact_backend} backend requires existing built artifact: {original_artifact}")
 
     scratch_root = tempfile.mkdtemp(prefix="stryker-cxx-compiled-batch-", dir=worker_tmp_dir)
     scratch_repo = os.path.join(scratch_root, "source")
-    scratch_build_dir = os.path.join(scratch_root, "build")
+    scratch_build_dir = _compiled_artifact_scratch_build_dir(
+        scratch_root,
+        scratch_repo,
+        build_system,
+        build_dir,
+    )
+    xcode_options = {
+        "scratchRepo": scratch_repo,
+        "workspace": xcode_workspace,
+        "project": xcode_project,
+        "scheme": xcode_scheme,
+        "configuration": xcode_configuration,
+        "sdk": xcode_sdk,
+        "destination": xcode_destination,
+    }
     backup_artifact = os.path.join(artifact_root, f"original_batch_{batch_id}_{os.path.basename(original_artifact)}")
     configure_log = os.path.join(artifact_root, f"compiled_batch_configure_{batch_id}.log")
     build_log = os.path.join(artifact_root, f"compiled_batch_build_{batch_id}.log")
@@ -5507,6 +8153,8 @@ def _run_batch_probe_compiled_artifact(
     object_artifacts: list[dict[str, Any]] | None = None
     retained = False
     result: tuple[str, str, int, dict[str, Any]] | None = None
+    placement_lock: threading.Lock | None = None
+    placement_lock_acquired = False
 
     try:
         shutil.copytree(
@@ -5516,35 +8164,50 @@ def _run_batch_probe_compiled_artifact(
         )
         for mut in batch:
             apply_mutant(scratch_repo, mut)
-
-        configure_cmd = (
-            "cmake -S "
-            f"{shlex.quote(scratch_repo)} -B {shlex.quote(scratch_build_dir)} "
-            "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
+        _remove_stale_scratch_artifact(
+            scratch_build_dir,
+            target,
+            original_artifact,
+            build_system,
         )
-        configure_rc, configure_ms = run_cmd(
-            configure_cmd,
-            repo,
-            configure_log,
-            timeout_seconds,
-            "build",
-            plugins,
-            env_overrides,
-            env_inherit,
-            env_block,
+
+        configure_cmd = _compiled_artifact_configure_command(
+            scratch_repo,
+            scratch_build_dir,
+            build_system,
         )
         run["configureCommand"] = configure_cmd
-        run["configureReturnCode"] = configure_rc
-        run["configureMs"] = configure_ms
         run["configureLog"] = configure_log
-        if configure_rc == 124:
-            result = ("TIMEOUT", f"{artifact_backend} batch configure timed out", int((time.perf_counter() - start_ms) * 1000), run)
-            return result
-        if configure_rc != 0:
-            result = ("BUILD_ERROR", f"{artifact_backend} batch configure failed", int((time.perf_counter() - start_ms) * 1000), run)
-            return result
+        if configure_cmd:
+            configure_rc, configure_ms = run_cmd(
+                configure_cmd,
+                repo,
+                configure_log,
+                timeout_seconds,
+                "build",
+                plugins,
+                env_overrides,
+                env_inherit,
+                env_block,
+            )
+            run["configureReturnCode"] = configure_rc
+            run["configureMs"] = configure_ms
+            if configure_rc == 124:
+                result = ("TIMEOUT", f"{artifact_backend} batch configure timed out", int((time.perf_counter() - start_ms) * 1000), run)
+                return result
+            if configure_rc != 0:
+                result = ("BUILD_ERROR", f"{artifact_backend} batch configure failed", int((time.perf_counter() - start_ms) * 1000), run)
+                return result
+        else:
+            run["configureReturnCode"] = None
+            run["configureMs"] = 0
 
-        compiled_build_cmd = f"cmake --build {shlex.quote(scratch_build_dir)} --target {shlex.quote(target)}"
+        compiled_build_cmd = _compiled_artifact_build_command(
+            scratch_build_dir,
+            build_system,
+            target,
+            xcode_options=xcode_options,
+        )
         build_rc, build_ms = run_cmd(
             compiled_build_cmd,
             repo,
@@ -5604,6 +8267,14 @@ def _run_batch_probe_compiled_artifact(
                 result = ("CHECK_ERROR", f"{artifact_backend} batch checker rejected mutant set", int((time.perf_counter() - start_ms) * 1000), run)
                 return result
 
+        placement_lock = _compiled_artifact_placement_lock(original_artifact)
+        lock_wait_start = time.perf_counter()
+        placement_lock.acquire()
+        placement_lock_acquired = True
+        run["artifactPlacementLock"] = {
+            "key": os.path.abspath(original_artifact),
+            "waitMs": int((time.perf_counter() - lock_wait_start) * 1000),
+        }
         shutil.copy2(original_artifact, backup_artifact)
         shutil.copy2(mutated_artifact, original_artifact)
         run["artifactPlaced"] = True
@@ -5652,11 +8323,15 @@ def _run_batch_probe_compiled_artifact(
         return result
     finally:
         status = result[0] if result else "PENDING"
-        if os.path.isfile(backup_artifact):
-            shutil.copy2(backup_artifact, original_artifact)
-            original_hash_after = _sha256_file(original_artifact)
-        elif os.path.isfile(original_artifact):
-            original_hash_after = _sha256_file(original_artifact)
+        try:
+            if os.path.isfile(backup_artifact):
+                shutil.copy2(backup_artifact, original_artifact)
+                original_hash_after = _sha256_file(original_artifact)
+            elif os.path.isfile(original_artifact):
+                original_hash_after = _sha256_file(original_artifact)
+        finally:
+            if placement_lock_acquired and placement_lock is not None:
+                placement_lock.release()
         retain_current = _should_retain_worktree(
             retain_worktrees,
             retain_worktrees_for,
@@ -5877,34 +8552,140 @@ def _run_mutant_task(payload: tuple[Any, ...]) -> Mutant:
 
 
 def _mutants_overlap(a: Mutant, b: Mutant) -> bool:
+    return _batch_placement_conflict_reason(a, b) is not None
+
+
+def _batch_placement_conflict_reason(a: Mutant, b: Mutant) -> str | None:
     if a.file != b.file:
-        return False
+        return None
     if a.mutator in BATCH_ISOLATED_MUTATORS or b.mutator in BATCH_ISOLATED_MUTATORS:
-        return True
+        return "source-structure mutator isolation"
     # Keep batching conservative: nearby edits can shift columns, interact with
     # statement-level replacements, or change neighboring branch/loop behavior.
     if abs(a.line - b.line) <= 1:
-        return True
-    return False
+        return "same-file adjacent-line isolation"
+    return None
+
+
+def _batch_coverage_key(mut: Mutant) -> tuple[str, ...]:
+    covered_by = mut.run.get("coveredBy", [])
+    if not isinstance(covered_by, list):
+        return ()
+    return tuple(sorted(str(test) for test in covered_by))
+
+
+def _batch_shared_coverage_key(batch: list[Mutant]) -> tuple[str, ...]:
+    if not batch:
+        return ()
+    first = _batch_coverage_key(batch[0])
+    if not first:
+        return ()
+    if all(_batch_coverage_key(mut) == first for mut in batch[1:]):
+        return first
+    return ()
+
+
+def _batch_coverage_union(batch: list[Mutant]) -> tuple[str, ...]:
+    tests: set[str] = set()
+    for mut in batch:
+        tests.update(_batch_coverage_key(mut))
+    return tuple(sorted(tests))
+
+
+def _coverage_union_growth(mut: Mutant, batch: list[Mutant]) -> int:
+    coverage_key = set(_batch_coverage_key(mut))
+    if not coverage_key:
+        return 0
+    existing = set(_batch_coverage_union(batch))
+    return len(existing | coverage_key) - len(existing)
+
+
+def _batch_candidate_order(mut: Mutant, batches: list[list[Mutant]]) -> list[list[Mutant]]:
+    coverage_key = _batch_coverage_key(mut)
+    if not coverage_key:
+        return batches
+    matching = [batch for batch in batches if _batch_shared_coverage_key(batch) == coverage_key]
+    non_matching = [batch for batch in batches if _batch_shared_coverage_key(batch) != coverage_key]
+    non_matching.sort(key=lambda batch: (_coverage_union_growth(mut, batch), batches.index(batch)))
+    return matching + non_matching
 
 
 def _batch_mutants(mutants: list[Mutant], batch_size: int) -> list[list[Mutant]]:
     if batch_size <= 1:
+        for mut in mutants:
+            mut.run["batchPlanning"] = {
+                "placement": "new-batch",
+                "placementReasons": ["batch-size limit"],
+            }
         return [[mut] for mut in mutants]
     batches: list[list[Mutant]] = []
     for mut in mutants:
         placed = False
-        for batch in batches:
+        placement_reasons: set[str] = set()
+        for batch in _batch_candidate_order(mut, batches):
             if len(batch) >= batch_size:
+                placement_reasons.add("batch-size limit")
                 continue
-            if any(_mutants_overlap(mut, existing) for existing in batch):
+            conflict_reasons = [
+                reason
+                for existing in batch
+                for reason in [_batch_placement_conflict_reason(mut, existing)]
+                if reason is not None
+            ]
+            if conflict_reasons:
+                placement_reasons.update(conflict_reasons)
                 continue
+            coverage_key = _batch_coverage_key(mut)
+            shared_coverage_key = _batch_shared_coverage_key(batch)
+            coverage_union = _batch_coverage_union(batch)
+            coverage_reason = None
+            if coverage_key and shared_coverage_key == coverage_key:
+                coverage_reason = "coverage-selected affinity"
+            elif coverage_key and coverage_union:
+                coverage_reason = "coverage-union minimized"
             batch.append(mut)
+            mut.run["batchPlanning"] = {
+                "placement": "joined-existing-batch",
+                "placementReasons": [coverage_reason] if coverage_reason else [],
+            }
             placed = True
             break
         if not placed:
+            mut.run["batchPlanning"] = {
+                "placement": "new-batch" if batches else "seed",
+                "placementReasons": sorted(placement_reasons),
+            }
             batches.append([mut])
     return batches
+
+
+def _batch_id(batch: list[Mutant]) -> str:
+    return hashlib.sha256(",".join(mut.id for mut in batch).encode("utf-8")).hexdigest()[:12]
+
+
+def _batch_plan_record(batch_index: int, batch: list[Mutant]) -> dict[str, Any]:
+    return {
+        "batchIndex": batch_index,
+        "batchId": _batch_id(batch),
+        "batchSize": len(batch),
+        "sessionType": "batch" if len(batch) > 1 else "per-mutant",
+        "heuristic": "first-fit non-overlap",
+        "placement": [dict(mut.run.get("batchPlanning", {})) for mut in batch],
+        "mutantIds": [mut.id for mut in batch],
+        "locations": [
+            {
+                "file": mut.file,
+                "line": mut.line,
+                "column": mut.col + 1,
+                "mutator": mut.mutator,
+            }
+            for mut in batch
+        ],
+    }
+
+
+def _batch_plan(batches: list[list[Mutant]]) -> list[dict[str, Any]]:
+    return [_batch_plan_record(index, batch) for index, batch in enumerate(batches, 1)]
 
 
 def _run_batch_probe(
@@ -5928,7 +8709,7 @@ def _run_batch_probe(
     env_inherit: list[str] | None = None,
     env_block: list[str] | None = None,
 ) -> tuple[str, str, int, dict[str, Any]]:
-    batch_id = hashlib.sha256(",".join(mut.id for mut in batch).encode("utf-8")).hexdigest()[:12]
+    batch_id = _batch_id(batch)
     run: dict[str, Any] = {
         "mode": execution_mode,
         "worktreeMode": worktree_mode,
@@ -5940,12 +8721,11 @@ def _run_batch_probe(
         test_cmd,
         coverage_test_command_template,
     )
-    run["scheduler"] = {
-        "sessionType": "batch",
-        "coverageSelected": bool(selected_tests and coverage_test_command_template),
-        "selectedTests": selected_tests,
-        "mutantIds": [mut.id for mut in batch],
-    }
+    run["scheduler"] = batch_scheduler_record(
+        coverage_selected=bool(selected_tests and coverage_test_command_template),
+        selected_tests=selected_tests,
+        mutant_ids=[mut.id for mut in batch],
+    )
     if selected_tests:
         run["coveredBy"] = selected_tests
         run["selectedTestCommand"] = effective_test_cmd
@@ -6152,6 +8932,13 @@ def _run_compiled_batch_task(payload: tuple[Any, ...]) -> tuple[int, list[Mutant
         build_dir,
         build_target,
         test_binary,
+        artifact_path,
+        xcode_workspace,
+        xcode_project,
+        xcode_scheme,
+        xcode_configuration,
+        xcode_sdk,
+        xcode_destination,
         plugins,
         worker_tmp_dir,
         retain_worktrees,
@@ -6176,6 +8963,13 @@ def _run_compiled_batch_task(payload: tuple[Any, ...]) -> tuple[int, list[Mutant
         build_dir=build_dir,
         build_target=build_target,
         test_binary=test_binary,
+        artifact_path=artifact_path,
+        xcode_workspace=xcode_workspace,
+        xcode_project=xcode_project,
+        xcode_scheme=xcode_scheme,
+        xcode_configuration=xcode_configuration,
+        xcode_sdk=xcode_sdk,
+        xcode_destination=xcode_destination,
         plugins=plugins,
         worker_tmp_dir=worker_tmp_dir,
         retain_worktrees=retain_worktrees,
@@ -6209,6 +9003,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--build-dir", default=None)
     ap.add_argument("--build-target", default=None)
     ap.add_argument("--test-binary", default=None)
+    ap.add_argument("--artifact-path", default=None)
+    ap.add_argument("--xcode-workspace", default=None, dest="xcode_workspace")
+    ap.add_argument("--xcode-project", default=None, dest="xcode_project")
+    ap.add_argument("--xcode-scheme", default=None, dest="xcode_scheme")
+    ap.add_argument("--xcode-configuration", default=None, dest="xcode_configuration")
+    ap.add_argument("--xcode-sdk", default=None, dest="xcode_sdk")
+    ap.add_argument("--xcode-destination", default=None, dest="xcode_destination")
     ap.add_argument("--report", required=True)
     ap.add_argument("--config-path", default=None)
     ap.add_argument("--config-hash", default=None)
@@ -6253,6 +9054,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dashboard-build-url", default=None)
     ap.add_argument("--dashboard-auth-token-env", default=None)
     ap.add_argument("--dashboard-auth-header", default="Authorization")
+    ap.add_argument("--dashboard-upload-retries", type=int, default=0)
+    ap.add_argument("--dashboard-upload-retry-delay-ms", type=int, default=1000)
     ap.add_argument("--incremental", action="store_true",
                     help="Reuse compatible mutant results from a baseline cache")
     ap.add_argument("--baseline-file", default=None,
@@ -6275,8 +9078,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--shard-index", type=int, default=None)
     ap.add_argument("--shard-total", type=int, default=None, help="Split work into N shards")
+    ap.add_argument("--distribution-manifest", default=None,
+                    help="Write a deterministic shard/work distribution manifest")
     ap.add_argument("--artifact-backend", default="source-overlay", choices=sorted(ARTIFACT_BACKENDS))
     ap.add_argument("--artifact-fallback", default="none", choices=["none", "source-overlay"])
+    ap.add_argument("--execution-mode", default="source-overlay", choices=sorted(EXECUTION_MODES))
     ap.add_argument("--worktree-mode", dest="worktree_mode", choices=["inplace", "git-worktree", "copy"], default="inplace")
     ap.add_argument("--allow-dirty", action="store_true")
     ap.add_argument("--output-format", default="legacy", choices=["legacy", "stryker-cxx"],
@@ -6308,21 +9114,89 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--run-mutant-id", default=None)
     args = ap.parse_args(argv)
+    requested_artifact_backend = args.artifact_backend
+    artifact_fallback_reason: str | None = None
 
     if args.jobs < 1:
         ap.error("--jobs must be >= 1")
     if args.batch_size < 1:
         ap.error("--batch-size must be >= 1")
-    if args.batch_mutants and args.worktree_mode == "inplace":
-        if args.artifact_backend == "source-overlay":
-            ap.error("--batch-mutants requires --worktree-mode copy or git-worktree")
     if args.artifact_backend != "source-overlay":
         if args.artifact_backend not in {"compiled-executable", "compiled-library", "compiled-object"}:
             ap.error(f"{args.artifact_backend} backend is specified but not implemented yet; use compiled-executable, compiled-library, or compiled-object")
-        if args.build_system not in {"cmake", "ctest", None}:
-            ap.error(f"--artifact-backend {args.artifact_backend} currently requires --build-system cmake/ctest")
-        if args.jobs > 1:
-            ap.error(f"--artifact-backend {args.artifact_backend} currently requires --jobs 1")
+        allowed_build_systems = {"cmake", "ctest"}
+        supported_build_systems = "cmake/ctest"
+        if args.artifact_backend == "compiled-executable":
+            allowed_build_systems = {"cmake", "ctest", "make", "ninja", "meson", "bazel", "xcodebuild"}
+            supported_build_systems = "cmake/ctest/make/ninja/meson/bazel/xcodebuild"
+        elif args.artifact_backend == "compiled-library":
+            allowed_build_systems = {"cmake", "ctest", "make", "ninja", "meson"}
+            supported_build_systems = "cmake/ctest/make/ninja/meson"
+            if args.artifact_path:
+                allowed_build_systems = {"cmake", "ctest", "make", "ninja", "meson", "bazel", "xcodebuild"}
+                supported_build_systems = "cmake/ctest/make/ninja/meson/bazel/xcodebuild"
+        elif args.artifact_backend == "compiled-object" and args.artifact_path:
+            allowed_build_systems = {"cmake", "ctest", "make", "ninja", "meson", "bazel"}
+            supported_build_systems = "cmake/ctest/make/ninja/meson/bazel"
+        if args.build_system is None:
+            if args.artifact_fallback == "source-overlay":
+                artifact_fallback_reason = (
+                    f"--artifact-backend {args.artifact_backend} requires explicit "
+                    f"--build-system {supported_build_systems}; falling back to source-overlay"
+                )
+                args.artifact_backend = "source-overlay"
+            else:
+                ap.error(
+                    f"--artifact-backend {args.artifact_backend} requires explicit "
+                    f"--build-system {supported_build_systems}"
+                )
+        elif args.build_system not in allowed_build_systems:
+            if args.artifact_fallback == "source-overlay":
+                if args.artifact_backend == "compiled-executable":
+                    supported = "cmake/ctest/make/ninja/meson/bazel/xcodebuild"
+                elif args.artifact_backend == "compiled-library":
+                    supported = "cmake/ctest/make/ninja/meson"
+                    if args.artifact_path:
+                        supported = f"{supported}/bazel/xcodebuild"
+                elif args.artifact_backend == "compiled-object" and args.artifact_path:
+                    supported = "cmake/ctest/make/ninja/meson/bazel"
+                else:
+                    supported = "cmake/ctest"
+                artifact_fallback_reason = (
+                    f"--artifact-backend {args.artifact_backend} does not support "
+                    f"--build-system {args.build_system}; falling back to source-overlay "
+                    f"(supported: {supported})"
+                )
+                args.artifact_backend = "source-overlay"
+            else:
+                if args.artifact_backend == "compiled-executable":
+                    ap.error(
+                        "--artifact-backend compiled-executable currently requires "
+                        "--build-system cmake/ctest/make/ninja/meson/bazel/xcodebuild"
+                    )
+                if args.artifact_backend == "compiled-library":
+                    ap.error(
+                        "--artifact-backend compiled-library currently requires "
+                        "--build-system cmake/ctest/make/ninja/meson "
+                        "(or bazel/xcodebuild with --artifact-path)"
+                    )
+                if args.artifact_backend == "compiled-object" and args.artifact_path:
+                    ap.error(
+                        "--artifact-backend compiled-object with --artifact-path currently requires "
+                        "--build-system cmake/ctest/make/ninja/meson/bazel"
+                    )
+                ap.error(f"--artifact-backend {args.artifact_backend} currently requires --build-system cmake/ctest")
+        if args.jobs > 1 and not args.batch_mutants:
+            if args.artifact_fallback == "source-overlay":
+                artifact_fallback_reason = (
+                    f"--artifact-backend {args.artifact_backend} currently requires "
+                    "--batch-mutants for --jobs > 1; falling back to source-overlay"
+                )
+                args.artifact_backend = "source-overlay"
+            else:
+                ap.error(f"--artifact-backend {args.artifact_backend} currently requires --batch-mutants for --jobs > 1")
+    if args.batch_mutants and args.worktree_mode == "inplace" and args.artifact_backend == "source-overlay":
+        ap.error("--batch-mutants requires --worktree-mode copy or git-worktree")
     coverage_helper_tests = _parse_csv_items(args.coverage_helper_tests)
     if args.coverage_helper_command_template and not coverage_helper_tests:
         ap.error("--coverage-helper-command-template requires --coverage-helper-tests")
@@ -6338,6 +9212,10 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("--retained-worktree-ttl-hours must be >= 0")
     if args.dashboard_retention_days is not None and args.dashboard_retention_days < 1:
         ap.error("--dashboard-retention-days must be >= 1")
+    if args.dashboard_upload_retries < 0:
+        ap.error("--dashboard-upload-retries must be >= 0")
+    if args.dashboard_upload_retry_delay_ms < 0:
+        ap.error("--dashboard-upload-retry-delay-ms must be >= 0")
     try:
         retain_worktrees_for = _parse_retain_statuses(args.retain_worktrees_for)
     except ValueError as exc:
@@ -6384,7 +9262,11 @@ def main(argv: list[str] | None = None) -> int:
     else:
         output_mode = args.output_format
 
-    plugins = load_plugins(args.plugin, args.plugin_dir)
+    try:
+        plugins = load_plugins(args.plugin, args.plugin_dir)
+    except ValueError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        return 1
 
     try:
         enabled = normalize_mutator_list(args.mutators)
@@ -6404,12 +9286,15 @@ def main(argv: list[str] | None = None) -> int:
         if dirty:
             raise ValueError(f"refusing to mutate dirty files in inplace mode: {', '.join(dirty)} (use --allow-dirty to override)")
 
-    if args.jobs > 1 and args.worktree_mode == "inplace":
+    if args.jobs > 1 and args.worktree_mode == "inplace" and args.artifact_backend == "source-overlay":
         if not args.quiet:
             print("[error] --jobs > 1 requires --worktree-mode copy or git-worktree to avoid workspace races")
         raise ValueError("cannot run parallel in-place mutation")
 
     artifact_root = args.artifact_dir or os.path.join(repo, "agent_space", "stryker-cxx")
+    requested_execution_mode = args.execution_mode
+    actual_execution_mode = requested_execution_mode
+    mutant_switch_fallback_reason: str | None = None
     rep = Report(
         target_files=files,
         repo=repo,
@@ -6422,8 +9307,13 @@ def main(argv: list[str] | None = None) -> int:
         testCommand=args.test_cmd,
         execution={
             "mode": args.mode,
+            "executionMode": actual_execution_mode,
+            "requestedExecutionMode": requested_execution_mode,
             "artifactBackend": args.artifact_backend,
+            "requestedArtifactBackend": requested_artifact_backend,
+            "artifactPath": args.artifact_path,
             "artifactFallback": args.artifact_fallback,
+            "artifactFallbackReason": artifact_fallback_reason,
             "worktreeMode": args.worktree_mode,
             "jobs": args.jobs,
             "initialTest": not args.skip_initial_test,
@@ -6433,11 +9323,20 @@ def main(argv: list[str] | None = None) -> int:
                 "engine": args.mode,
                 "macroRejectedMutants": 0,
                 "macroRejections": [],
+                "macroRejectedRanges": 0,
+                "macroRangeRejections": [],
                 "equivalentSuppression": {
                     "mode": args.equivalent_suppression,
                     "suppressedMutants": 0,
                     "suppressions": [],
                 },
+            },
+            "mutantSwitch": {
+                "enabled": actual_execution_mode == "mutant-switch",
+                "requested": requested_execution_mode == "mutant-switch",
+                "fallbackReason": mutant_switch_fallback_reason,
+                "activationEnvironment": MUTANT_SWITCH_ACTIVE_ENV,
+                "runtimeGuardCount": 0,
             },
             "timeoutFactor": args.timeout_factor,
             "timeoutConstantMs": args.timeout_constant_ms,
@@ -6448,11 +9347,20 @@ def main(argv: list[str] | None = None) -> int:
                 "batches": 0,
                 "splitBatches": 0,
                 "batchedMutants": 0,
+                "plan": [],
                 "heuristics": [
                     "same-file adjacent-line isolation",
                     "source-structure mutator isolation",
                     "failed batch split attribution",
                 ],
+            },
+            "distribution": {
+                "schemaVersion": DISTRIBUTION_MANIFEST_SCHEMA_VERSION,
+                "manifestPath": args.distribution_manifest,
+                "shardIndex": args.shard_index or 1,
+                "shardTotal": args.shard_total or 1,
+                "selectedMutants": 0,
+                "workerLabel": worker_label,
             },
             "compilePruning": {
                 "enabled": True,
@@ -6477,10 +9385,20 @@ def main(argv: list[str] | None = None) -> int:
                 "commit": args.dashboard_commit,
                 "buildUrl": args.dashboard_build_url,
                 "exportPath": args.dashboard_export,
+                "export": {
+                    "enabled": bool(args.dashboard_export),
+                    "path": args.dashboard_export,
+                    "status": "notAttempted" if args.dashboard_export else "disabled",
+                    "bytes": None,
+                    "writtenAt": None,
+                },
                 "upload": {
                     "enabled": bool(args.dashboard_upload_url),
                     "urlConfigured": bool(args.dashboard_upload_url),
                     "status": "notAttempted" if args.dashboard_upload_url else "disabled",
+                    "maxAttempts": args.dashboard_upload_retries + 1 if args.dashboard_upload_url else 0,
+                    "retryDelayMs": args.dashboard_upload_retry_delay_ms,
+                    "attempts": [],
                     "authTokenEnv": args.dashboard_auth_token_env,
                     "authHeader": (
                         args.dashboard_auth_header
@@ -6491,8 +9409,11 @@ def main(argv: list[str] | None = None) -> int:
             },
             "resourceIsolation": {
                 "worktreeMode": args.worktree_mode,
-                "workspacePerMutant": args.worktree_mode in {"copy", "git-worktree"},
-                "parallelSafe": args.worktree_mode != "inplace",
+                "workspacePerMutant": (
+                    args.worktree_mode in {"copy", "git-worktree"}
+                    or args.artifact_backend != "source-overlay"
+                ),
+                "parallelSafe": args.worktree_mode != "inplace" or args.artifact_backend != "source-overlay",
                 "workerCount": args.jobs,
                 "artifactDir": artifact_root,
                 "retainWorktrees": retain_worktrees,
@@ -6509,6 +9430,7 @@ def main(argv: list[str] | None = None) -> int:
                 "redaction": _redaction_metadata(),
                 "network": "core-offline; explicit dashboard URLs and plugin commands may use network",
             },
+            "pluginLifecycle": _plugin_lifecycle_metadata(plugins),
             "mutationArtifact": (
                 compiled_mutation_artifact_metadata(
                     args.artifact_backend,
@@ -6572,6 +9494,7 @@ def main(argv: list[str] | None = None) -> int:
     rep.execution["plugins"] = plugins
     rep.execution["reporters"] = args.reporter
     rep.execution["reporterMetadata"] = _reporter_metadata(plugins, args.reporter)
+    rep.execution["reporterRuns"] = []
     rep.execution["providers"] = _execution_provider_summary(plugins)
     rep.execution["projectAnalysis"] = analyze_project(
         repo,
@@ -6620,21 +9543,94 @@ def main(argv: list[str] | None = None) -> int:
         discovered = discovered[: args.max_mutants]
 
     discovered = _apply_shard(discovered, args.shard_index, args.shard_total)
+    if requested_execution_mode == "mutant-switch":
+        mutant_switch_fallback_reason = _mutant_switch_fallback_reason(repo, discovered, args)
+        if mutant_switch_fallback_reason:
+            actual_execution_mode = "source-overlay"
+        else:
+            actual_execution_mode = "mutant-switch"
+        rep.execution["executionMode"] = actual_execution_mode
+        rep.execution["requestedExecutionMode"] = requested_execution_mode
+        rep.execution["mutantSwitch"]["enabled"] = actual_execution_mode == "mutant-switch"
+        rep.execution["mutantSwitch"]["fallbackReason"] = mutant_switch_fallback_reason
+        guards = []
+        for mut in discovered:
+            guard_id = mutant_switch_guard_id(mut)
+            mut.run["mutantSwitchGuardId"] = guard_id
+            mut.run["mutantSwitchActiveEnvironment"] = MUTANT_SWITCH_ACTIVE_ENV
+            guards.append({"mutantId": mut.id, "guardId": guard_id})
+        rep.execution["mutantSwitch"]["candidateGuardCount"] = len(guards)
+        rep.execution["mutantSwitch"]["guards"] = guards
+        rep.execution["mutantSwitch"]["artifactCandidate"] = mutant_switch_artifact_metadata(
+            enabled=actual_execution_mode == "mutant-switch",
+            guard_count=len(guards),
+            guards=guards,
+            fallback_reason=mutant_switch_fallback_reason,
+            activation_environment=MUTANT_SWITCH_ACTIVE_ENV,
+        )
+        if actual_execution_mode == "mutant-switch":
+            rep.execution["mutationArtifact"] = rep.execution["mutantSwitch"]["artifactCandidate"]
+            rep.execution["artifactPlacement"] = {
+                **artifact_placement_policy(
+                    args.worktree_mode,
+                    artifact_root=artifact_root,
+                    worker_tmp_dir=args.worker_tmp_dir,
+                    retain_worktrees=retain_worktrees,
+                    retain_worktrees_for=_retain_status_names(retain_worktrees_for)
+                    if retain_worktrees
+                    else [],
+                    worker_label=worker_label,
+                ),
+                "mode": "mutant-switch",
+                "mutantSwitch": {
+                    "activationEnvironment": MUTANT_SWITCH_ACTIVE_ENV,
+                    "guardedSourceOverlay": True,
+                },
+            }
+            rep.execution["singleCompile"] = {
+                "enabled": True,
+                "activationMethod": "environment",
+                "activationEnvironment": MUTANT_SWITCH_ACTIVE_ENV,
+                "runtimeGuardCount": len(guards),
+                "builds": 0,
+                "checks": 0,
+            }
+            rep.execution["compilePruning"]["strategy"] = "mutant-switch-prune-and-retry"
+            rep.execution["compilePruning"]["candidateArtifactMode"] = "mutant-switch"
 
+    rep.execution["distribution"]["selectedMutants"] = len(discovered)
+    _write_distribution_manifest(args.distribution_manifest, rep, discovered, args, worker_label)
     rep.total = len(discovered)
     if not args.quiet:
         print(f"[stryker-cxx] {rep.total} mutants across {len(files)} file(s)\n")
 
     os.makedirs(artifact_root, exist_ok=True)
-    _run_plugin_hooks(
-        plugins,
-        "preRun",
-        repo,
-        artifact_root,
-        args.report,
-        env_overrides,
-        env_inherit,
-        env_block,
+    for event in ("initialization", "projectAnalysis", "mutationDiscovery", "artifactCreation"):
+        _record_plugin_lifecycle_runs(
+            rep,
+            _run_plugin_lifecycle_hooks(
+                plugins,
+                event,
+                repo,
+                artifact_root,
+                args.report,
+                env_overrides,
+                env_inherit,
+                env_block,
+            ),
+        )
+    _record_plugin_lifecycle_runs(
+        rep,
+        _run_plugin_lifecycle_hooks(
+            plugins,
+            "coverageAnalysis",
+            repo,
+            artifact_root,
+            args.report,
+            env_overrides,
+            env_inherit,
+            env_block,
+        ),
     )
 
     coverage_map, coverage_tests, coverage_meta = _load_coverage(
@@ -6717,26 +9713,51 @@ def main(argv: list[str] | None = None) -> int:
                 _write_dashboard_export(args.dashboard_export, rep)
             if dashboard_upload_error is not None:
                 raise dashboard_upload_error
-            _run_reporter_plugins(
+            _record_plugin_lifecycle_runs(
+                rep,
+                _run_plugin_lifecycle_hooks(
+                    plugins,
+                    "reporting",
+                    repo,
+                    artifact_root,
+                    args.report,
+                    env_overrides,
+                    env_inherit,
+                    env_block,
+                ),
+            )
+            _record_reporter_plugin_runs(
+                rep,
+                _run_reporter_plugins(
+                    plugins,
+                    args.reporter,
+                    repo,
+                    artifact_root,
+                    args.report,
+                    env_overrides,
+                    env_inherit,
+                    env_block,
+                ),
                 plugins,
                 args.reporter,
-                repo,
-                artifact_root,
-                args.report,
-                env_overrides,
-                env_inherit,
-                env_block,
             )
-            _run_plugin_hooks(
-                plugins,
-                "postRun",
-                repo,
-                artifact_root,
-                args.report,
-                env_overrides,
-                env_inherit,
-                env_block,
+            _record_plugin_lifecycle_runs(
+                rep,
+                _run_plugin_lifecycle_hooks(
+                    plugins,
+                    "cleanup",
+                    repo,
+                    artifact_root,
+                    args.report,
+                    env_overrides,
+                    env_inherit,
+                    env_block,
+                ),
             )
+            _write_report(args.report, rep, output_mode=output_mode)
+            _write_output_artifacts(args.report, args.format, rep)
+            if args.dashboard_export:
+                _write_dashboard_export(args.dashboard_export, rep)
             return 1
 
     if args.dry_run_only:
@@ -6748,26 +9769,51 @@ def main(argv: list[str] | None = None) -> int:
             _write_dashboard_export(args.dashboard_export, rep)
         if dashboard_upload_error is not None:
             raise dashboard_upload_error
-        _run_reporter_plugins(
+        _record_plugin_lifecycle_runs(
+            rep,
+            _run_plugin_lifecycle_hooks(
+                plugins,
+                "reporting",
+                repo,
+                artifact_root,
+                args.report,
+                env_overrides,
+                env_inherit,
+                env_block,
+            ),
+        )
+        _record_reporter_plugin_runs(
+            rep,
+            _run_reporter_plugins(
+                plugins,
+                args.reporter,
+                repo,
+                artifact_root,
+                args.report,
+                env_overrides,
+                env_inherit,
+                env_block,
+            ),
             plugins,
             args.reporter,
-            repo,
-            artifact_root,
-            args.report,
-            env_overrides,
-            env_inherit,
-            env_block,
         )
-        _run_plugin_hooks(
-            plugins,
-            "postRun",
-            repo,
-            artifact_root,
-            args.report,
-            env_overrides,
-            env_inherit,
-            env_block,
+        _record_plugin_lifecycle_runs(
+            rep,
+            _run_plugin_lifecycle_hooks(
+                plugins,
+                "cleanup",
+                repo,
+                artifact_root,
+                args.report,
+                env_overrides,
+                env_inherit,
+                env_block,
+            ),
         )
+        _write_report(args.report, rep, output_mode=output_mode)
+        _write_output_artifacts(args.report, args.format, rep)
+        if args.dashboard_export:
+            _write_dashboard_export(args.dashboard_export, rep)
         return 0
 
     resumed = _load_resumed(args.resume, {m.id for m in discovered})
@@ -6851,6 +9897,19 @@ def main(argv: list[str] | None = None) -> int:
         pending.append(m)
 
     rep.total = len(discovered)
+    _record_plugin_lifecycle_runs(
+        rep,
+        _run_plugin_lifecycle_hooks(
+            plugins,
+            "scheduling",
+            repo,
+            artifact_root,
+            args.report,
+            env_overrides,
+            env_inherit,
+            env_block,
+        ),
+    )
 
     def run_single_mutant(mut: Mutant) -> Mutant:
         if args.artifact_backend in {"compiled-executable", "compiled-library", "compiled-object"}:
@@ -6869,6 +9928,13 @@ def main(argv: list[str] | None = None) -> int:
                 build_dir=args.build_dir,
                 build_target=args.build_target,
                 test_binary=args.test_binary,
+                artifact_path=args.artifact_path,
+                xcode_workspace=args.xcode_workspace,
+                xcode_project=args.xcode_project,
+                xcode_scheme=args.xcode_scheme,
+                xcode_configuration=args.xcode_configuration,
+                xcode_sdk=args.xcode_sdk,
+                xcode_destination=args.xcode_destination,
                 plugins=plugins,
                 worker_tmp_dir=args.worker_tmp_dir,
                 retain_worktrees=retain_worktrees,
@@ -6899,12 +9965,156 @@ def main(argv: list[str] | None = None) -> int:
             env_block=env_block,
         )
 
+    _record_plugin_lifecycle_runs(
+        rep,
+        _run_plugin_lifecycle_hooks(
+            plugins,
+            "execution",
+            repo,
+            artifact_root,
+            args.report,
+            env_overrides,
+            env_inherit,
+            env_block,
+        ),
+    )
+
     try:
         if pending:
-            if args.batch_mutants:
+            if actual_execution_mode == "mutant-switch":
+                switch_builds = 1
+                executed_mutants = _run_mutant_switch_session(
+                    pending,
+                    repo=repo,
+                    build_cmd=args.build_cmd,
+                    check_cmd=args.check_cmd,
+                    test_cmd=args.test_cmd,
+                    timeout_seconds=effective_timeout_seconds,
+                    worktree_mode=args.worktree_mode,
+                    artifact_root=artifact_root,
+                    analysis_mode=args.mode,
+                    skip_tests=args.skip_tests,
+                    plugins=plugins,
+                    worker_tmp_dir=args.worker_tmp_dir,
+                    retain_worktrees=retain_worktrees,
+                    retain_worktrees_for=retain_worktrees_for,
+                    worker_label=worker_label,
+                    env_overrides=env_overrides,
+                    env_inherit=env_inherit,
+                    env_block=env_block,
+                )
+                if (
+                    len(pending) > 1
+                    and executed_mutants
+                    and all(mut.status in COMPILE_PRUNED_STATUSES for mut in executed_mutants)
+                ):
+                    original_batch_id = "mutant-switch-compile-prune-1"
+                    first_status = executed_mutants[0].status
+                    _record_compile_pruning_attempt(
+                        rep,
+                        pending,
+                        first_status,
+                        {
+                            "batchId": original_batch_id,
+                            "executionMode": "mutant-switch",
+                            "guardCount": len(pending),
+                        },
+                    )
+                    retry_candidates: list[Mutant] = []
+                    for original in pending:
+                        probe_input = copy.deepcopy(original)
+                        probe_result = _run_mutant_switch_session(
+                            [probe_input],
+                            repo=repo,
+                            build_cmd=args.build_cmd,
+                            check_cmd=args.check_cmd,
+                            test_cmd=args.test_cmd,
+                            timeout_seconds=effective_timeout_seconds,
+                            worktree_mode=args.worktree_mode,
+                            artifact_root=artifact_root,
+                            analysis_mode=args.mode,
+                            skip_tests=True,
+                            plugins=plugins,
+                            worker_tmp_dir=args.worker_tmp_dir,
+                            retain_worktrees=retain_worktrees,
+                            retain_worktrees_for=retain_worktrees_for,
+                            worker_label=worker_label,
+                            env_overrides=env_overrides,
+                            env_inherit=env_inherit,
+                            env_block=env_block,
+                        )[0]
+                        switch_builds += 1
+                        if probe_result.status in COMPILE_PRUNED_STATUSES:
+                            _record_compile_pruned_mutant(
+                                rep,
+                                probe_result,
+                                source="mutant-switch",
+                                batch_id=original_batch_id,
+                            )
+                            _count_status(rep, probe_result.status)
+                            probe_result.run["reproCommand"] = mutation_repro_command(
+                                probe_result,
+                                repo,
+                                args.build_cmd,
+                                str(probe_result.run.get("selectedTestCommand") or args.test_cmd or ""),
+                                args.report,
+                            )
+                            rep.mutants.append(_executed_record(probe_result, "compile-pruning"))
+                            continue
+                        original.run["compilePruning"] = {
+                            **dict(original.run.get("compilePruning", {})),
+                            "retriedAfterPruning": True,
+                            "sourceBatchId": original_batch_id,
+                        }
+                        retry_candidates.append(original)
+
+                    if retry_candidates:
+                        _record_compile_pruning_retry(rep, retry_candidates)
+                        executed_mutants = _run_mutant_switch_session(
+                            retry_candidates,
+                            repo=repo,
+                            build_cmd=args.build_cmd,
+                            check_cmd=args.check_cmd,
+                            test_cmd=args.test_cmd,
+                            timeout_seconds=effective_timeout_seconds,
+                            worktree_mode=args.worktree_mode,
+                            artifact_root=artifact_root,
+                            analysis_mode=args.mode,
+                            skip_tests=args.skip_tests,
+                            plugins=plugins,
+                            worker_tmp_dir=args.worker_tmp_dir,
+                            retain_worktrees=retain_worktrees,
+                            retain_worktrees_for=retain_worktrees_for,
+                            worker_label=worker_label,
+                            env_overrides=env_overrides,
+                            env_inherit=env_inherit,
+                            env_block=env_block,
+                        )
+                        switch_builds += 1
+                    else:
+                        executed_mutants = []
+                rep.execution.setdefault("singleCompile", {})["builds"] = switch_builds
+                rep.execution.setdefault("singleCompile", {})["checks"] = switch_builds if args.check_cmd else 0
+                for idx, executed in enumerate(executed_mutants, 1):
+                    _count_status(rep, executed.status)
+                    _record_compile_pruned_mutant(rep, executed, source="mutant-switch")
+                    executed.run["reproCommand"] = mutation_repro_command(
+                        executed,
+                        repo,
+                        args.build_cmd,
+                        str(executed.run.get("selectedTestCommand") or args.test_cmd or ""),
+                        args.report,
+                    )
+                    rep.mutants.append(_executed_record(executed, "mutant-switch"))
+                    _write_report(args.report, rep, output_mode=output_mode)
+                    if not args.quiet:
+                        tag = f"{executed.file}:{executed.line}:{executed.col}:{executed.mutator}"
+                        print(f"[{idx}/{len(executed_mutants)}] {tag} ... {executed.status} ({executed.durationMs}ms)")
+            elif args.batch_mutants:
                 batches = _batch_mutants(pending, args.batch_size)
                 rep.execution["batching"]["batches"] = len(batches)
                 rep.execution["batching"]["batchedMutants"] = sum(len(batch) for batch in batches if len(batch) > 1)
+                rep.execution["batching"]["plan"] = _batch_plan(batches)
                 if args.artifact_backend == "source-overlay":
                     probe_payloads = [
                         (
@@ -6951,6 +10161,13 @@ def main(argv: list[str] | None = None) -> int:
                             args.build_dir,
                             args.build_target,
                             args.test_binary,
+                            args.artifact_path,
+                            args.xcode_workspace,
+                            args.xcode_project,
+                            args.xcode_scheme,
+                            args.xcode_configuration,
+                            args.xcode_sdk,
+                            args.xcode_destination,
                             plugins,
                             args.worker_tmp_dir,
                             retain_worktrees,
@@ -7244,26 +10461,51 @@ def main(argv: list[str] | None = None) -> int:
         _write_dashboard_export(args.dashboard_export, rep)
     if dashboard_upload_error is not None:
         raise dashboard_upload_error
-    _run_reporter_plugins(
+    _record_plugin_lifecycle_runs(
+        rep,
+        _run_plugin_lifecycle_hooks(
+            plugins,
+            "reporting",
+            repo,
+            artifact_root,
+            args.report,
+            env_overrides,
+            env_inherit,
+            env_block,
+        ),
+    )
+    _record_reporter_plugin_runs(
+        rep,
+        _run_reporter_plugins(
+            plugins,
+            args.reporter,
+            repo,
+            artifact_root,
+            args.report,
+            env_overrides,
+            env_inherit,
+            env_block,
+        ),
         plugins,
         args.reporter,
-        repo,
-        artifact_root,
-        args.report,
-        env_overrides,
-        env_inherit,
-        env_block,
     )
-    _run_plugin_hooks(
-        plugins,
-        "postRun",
-        repo,
-        artifact_root,
-        args.report,
-        env_overrides,
-        env_inherit,
-        env_block,
+    _record_plugin_lifecycle_runs(
+        rep,
+        _run_plugin_lifecycle_hooks(
+            plugins,
+            "cleanup",
+            repo,
+            artifact_root,
+            args.report,
+            env_overrides,
+            env_inherit,
+            env_block,
+        ),
     )
+    _write_report(args.report, rep, output_mode=output_mode)
+    _write_output_artifacts(args.report, args.format, rep)
+    if args.dashboard_export:
+        _write_dashboard_export(args.dashboard_export, rep)
 
     if not args.quiet:
         print(

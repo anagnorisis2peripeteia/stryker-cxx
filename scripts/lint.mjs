@@ -31,6 +31,8 @@ function findPython() {
 const lintTargets = [
   resolve("bin", "stryker-cxx.js"),
   resolve("scripts", "check-config-schema.mjs"),
+  resolve("scripts", "check-docs-commands.mjs"),
+  resolve("scripts", "check-package-contents.mjs"),
   resolve("scripts", "run-tests.mjs"),
   resolve("scripts", "validate-full-spec.mjs"),
 ].filter((path) => existsSync(path));
@@ -39,4 +41,5 @@ for (const file of lintTargets) {
   run("node", ["--check", file]);
 }
 
+run("npm", ["run", "docs:check"]);
 run(findPython(), ["-m", "compileall", "-q", "python"]);

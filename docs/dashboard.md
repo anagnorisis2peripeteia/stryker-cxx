@@ -14,12 +14,15 @@ It does not upload mutation data unless the caller supplies
 
 ## Upload behavior
 
-`--dashboard-upload-url <url>` performs a single HTTP POST with the dashboard JSON
+`--dashboard-upload-url <url>` performs an HTTP POST with the dashboard JSON
 payload. The URL is intentionally explicit; no default service is contacted.
 `--dashboard-auth-token-env <KEY>` can require a bearer token from the named
 environment variable. The token value is used only as an HTTP header and is not
 serialized into reports or dashboard payloads. `--dashboard-auth-header <name>`
 defaults to `Authorization`; custom header names receive the raw token value.
+`--dashboard-upload-retries <n>` retries failed uploads up to `n` additional
+times, and `--dashboard-upload-retry-delay-ms <n>` controls the delay between
+attempts. The default is zero retries.
 
 `--dashboard-version <v>` records a hosted-dashboard compatibility version in
 the payload. `--dashboard-retention-days <n>` records caller-managed retention
@@ -46,7 +49,15 @@ Dashboard payloads include:
 - upload auth metadata containing the env var/header names, never token values;
 - upload status metadata under `provenance.upload.status`, with `disabled`,
   `notAttempted`, `attempting`, `succeeded`, or `failed` states and HTTP
-  status/error detail when available.
+  status/error detail when available;
+- upload retry metadata under `provenance.upload.maxAttempts`,
+  `provenance.upload.retryDelayMs`, and `provenance.upload.attempts[]`, where
+  each attempt records its attempt number, status, and status code or error.
+
+The native report records local dashboard export execution under
+`execution.dashboard.export`, including whether export was enabled, the export
+path, status, byte count, and write timestamp. This keeps local CI artifacts
+auditable even when no hosted dashboard service is used.
 
 Recommended hosted-service requirements:
 

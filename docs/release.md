@@ -9,7 +9,7 @@ backwards-compatible `stryker-cxx.report.v1` fields or document migrations here.
 - Confirm `stryker-cxx --version` reports the intended version.
 - Run the normal test suite.
 - Run full local validation: `npm run validate:full-spec`.
-- Run package smoke: `npm pack --dry-run`.
+- Run package smoke: `npm run package:check`.
 - Confirm generated package contents include `python/`, `src/`, `bin/`, `docs/`,
   `fixtures/`, `README.md`, `LICENSE`, and `CHANGELOG.md`.
 - Confirm `docs/schemas/` is included in the package.

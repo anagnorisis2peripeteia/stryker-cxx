@@ -18,6 +18,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
+      - name: Lint
+        run: npm run lint
+      - name: Unit and contract tests
+        run: npm test
+      - name: Schema check
+        run: npm run schema:check
+      - name: Package dry run
+        run: npm run package:check
       - name: Full-spec validation
         run: npm run validate:full-spec
 
@@ -36,3 +44,5 @@ jobs:
         run: python -m pip install libclang
       - name: Run tests with clang fixture enabled
         run: npm test
+      - name: Prove clang-ast evidence with libclang enabled
+        run: npm run evidence:p1

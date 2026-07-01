@@ -1,8 +1,9 @@
 #!/usr/bin/env node
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const schemaPath = resolve("docs/schemas/stryker-cxx.config.schema.json");
+const schemaDir = resolve("docs/schemas");
 const fixturePaths = [
   resolve("fixtures/config/stryker-cxx.config.json"),
   resolve("fixtures/config/stryker-cxx.config.yml"),
@@ -129,6 +130,21 @@ function validateObject(value, schema, path, errors) {
 
 const schema = JSON.parse(readFileSync(schemaPath, "utf8"));
 let totalErrors = 0;
+for (const entry of readdirSync(schemaDir).sort()) {
+  if (!entry.endsWith(".json")) continue;
+  const publishedSchemaPath = resolve(schemaDir, entry);
+  try {
+    JSON.parse(readFileSync(publishedSchemaPath, "utf8"));
+    console.log(`[schema:check] ok ${publishedSchemaPath}`);
+  } catch (error) {
+    totalErrors += 1;
+    console.error(
+      `[schema:check] invalid JSON ${publishedSchemaPath}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+}
 for (const fixturePath of fixturePaths) {
   const fixture = readConfig(fixturePath);
   const errors = validate(fixture, schema);

@@ -48,6 +48,17 @@
     "execution": {
       "type": "object",
       "properties": {
+        "mode": { "type": "string" },
+        "executionMode": { "enum": ["source-overlay", "mutant-switch"] },
+        "requestedExecutionMode": { "enum": ["source-overlay", "mutant-switch"] },
+        "artifactBackend": {
+          "enum": ["source-overlay", "compiled-executable", "compiled-library", "compiled-object"]
+        },
+        "requestedArtifactBackend": {
+          "enum": ["source-overlay", "compiled-executable", "compiled-library", "compiled-object"]
+        },
+        "artifactFallback": { "enum": ["none", "source-overlay"] },
+        "artifactFallbackReason": { "type": ["string", "null"] },
         "analysis": {
           "type": "object",
           "properties": {
@@ -64,12 +75,59 @@
             }
           }
         },
+        "mutantSwitch": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "requested": { "type": "boolean" },
+            "fallbackReason": { "type": ["string", "null"] },
+            "activationEnvironment": { "type": "string" },
+            "runtimeGuardCount": { "type": "integer", "minimum": 0 },
+            "candidateGuardCount": { "type": "integer", "minimum": 0 },
+            "guards": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "mutantId": { "type": "string" },
+                  "guardId": { "type": "string" }
+                }
+              }
+            },
+            "artifactCandidate": { "type": "object" }
+          }
+        },
+        "singleCompile": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "activationMethod": { "type": "string" },
+            "activationEnvironment": { "type": "string" },
+            "runtimeGuardCount": { "type": "integer", "minimum": 0 },
+            "builds": { "type": "integer", "minimum": 0 },
+            "checks": { "type": "integer", "minimum": 0 }
+          }
+        },
         "dashboard": {
           "type": "object",
           "properties": {
             "version": { "type": "string" },
             "retentionDays": { "type": ["integer", "null"], "minimum": 1 },
             "exportPath": { "type": ["string", "null"] },
+            "export": {
+              "type": "object",
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "path": { "type": ["string", "null"] },
+                "status": {
+                  "type": "string",
+                  "enum": ["disabled", "notAttempted", "writing", "succeeded", "failed"]
+                },
+                "bytes": { "type": ["integer", "null"], "minimum": 0 },
+                "writtenAt": { "type": ["string", "null"] },
+                "error": { "type": "string" }
+              }
+            },
             "upload": {
               "type": "object",
               "properties": {
@@ -81,6 +139,23 @@
                 },
                 "statusCode": { "type": "integer" },
                 "error": { "type": "string" },
+                "maxAttempts": { "type": "integer", "minimum": 0 },
+                "retryDelayMs": { "type": "integer", "minimum": 0 },
+                "attempts": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "attempt": { "type": "integer", "minimum": 1 },
+                      "status": {
+                        "type": "string",
+                        "enum": ["attempting", "succeeded", "failed"]
+                      },
+                      "statusCode": { "type": "integer" },
+                      "error": { "type": "string" }
+                    }
+                  }
+                },
                 "authTokenEnv": { "type": ["string", "null"] },
                 "authHeader": { "type": ["string", "null"] }
               }
@@ -128,6 +203,58 @@
               "type": "array",
               "items": { "type": "object" }
             }
+          }
+        },
+        "reporterMetadata": {
+          "type": "array",
+          "items": { "type": "object" }
+        },
+        "reporterRuns": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "plugin": { "type": ["string", "null"] },
+              "reporter": { "type": ["string", "null"] },
+              "hook": { "type": ["string", "null"] },
+              "phase": { "type": ["string", "null"] },
+              "command": { "type": ["string", "null"] },
+              "status": { "type": ["string", "null"] },
+              "exitCode": { "type": ["integer", "null"] },
+              "durationMs": { "type": ["integer", "null"], "minimum": 0 },
+              "log": { "type": ["string", "null"] },
+              "environment": { "type": ["object", "null"] },
+              "reason": { "type": ["string", "null"] },
+              "availableReporters": {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            }
+          }
+        },
+        "pluginLifecycle": {
+          "type": "object",
+          "properties": {
+            "schemaVersion": { "type": "string" },
+            "supportedEvents": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "legacyAliases": { "type": "object" },
+            "loadOrder": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "registeredHooks": {
+              "type": "array",
+              "items": { "type": "object" }
+            },
+            "runs": {
+              "type": "array",
+              "items": { "type": "object" }
+            },
+            "localOnly": { "type": "boolean" },
+            "networkInstall": { "type": "boolean" }
           }
         },
         "resourceIsolation": {
@@ -181,20 +308,70 @@
         },
         "buildSystems": {
           "type": "array",
-          "items": { "type": "object" }
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "source": { "type": "string" },
+              "confidence": { "type": "string" },
+              "analysisKey": { "type": "string" }
+            }
+          }
         },
         "compileDatabase": { "type": "object" },
         "sourceTargets": {
           "type": "array",
-          "items": { "type": "object" }
+          "items": {
+            "type": "object",
+            "properties": {
+              "file": { "type": "string" },
+              "analysisKey": { "type": "string" },
+              "ownership": {
+                "type": "object",
+                "properties": {
+                  "kind": { "type": "string" },
+                  "source": { "type": "string" },
+                  "confidence": { "type": "string" },
+                  "key": { "type": "string" },
+                  "buildTargets": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
         },
         "buildTargets": {
           "type": "array",
-          "items": { "type": "object" }
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "kind": { "type": "string" },
+              "source": { "type": "string" },
+              "confidence": { "type": "string" },
+              "analysisKey": { "type": "string" },
+              "sourceFiles": {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            }
+          }
         },
         "testTargets": {
           "type": "array",
-          "items": { "type": "object" }
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "kind": { "type": "string" },
+              "source": { "type": "string" },
+              "confidence": { "type": "string" },
+              "analysisKey": { "type": "string" },
+              "relatedBuildTarget": { "type": "string" }
+            }
+          }
         },
         "commands": { "type": "object" }
       }

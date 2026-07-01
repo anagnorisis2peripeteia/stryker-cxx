@@ -18,7 +18,8 @@ Use it for off-by-one and inclusive/exclusive boundary mistakes. Noise is
 usually low in ordinary control flow, but template-heavy C++ can contain angle
 brackets that look like comparisons; token mode only mutates bare `<` and `>`
 with surrounding whitespace to reduce that risk. Clang mode requires a
-`BINARY_OPERATOR` cursor.
+`BINARY_OPERATOR` cursor. `clang-ast` mode rewrites single-operator binary
+expression ranges directly and reports `clang-ast-direct-binary`.
 
 ### EqualityOperator
 
@@ -29,7 +30,9 @@ Rewrites equality checks:
 
 Use it for assertion strength and branch-condition coverage. Noise is low, but
 mutants inside generated comparison helpers may be equivalent; suppress those
-with `// Stryker disable next-line EqualityOperator: reason`.
+with `// Stryker disable next-line EqualityOperator: reason`. `clang-ast` mode
+rewrites single-operator binary expression ranges directly and reports
+`clang-ast-direct-binary`.
 
 ### LogicalOperator
 
@@ -41,6 +44,8 @@ Rewrites boolean short-circuit operators:
 Use it for boolean guard coverage. Noise is moderate when defensive guards are
 intentionally redundant or when short-circuit side effects are avoided by
 construction. Prefer targeted ignore comments over disabling the mutator.
+`clang-ast` mode rewrites single-operator binary expression ranges directly and
+reports `clang-ast-direct-binary`.
 
 ### ShiftOperator
 
@@ -55,6 +60,7 @@ Use it for low-level and geometry-like code where directional shift behavior is
 critical. Noise is modest in packed flag code and bitfield manipulation where
 over- or under-shifting can be equivalent in the local fixture.
 Clang mode confirms these using `BINARY_OPERATOR` cursor context.
+`clang-ast` mode uses direct single-operator binary ranges when available.
 
 ### BooleanLiteral
 
@@ -77,11 +83,13 @@ Rewrites arithmetic operators:
 - `-` -> `+`
 - `*` -> `/`
 - `/` -> `*`
+- `%` -> `*`
 
 Use it for numeric logic, dimensions, offsets, and scoring formulas. Noise is
 higher than default mutators because some numeric identities and saturation
 paths can be equivalent for a narrow fixture. Use scoped runs or explicit
-ignore comments for generated arithmetic.
+ignore comments for generated arithmetic. `clang-ast` mode uses direct
+single-operator binary ranges when available.
 
 ### AssignmentOperator
 
@@ -91,9 +99,14 @@ Rewrites compound assignment:
 - `-=` -> `+=`
 - `*=` -> `/=`
 - `/=` -> `*=`
+- `%=` -> `*=`
+- `&=` -> `|=`
+- `|=` -> `&=`
+- `^=` -> `|=`
 
-Use it for accumulation and state-update coverage. Noise is low when tests
-assert final state, but higher for dead stores and telemetry counters.
+Use it for accumulation, flags, masks, and state-update coverage. Noise is low
+when tests assert final state, but higher for dead stores and telemetry counters.
+`clang-ast` mode uses direct single-operator binary ranges when available.
 
 ### BitwiseOperator
 
@@ -102,10 +115,12 @@ Rewrites bitwise operators:
 - `&` -> `|`
 - `|` -> `&`
 - `^` -> `|`
+- `^` -> `&`
 
 Use it for flags, masks, and low-level code. Noise is moderate because masks can
 be redundant for known constants. Clang mode confirms these as binary
-operators.
+operators. `clang-ast` mode uses direct single-operator binary ranges when
+available.
 
 ### UnaryOperator
 
@@ -113,16 +128,25 @@ Rewrites logical negation:
 
 - `!expr` -> `expr`
 - `!expr` -> `!!expr`
+- `-expr` -> `+expr` in conservative unary contexts such as `return -x`,
+  assignment initializers, and parenthesized arguments
+- `+expr` -> `-expr` in the same conservative unary contexts
 
-Use it for negated guards and boolean normalization. Noise is moderate around
-already-normalized booleans where `!!expr` can be equivalent.
+Use it for negated guards, boolean normalization, and sign-sensitive numeric
+paths. Noise is moderate around already-normalized booleans where `!!expr` can
+be equivalent, and around sign changes that are dead-stored or later saturated.
+Clang mode confirms logical negation under `UNARY_OPERATOR`; `clang-ast` mode
+uses the unary cursor range to attach direct AST metadata while preserving the
+token-compatible `!` mutant IDs.
 
 ### UpdateOperator
 
-Rewrites increment and decrement:
+Rewrites full prefix/suffix increment and decrement expressions:
 
-- `++` -> `--`
-- `--` -> `++`
+- `value++` -> `value--`
+- `++value` -> `--value`
+- `value--` -> `value++`
+- `--value` -> `++value`
 
 Use it for loop and counter mutation scenarios. Noise is modest where loop
 index direction is intentional and side effects are tightly scoped. This is
@@ -298,6 +322,131 @@ It is opt-in because template overloads, ADL-sensitive code, and algorithm
 return-type differences can produce compile errors or equivalent mutants in
 narrow fixtures.
 
+### MoveSemantics
+
+Removes selected C++ value-category wrappers:
+
+- `std::move(x)` -> `(x)`
+- `std::forward<T>(x)` -> `(x)`
+
+Use it for ownership-transfer, move-only, forwarding-reference, and
+post-move-state checks. It is opt-in because removing move/forward wrappers can
+produce compile errors for move-only types and can be intentionally equivalent
+when the value category is not observable. Token mode removes only the
+`std::move` or `std::forward<T>` call target and leaves the argument expression
+parenthesized. `clang-ast` mode can apply the same wrapper removal from direct
+single-line call-expression ranges.
+
+### ContainerCall
+
+Rewrites selected no-argument C++ container member calls:
+
+- `.front()` -> `.back()`
+- `.back()` -> `.front()`
+- `.begin()` -> `.end()`
+- `.end()` -> `.begin()`
+- `.cbegin()` -> `.cend()`
+- `.cend()` -> `.cbegin()`
+- `.rbegin()` -> `.rend()`
+- `.rend()` -> `.rbegin()`
+
+Use it for sequence-end, iterator-boundary, and container-edge behavior. It is
+opt-in because end-iterator substitutions often compile but can be noisy, and
+front/back substitutions depend on non-empty container preconditions.
+`clang-ast` mode can apply the same member-call target substitution from direct
+single-line member-call ranges.
+
+### ContainerStateCall
+
+Rewrites selected no-argument C++ container state/capacity member calls:
+
+- `.empty()` -> `.size()`
+- `.size()` -> `.empty()`
+- `.capacity()` -> `.size()`
+- `.max_size()` -> `.size()`
+
+Use it for tests that should distinguish emptiness, exact size, reserved
+capacity, and upper-bound assumptions. It is opt-in because `.empty()` and
+`.size()` have different return types even though both are often usable in
+boolean contexts, and capacity-related substitutions can expose implementation
+or allocator-specific behavior. `clang-ast` mode can apply the same member-call
+target substitution from direct single-line member-call ranges.
+
+### StringCall
+
+Rewrites selected C++ string/search member calls:
+
+- `.find()` -> `.rfind()`
+- `.rfind()` -> `.find()`
+- `.starts_with()` -> `.ends_with()`
+- `.ends_with()` -> `.starts_with()`
+
+This mutator is opt-in and targets low-arity search/predicate call swaps where
+the replacement keeps the same call shape. Token discovery emits
+`token-string-call`; clang AST direct-range discovery emits
+`clang-ast-direct-string-call`.
+
+### MathCall
+
+Rewrites selected C/C++ math calls:
+
+- `std::ceil()` -> `std::floor()`
+- `std::floor()` -> `std::ceil()`
+- `std::round()` -> `std::trunc()`
+- `std::trunc()` -> `std::round()`
+
+Bare `ceil`, `floor`, `round`, and `trunc` calls are also supported when they
+appear as direct call targets. Token discovery emits `token-math-call`; clang
+AST direct-range discovery emits `clang-ast-direct-math-call`.
+
+### IteratorCall
+
+Rewrites selected C++ iterator movement helper calls:
+
+- `std::next()` -> `std::prev()`
+- `std::prev()` -> `std::next()`
+
+Bare `next` and `prev` calls are also supported when they appear as direct call
+targets. Token discovery emits `token-iterator-call`; clang AST direct-range
+discovery emits `clang-ast-direct-iterator-call`.
+
+### ChronoCall
+
+Rewrites selected C++ chrono rounding calls:
+
+- `std::chrono::floor()` -> `std::chrono::ceil()`
+- `std::chrono::ceil()` -> `std::chrono::floor()`
+
+Templated calls such as `std::chrono::floor<std::chrono::seconds>(duration)`
+are supported. `chrono::floor` and `chrono::ceil` are also supported when they
+appear as direct call targets. Token discovery emits `token-chrono-call`; clang
+AST direct-range discovery emits `clang-ast-direct-chrono-call`.
+
+### RegexCall
+
+Rewrites selected C++ regex predicate calls:
+
+- `std::regex_match()` -> `std::regex_search()`
+- `std::regex_search()` -> `std::regex_match()`
+
+Bare `regex_match` and `regex_search` calls are also supported when they appear
+as direct call targets. Token discovery emits `token-regex-call`; clang AST
+direct-range discovery emits `clang-ast-direct-regex-call`.
+
+### FilesystemCall
+
+Rewrites selected C++ filesystem predicate calls:
+
+- `std::filesystem::exists()` -> `std::filesystem::is_empty()`
+- `std::filesystem::is_empty()` -> `std::filesystem::exists()`
+- `std::filesystem::is_regular_file()` -> `std::filesystem::is_directory()`
+- `std::filesystem::is_directory()` -> `std::filesystem::is_regular_file()`
+
+`filesystem::...` calls without the leading `std::` namespace are also
+supported when they appear as direct call targets. Token discovery emits
+`token-filesystem-call`; clang AST direct-range discovery emits
+`clang-ast-direct-filesystem-call`.
+
 ### MemoryOrder
 
 Rewrites selected C++ atomic memory-order constants with same-type alternatives:
@@ -436,10 +585,23 @@ marks high-confidence noisy mutants as ignored when a source file carries a
 generated-code marker, when a logical or bitwise mutation touches duplicate pure
 operands such as `flag && flag` or `flags & flags`, when an arithmetic mutation
 changes an identity such as `x + 0` / `x - 0` or `x * 1` / `x / 1`, or when
-`std::min(x, x)`/`std::max(x, x)` would only swap duplicate operands. The native
-report records these under `execution.analysis.equivalentSuppression`. Use
+`std::min(x, x)`/`std::max(x, x)` would only swap duplicate operands, or when
+`std::lower_bound(first, first, value)`/`std::upper_bound(first, first, value)`
+would search an empty duplicate range. The native
+report records these under `execution.analysis.equivalentSuppression` with
+stable `ruleId` values, and each automatically suppressed mutant includes
+`run.suppressionRule` plus `run.suppressionReason`. Use
 `--equivalent-suppression off` for raw proof runs, or `aggressive` to also
 suppress generated-looking paths and style-equivalent null literal rewrites.
+
+## Macro and preprocessor safety
+
+Clang-backed modes avoid rewriting macro or preprocessor-controlled source
+ranges. `--mode clang` rejects candidates that overlap macro expansion ranges,
+and `--mode clang-ast` rejects macro/preprocessor cursor ranges before source
+rewrite candidate generation. Native reports expose these decisions under
+`execution.analysis.macroRejections` and
+`execution.analysis.macroRangeRejections`.
 
 ## Gate guidance
 

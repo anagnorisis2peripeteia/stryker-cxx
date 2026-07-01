@@ -1,0 +1,43 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		AAAABBBBCCCC0001 /* math_test.cpp in Sources */ = {isa = PBXBuildFile; fileRef = AAAABBBBCCCC0002 /* math_test.cpp */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		AAAABBBBCCCC0002 /* math_test.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = math_test.cpp; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXNativeTarget section */
+		AAAABBBBCCCC0003 /* MathTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = AAAABBBBCCCC0005 /* Build configuration list for PBXNativeTarget "MathTests" */;
+			buildPhases = (
+				AAAABBBBCCCC0004 /* Sources */,
+			);
+			name = MathTests;
+			productName = MathTests;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXSourcesBuildPhase section */
+		AAAABBBBCCCC0004 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AAAABBBBCCCC0001 /* math_test.cpp in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+	};
+	rootObject = AAAABBBBCCCC0006 /* Project object */;
+}

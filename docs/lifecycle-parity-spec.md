@@ -32,15 +32,15 @@ The target lifecycle is:
 | Lifecycle step | `stryker-cxx` state | Gap |
 | --- | --- | --- |
 | Initialization | Mostly implemented | Good enough for current CLI/config surface. |
-| Project analysis | Partial | File and mutant discovery exist, but target/test project discovery is shallow. |
-| In-memory mutation | Missing | Mutations are source/worktree rewrites, not an internal compiler-artifact model. |
-| Compile mutated target | Partial | External build/check commands compile disk state. |
-| Compile-error pruning loop | Weak | Compile/check failures become statuses instead of pruning and recompiling a valid mutation set. |
-| Save mutated artifact | Missing | No first-class object/library/binary placement model. |
-| Coverage analysis | Partial | Supplied/helper/provider coverage exists, but coverage is not a normal engine phase. |
+| Project analysis | Implemented, still widening | Compile databases, CMake/CTest target ownership, explicit commands, test metadata, and best-effort Ninja/Make/Meson/Bazel/Xcode source/test ownership are reported with deterministic analysis keys; broad real-world non-CMake graph ownership remains best-effort. |
+| In-memory mutation | Partial C++ equivalent | Source-overlay remains the compatibility path; compiled-artifact backends mutate scratch source/artifacts and mutant-switch injects guarded expression-like mutants. |
+| Compile mutated target | Implemented for supported backends | External build/check commands compile source-overlay or guarded overlays; CMake/CTest compiled-artifact backends build scratch artifacts. |
+| Compile-error pruning loop | Implemented for optimized artifacts | Mutant-switch and compiled-artifact sessions record pruning attempts, pruned mutants, retries, and retry batches. |
+| Save mutated artifact | Implemented for CMake/CTest backends, simple Make/Ninja/Meson/Bazel/Xcode executables, explicit Make/Ninja/Meson libraries, explicit-path Bazel/Xcode libraries, and explicit-path Make/Ninja/Meson/Bazel objects with compile databases | `compiled-executable`, `compiled-library`, and `compiled-object` place/swap artifacts and record hashes; Xcode object ownership still preflight-fallbacks. |
+| Coverage analysis | Implemented, still provider-led | Supplied/helper/provider coverage is a normal report phase with coverage-aware scheduling metadata. |
 | Test sessions | Implemented | Per-mutant execution is the strongest match. |
-| Multi-mutant sessions | Partial | Opt-in batching exists for isolated worktrees, but it is conservative and source-level. |
-| Restore original artifacts | Source-level only | Source/worktree restoration exists; artifact restoration does not. |
+| Multi-mutant sessions | Implemented with conservative placement locking | Opt-in batching exists for isolated worktrees and compiled artifacts. Compiled artifact batches can build/check in parallel scratch workers, with artifact placement and tests serialized per original artifact. |
+| Restore original artifacts | Implemented for supported backends | Source/worktree restoration and compiled artifact restore-by-hash are recorded; broader build-system artifact restoration remains future work. |
 | Reports | Implemented | Native report plus MTE projection are in good shape. |
 
 ## Core architectural gaps
@@ -56,7 +56,15 @@ execution starts. For C/C++, this means:
 - map test executables/framework invocations to the target artifacts they test;
 - emit analysis metadata into `stryker-cxx.report.v1`.
 
-The current `build_adapters` module is command synthesis, not project analysis.
+The current `project_analysis` module now reports compile database ownership,
+CMake inline target and `target_sources(...)` source ownership, CTest test
+metadata, explicit command overrides, best-effort Ninja/Make/Meson
+executable/library, recursive Bazel package source ownership with `cc_test`
+dependency-to-target relationships, and Xcode source/test ownership with unit
+test dependency-to-target relationships for parseable fixture-style metadata,
+deterministic analysis/ownership keys, and confidence levels. The remaining gap
+is broad build-graph ownership for real-world Ninja, Make, Meson, Bazel, and
+Xcode projects beyond their command adapters and simple declarative metadata.
 
 ### Mutation artifact model
 
@@ -153,8 +161,9 @@ Acceptance criteria:
 
 ### Phase 2: project analysis module
 
-Status: implemented for descriptive report metadata and common fixture
-detection; deeper graph ownership remains future work.
+Status: implemented for descriptive report metadata, common fixture detection,
+deterministic analysis keys, and parseable Ninja/Make/Meson/Bazel/Xcode
+source/test ownership; deeper real-world graph ownership remains future work.
 
 Implementation work:
 
@@ -172,8 +181,8 @@ Acceptance criteria:
 
 ### Phase 3: mutation artifact interface
 
-Status: implemented for source-overlay materialization; compiled artifact
-replacement remains future work.
+Status: implemented for source-overlay materialization, mutant-switch guarded
+artifacts, and supported compiled artifact replacement.
 
 Implementation work:
 
@@ -225,9 +234,8 @@ Acceptance criteria:
 
 ### Phase 6: artifact placement and restoration
 
-Status: implemented for source-overlay restoration and retained proof
-artifacts; compiled artifact placement has a compatible policy shape but is not
-enabled.
+Status: implemented for source-overlay restoration, mutant-switch artifacts,
+retained proof artifacts, and supported compiled artifact placement/restoration.
 
 Implementation work:
 

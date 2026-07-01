@@ -24,3 +24,5 @@ jobs:
           python-version: "3.11"
       - run: npm install
       - run: npm run validate:full-spec
+      - run: npm run package:check
+      - run: npm pack --dry-run

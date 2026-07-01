@@ -57,6 +57,10 @@ matches the supplied native status list, and `--retained-worktree-ttl-hours 24`
 to remove older retained workers under the same worker temp root before a run.
 Use `--worker-label pr-96205-proof` to tag retained worker paths and report
 metadata for proof capture or CI artifact grouping.
+Use `--distribution-manifest distribution.json` to archive the selected
+shard/worker contract, including redacted commands and selected mutant IDs, for
+CI fan-out or proof bundles. Its JSON schema is published at
+`docs/schemas/stryker-cxx.distribution.schema.json`.
 Use `--env-inherit PATH,HOME` or `--env-block GITHUB_TOKEN` when a gate needs an
 explicit inherited-environment allow/deny policy.
 With `--batch-mutants`, isolated `copy`/`git-worktree` runs can use `--jobs` to
@@ -95,10 +99,22 @@ Compiled backends currently support CMake/CTest targets:
 
 `source-overlay` remains the default compatibility backend for generic command
 adapters. Ninja, Make, Meson, Bazel, and Xcode command synthesis are available
-for source-overlay runs; compiled artifact backends intentionally preflight to
-CMake/CTest until those build graph adapters can prove artifact ownership.
-Compiled artifact batching is supported for single-worker local sessions;
-parallel compiled workers are rejected for now.
+for source-overlay runs; `compiled-executable` also supports CMake/CTest plus
+simple Make/Ninja/Meson/Bazel/Xcode executable targets when the caller supplies
+an explicit target and original artifact path. `compiled-library` also supports
+explicit Make/Ninja/Meson library targets when an original `lib<target>` artifact
+already exists and can be restored by hash, plus Bazel/Xcode library targets
+when `--artifact-path` names the original library to swap/restore.
+`compiled-object` supports CMake/CTest and explicit Make/Ninja/Meson targets
+when `--artifact-path` names the linked artifact and `compile_commands.json`
+proves the mutated source-to-object path. Bazel `compiled-object` targets are
+also supported when `--artifact-path` names the linked artifact and the Bazel
+build emits usable compile-database entries for the mutated sources. Xcode
+object support remains blocked until that adapter exposes equivalent object
+ownership.
+Compiled artifact batching supports `--jobs > 1` when `--batch-mutants` is set:
+workers build/check in parallel scratch directories, then serialize
+swap/test/restore with a per-original-artifact placement lock.
 Reports record env keys for reproducibility, but redact explicit env values and
 shell-style sensitive assignments such as `TOKEN=value` from serialized report
 artifacts.
@@ -122,7 +138,9 @@ optional. Add `--dashboard-auth-token-env STRYKER_CXX_DASHBOARD_TOKEN`,
 `--dashboard-version 1`, `--dashboard-retention-days 14`,
 `--dashboard-project`, `--dashboard-branch`, `--dashboard-commit`, and
 `--dashboard-build-url` when a hosted collector needs bearer-token auth,
-compatibility metadata, CI provenance, and retention policy.
+compatibility metadata, CI provenance, and retention policy. Add
+`--dashboard-upload-retries <n>` and `--dashboard-upload-retry-delay-ms <n>` to
+record deterministic retry-attempt metadata for flaky hosted collectors.
 
 For Xcode/XCTest projects, `--build-system xcodebuild --xcode-workspace <path>
 --xcode-scheme <name>` synthesizes `xcodebuild build` and `xcodebuild test`

@@ -24,18 +24,21 @@ def analyze_project(
 ) -> dict[str, Any]:
     repo_root = os.path.abspath(repo)
     compile_database = _compile_database(repo_root)
+    cmake_targets = _cmake_target_sources(repo_root)
+    build_target_sources = _build_target_sources(repo_root, cmake_targets)
     build_systems = _build_systems(
         repo_root,
         build_system=build_system,
         build_command=build_command,
         compile_database=compile_database,
     )
-    source_targets = _source_targets(repo_root, target_files, compile_database)
+    source_targets = _source_targets(repo_root, target_files, compile_database, build_target_sources)
     build_targets = _build_targets(
         repo_root,
         build_system=build_system,
         build_target=build_target,
         build_dir=build_dir,
+        build_target_sources=build_target_sources,
     )
     test_targets = _test_targets(
         repo_root,
@@ -43,6 +46,7 @@ def analyze_project(
         test_framework=test_framework,
         test_binary=test_binary,
         test_command=test_command,
+        cmake_targets=cmake_targets,
     )
     confidence = _confidence(build_systems, compile_database, build_targets, test_targets)
     return {
@@ -79,20 +83,23 @@ def _compile_database(repo: str) -> dict[str, Any]:
         }
     if not isinstance(entries, list):
         return {"present": True, "path": "compile_commands.json", "status": "invalid"}
-    files = sorted(
-        {
-            _repo_relative(repo, str(entry.get("file")))
-            for entry in entries
-            if isinstance(entry, dict) and entry.get("file")
-        }
-    )
-    directories = sorted(
-        {
-            _repo_relative(repo, str(entry.get("directory")))
-            for entry in entries
-            if isinstance(entry, dict) and entry.get("directory")
-        }
-    )
+    file_entries = []
+    for entry in entries:
+        if not isinstance(entry, dict) or not entry.get("file"):
+            continue
+        command = entry.get("command")
+        arguments = entry.get("arguments")
+        file_entries.append(
+            {
+                "file": _repo_relative(repo, str(entry.get("file"))),
+                "directory": _repo_relative(repo, str(entry.get("directory", ""))),
+                "command": str(command) if command is not None else None,
+                "arguments": [str(arg) for arg in arguments] if isinstance(arguments, list) else None,
+                "output": _repo_relative(repo, str(entry.get("output", ""))) if entry.get("output") else None,
+            }
+        )
+    files = sorted({str(entry["file"]) for entry in file_entries})
+    directories = sorted({str(entry["directory"]) for entry in file_entries if entry.get("directory")})
     return {
         "present": True,
         "path": "compile_commands.json",
@@ -100,6 +107,7 @@ def _compile_database(repo: str) -> dict[str, Any]:
         "entries": len(entries),
         "files": files,
         "directories": directories,
+        "fileEntries": file_entries,
     }
 
 
@@ -134,18 +142,88 @@ def _build_systems(
     return _dedupe_named(out)
 
 
-def _source_targets(repo: str, target_files: list[str], compile_database: dict[str, Any]) -> list[dict[str, Any]]:
+def _source_targets(
+    repo: str,
+    target_files: list[str],
+    compile_database: dict[str, Any],
+    build_target_sources: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     compile_db_files = set(compile_database.get("files") or [])
+    compile_db_entries = {
+        str(entry.get("file")): entry
+        for entry in compile_database.get("fileEntries") or []
+        if isinstance(entry, dict) and entry.get("file")
+    }
+    source_owners: dict[str, list[dict[str, Any]]] = {}
+    for target in (build_target_sources or {}).values():
+        target_name = str(target.get("name", ""))
+        for source in target.get("sourceFiles") or []:
+            source_owners.setdefault(str(source), []).append(target)
     out = []
     for file_name in target_files:
         relative = _repo_relative(repo, file_name)
+        compile_entry = compile_db_entries.get(relative)
+        matched = relative in compile_db_files
+        owning_records = sorted(
+            source_owners.get(relative, []),
+            key=lambda item: (str(item.get("source", "")), str(item.get("name", ""))),
+        )
+        owning_build_targets = sorted({str(item.get("name", "")) for item in owning_records if item.get("name")})
+        owning_sources = sorted({str(item.get("source", "")) for item in owning_records if item.get("source")})
+        confidence = "high" if matched else ("medium" if owning_build_targets else "medium")
+        source_owned_kind = (
+            "cmake-target-source"
+            if owning_sources == ["CMakeLists.txt"]
+            else "build-target-source"
+        )
+        ownership_kind = (
+            "compile-database-unit"
+            if matched
+            else (source_owned_kind if owning_build_targets else "explicit-source")
+        )
+        ownership_source = (
+            "compile_commands.json"
+            if matched
+            else (",".join(owning_sources) if owning_sources else "cli-or-config")
+        )
+        record = {
+            "file": relative,
+            "analysisKey": _stable_analysis_key(
+                "source",
+                relative,
+                ownership_kind,
+                ownership_source,
+                ",".join(owning_build_targets),
+            ),
+            "source": "cli-or-config",
+            "compileDatabaseMatched": matched,
+            "confidence": confidence,
+            "ownership": {
+                "kind": ownership_kind,
+                "source": ownership_source,
+                "confidence": confidence,
+                "buildTargets": owning_build_targets,
+                "key": _stable_analysis_key(
+                    ownership_kind,
+                    relative,
+                    ownership_source,
+                    ",".join(owning_build_targets),
+                ),
+            },
+            "owningBuildTargets": owning_build_targets,
+            "owningBuildTargetSources": owning_sources,
+        }
+        if compile_entry:
+            record.update(
+                {
+                    "compileDirectory": compile_entry.get("directory"),
+                    "compileCommand": compile_entry.get("command"),
+                    "compileArguments": compile_entry.get("arguments"),
+                    "compileOutput": compile_entry.get("output"),
+                }
+            )
         out.append(
-            {
-                "file": relative,
-                "source": "cli-or-config",
-                "compileDatabaseMatched": relative in compile_db_files,
-                "confidence": "high" if relative in compile_db_files else "medium",
-            }
+            record
         )
     return out
 
@@ -156,15 +234,12 @@ def _build_targets(
     build_system: str | None,
     build_target: str | None,
     build_dir: str | None,
+    build_target_sources: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     if build_target:
         out.append({"name": build_target, "kind": "build", "source": "explicit", "confidence": "high"})
-    out.extend(_cmake_targets(repo))
-    out.extend(_meson_targets(repo))
-    out.extend(_bazel_targets(repo))
-    out.extend(_ninja_targets(repo))
-    out.extend(_make_targets(repo))
+    out.extend((build_target_sources or _build_target_sources(repo)).values())
     if build_system and build_dir:
         out.append({"name": build_dir, "kind": "build-directory", "source": build_system, "confidence": "medium"})
     return _dedupe_named(out)
@@ -177,6 +252,7 @@ def _test_targets(
     test_framework: str | None,
     test_binary: str | None,
     test_command: str | None,
+    cmake_targets: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     if test_target:
@@ -187,15 +263,55 @@ def _test_targets(
         out.append({"name": _repo_relative(repo, test_binary), "kind": "test-binary", "source": "explicit", "confidence": "high"})
     if test_command:
         out.append({"name": test_command, "kind": "test-command", "source": "explicit", "confidence": "high"})
-    out.extend(_cmake_tests(repo))
+    out.extend(_cmake_tests(repo, cmake_targets))
     out.extend(_meson_tests(repo))
     out.extend(_bazel_tests(repo))
     out.extend(_ninja_test_targets(repo))
     out.extend(_make_test_targets(repo))
+    out.extend(_xcode_tests(repo))
     return _dedupe_named(out)
 
 
-def _cmake_targets(repo: str) -> list[dict[str, Any]]:
+def _build_target_sources(
+    repo: str,
+    cmake_targets: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for target in list((cmake_targets or _cmake_target_sources(repo)).values()):
+        _record_target_source(out, target)
+    for target in _meson_targets(repo):
+        _record_target_source(out, target)
+    for target in _bazel_targets(repo):
+        _record_target_source(out, target)
+    for target in _ninja_targets(repo):
+        _record_target_source(out, target)
+    for target in _make_targets(repo):
+        _record_target_source(out, target)
+    for target in _xcode_targets(repo):
+        _record_target_source(out, target)
+    return out
+
+
+def _record_target_source(targets: dict[str, dict[str, Any]], target: dict[str, Any]) -> None:
+    target.setdefault(
+        "analysisKey",
+        _stable_analysis_key(
+            "build-target",
+            str(target.get("source", "")),
+            str(target.get("kind", "")),
+            str(target.get("name", "")),
+        ),
+    )
+    key = f"{target.get('source')}:{target.get('kind')}:{target.get('name')}"
+    targets[key] = target
+
+
+def _cmake_targets(
+    repo: str,
+    cmake_targets: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    if cmake_targets is not None:
+        return list(cmake_targets.values())
     text = _read_optional(os.path.join(repo, "CMakeLists.txt"))
     if text is None:
         return []
@@ -205,55 +321,317 @@ def _cmake_targets(repo: str) -> list[dict[str, Any]]:
     return out
 
 
-def _cmake_tests(repo: str) -> list[dict[str, Any]]:
+def _cmake_tests(
+    repo: str,
+    cmake_targets: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     text = _read_optional(os.path.join(repo, "CMakeLists.txt"))
     if text is None:
         return []
     out = []
-    for name in re.findall(r"\badd_test\s*\(\s*NAME\s+([A-Za-z0-9_.:+-]+)", text, flags=re.IGNORECASE):
-        out.append({"name": name, "kind": "ctest", "source": "CMakeLists.txt", "confidence": "medium"})
+    target_names = set((cmake_targets or _cmake_target_sources(repo)).keys())
+    for block in re.findall(r"\badd_test\s*\((.*?)\)", text, flags=re.IGNORECASE | re.DOTALL):
+        tokens = _cmake_tokens(block)
+        if not tokens:
+            continue
+        name = ""
+        command = ""
+        if tokens[0].upper() == "NAME":
+            for index, token in enumerate(tokens):
+                upper = token.upper()
+                if upper == "NAME" and index + 1 < len(tokens):
+                    name = tokens[index + 1]
+                elif upper == "COMMAND" and index + 1 < len(tokens):
+                    command = tokens[index + 1]
+                    break
+        elif len(tokens) >= 2:
+            name = tokens[0]
+            command = tokens[1]
+        if not name or not command:
+            continue
+        record = {
+            "name": name,
+            "kind": "ctest",
+            "source": "CMakeLists.txt",
+            "confidence": "medium",
+            "command": command,
+        }
+        if command in target_names:
+            record["relatedBuildTarget"] = command
+        out.append(record)
     return out
+
+
+def _cmake_target_sources(repo: str) -> dict[str, dict[str, Any]]:
+    text = _read_optional(os.path.join(repo, "CMakeLists.txt"))
+    if text is None:
+        return {}
+    targets: dict[str, dict[str, Any]] = {}
+    for kind, block in re.findall(
+        r"\badd_(executable|library)\s*\((.*?)\)",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        tokens = _cmake_tokens(block)
+        if not tokens:
+            continue
+        name = tokens[0]
+        source_files = [
+            _repo_relative(repo, token)
+            for token in tokens[1:]
+            if _looks_like_source_file(token)
+        ]
+        targets[name] = {
+            "name": name,
+            "kind": kind.lower(),
+            "source": "CMakeLists.txt",
+            "confidence": "medium",
+            "sourceFiles": source_files,
+        }
+    for block in re.findall(
+        r"\btarget_sources\s*\((.*?)\)",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        tokens = _cmake_tokens(block)
+        if not tokens:
+            continue
+        name = tokens[0]
+        source_files = [
+            _repo_relative(repo, token)
+            for token in tokens[1:]
+            if _looks_like_source_file(token)
+        ]
+        if not source_files:
+            continue
+        target = targets.setdefault(
+            name,
+            {
+                "name": name,
+                "kind": "target",
+                "source": "CMakeLists.txt",
+                "confidence": "medium",
+                "sourceFiles": [],
+            },
+        )
+        existing = list(target.get("sourceFiles") or [])
+        target["sourceFiles"] = _stable_unique(existing + source_files)
+    return targets
+
+
+def _cmake_tokens(block: str) -> list[str]:
+    out: list[str] = []
+    for match in re.finditer(r'"([^"]+)"|\'([^\']+)\'|([^\s()]+)', block):
+        token = match.group(1) or match.group(2) or match.group(3) or ""
+        if token:
+            out.append(token)
+    return out
+
+
+def _looks_like_source_file(token: str) -> bool:
+    if token.startswith("$") or token.upper() in {
+        "STATIC",
+        "SHARED",
+        "MODULE",
+        "OBJECT",
+        "INTERFACE",
+        "EXCLUDE_FROM_ALL",
+        "WIN32",
+        "MACOSX_BUNDLE",
+    }:
+        return False
+    return os.path.splitext(token)[1].lower() in {
+        ".c",
+        ".cc",
+        ".cpp",
+        ".cxx",
+        ".m",
+        ".mm",
+        ".h",
+        ".hh",
+        ".hpp",
+        ".hxx",
+        ".metal",
+    }
 
 
 def _meson_targets(repo: str) -> list[dict[str, Any]]:
     text = _read_optional(os.path.join(repo, "meson.build"))
     if text is None:
         return []
-    return [
-        {"name": name, "kind": "executable", "source": "meson.build", "confidence": "medium"}
-        for name in re.findall(r"\bexecutable\s*\(\s*['\"]([^'\"]+)['\"]", text)
-    ]
+    out: list[dict[str, Any]] = []
+    for callee, kind in (
+        ("executable", "executable"),
+        ("library", "library"),
+        ("static_library", "static-library"),
+        ("shared_library", "shared-library"),
+    ):
+        for block in re.findall(rf"\b{re.escape(callee)}\s*\((.*?)\)", text, flags=re.DOTALL):
+            tokens = re.findall(r"['\"]([^'\"]+)['\"]", block)
+            if not tokens:
+                continue
+            name = tokens[0]
+            source_files = _stable_unique(
+                [
+                    _repo_relative(repo, token)
+                    for token in tokens[1:]
+                    if _looks_like_source_file(token)
+                ]
+            )
+            out.append(
+                {
+                    "name": name,
+                    "kind": kind,
+                    "source": "meson.build",
+                    "confidence": "medium",
+                    "sourceFiles": source_files,
+                }
+            )
+    return out
 
 
 def _meson_tests(repo: str) -> list[dict[str, Any]]:
     text = _read_optional(os.path.join(repo, "meson.build"))
     if text is None:
         return []
-    return [
-        {"name": name, "kind": "meson-test", "source": "meson.build", "confidence": "medium"}
-        for name in re.findall(r"\btest\s*\(\s*['\"]([^'\"]+)['\"]", text)
-    ]
+    out: list[dict[str, Any]] = []
+    for block in re.findall(r"\btest\s*\((.*?)\)", text, flags=re.DOTALL):
+        tokens = re.findall(r"['\"]([^'\"]+)['\"]|([A-Za-z_][A-Za-z0-9_]*)", block)
+        flat = [quoted or bare for quoted, bare in tokens if quoted or bare]
+        if not flat:
+            continue
+        record = {"name": flat[0], "kind": "meson-test", "source": "meson.build", "confidence": "medium"}
+        if len(flat) > 1:
+            record["relatedBuildTarget"] = flat[1]
+        out.append(record)
+    return out
 
 
 def _bazel_targets(repo: str) -> list[dict[str, Any]]:
-    return _bazel_named_rules(repo, {"cc_binary", "cc_library"})
+    return _bazel_named_rules(repo, {"cc_binary", "cc_library", "cc_test"})
 
 
 def _bazel_tests(repo: str) -> list[dict[str, Any]]:
-    return _bazel_named_rules(repo, {"cc_test"}, kind="bazel-test")
+    tests = _bazel_named_rules(repo, {"cc_test"}, kind="bazel-test")
+    for test in tests:
+        dependencies = test.get("dependencies")
+        if isinstance(dependencies, list) and dependencies:
+            test["relatedBuildTarget"] = dependencies[0]
+        else:
+            test.setdefault("relatedBuildTarget", test.get("name"))
+    return tests
 
 
 def _bazel_named_rules(repo: str, rules: set[str], kind: str | None = None) -> list[dict[str, Any]]:
-    text = _read_optional(os.path.join(repo, "BUILD.bazel")) or _read_optional(os.path.join(repo, "BUILD"))
-    if text is None:
-        return []
     out = []
-    for rule in rules:
-        for block in re.findall(rf"\b{rule}\s*\((.*?)\)", text, flags=re.DOTALL):
-            match = re.search(r"name\s*=\s*['\"]([^'\"]+)['\"]", block)
-            if match:
-                out.append({"name": match.group(1), "kind": kind or rule, "source": "BUILD.bazel", "confidence": "medium"})
+    for package_dir, source, text in _bazel_build_files(repo):
+        for rule in rules:
+            for block in re.findall(rf"\b{rule}\s*\((.*?)\)", text, flags=re.DOTALL):
+                match = re.search(r"name\s*=\s*['\"]([^'\"]+)['\"]", block)
+                if match:
+                    target_name = _bazel_target_name(package_dir, match.group(1))
+                    source_files = _stable_unique(
+                        [
+                            _bazel_source_path(repo, package_dir, source)
+                            for source in re.findall(r"['\"]([^'\"]+)['\"]", block)
+                            if _looks_like_source_file(_bazel_source_token_path(source))
+                        ]
+                    )
+                    record = {
+                        "name": target_name,
+                        "kind": kind or rule,
+                        "source": source,
+                        "confidence": "medium",
+                    }
+                    if source_files:
+                        record["sourceFiles"] = source_files
+                    dependencies = _bazel_dependencies(package_dir, block)
+                    if dependencies:
+                        record["dependencies"] = dependencies
+                    out.append(record)
     return out
+
+
+def _bazel_build_files(repo: str) -> list[tuple[str, str, str]]:
+    out: list[tuple[str, str, str]] = []
+    ignored_dirs = {
+        ".git",
+        ".hg",
+        ".svn",
+        "__pycache__",
+        "agent_space",
+        "bazel-bin",
+        "bazel-out",
+        "bazel-testlogs",
+        "build",
+        "cmake-build-debug",
+        "cmake-build-release",
+        "node_modules",
+    }
+    for current, dirs, files in os.walk(repo):
+        dirs[:] = sorted(
+            name
+            for name in dirs
+            if name not in ignored_dirs
+            and not name.startswith("bazel-")
+            and not name.startswith(".")
+        )
+        for file_name in ("BUILD.bazel", "BUILD"):
+            if file_name not in files:
+                continue
+            path = os.path.join(current, file_name)
+            text = _read_optional(path)
+            if text is None:
+                continue
+            package_dir = os.path.relpath(current, repo)
+            if package_dir == ".":
+                package_dir = ""
+            out.append((package_dir, _repo_relative(repo, path), text))
+            break
+    return out
+
+
+def _bazel_target_name(package_dir: str, name: str) -> str:
+    return name if not package_dir else f"//{package_dir}:{name}"
+
+
+def _bazel_source_token_path(token: str) -> str:
+    if token.startswith("//") and ":" in token:
+        package, name = token[2:].split(":", 1)
+        return os.path.join(package, name)
+    if token.startswith(":"):
+        return token[1:]
+    return token
+
+
+def _bazel_source_path(repo: str, package_dir: str, token: str) -> str:
+    source = _bazel_source_token_path(token)
+    if os.path.isabs(source):
+        return _repo_relative(repo, source)
+    if token.startswith("//"):
+        return _repo_relative(repo, source)
+    return _repo_relative(repo, os.path.join(package_dir, source))
+
+
+def _bazel_dependencies(package_dir: str, block: str) -> list[str]:
+    match = re.search(r"\bdeps\s*=\s*\[(.*?)\]", block, flags=re.DOTALL)
+    if not match:
+        return []
+    return _stable_unique(
+        [
+            _bazel_label_to_target(package_dir, dep)
+            for dep in re.findall(r"['\"]([^'\"]+)['\"]", match.group(1))
+            if dep and not _looks_like_source_file(_bazel_source_token_path(dep))
+        ]
+    )
+
+
+def _bazel_label_to_target(package_dir: str, label: str) -> str:
+    if label.startswith("//"):
+        return label
+    if label.startswith(":"):
+        return _bazel_target_name(package_dir, label[1:])
+    return _bazel_target_name(package_dir, label)
 
 
 def _ninja_targets(repo: str) -> list[dict[str, Any]]:
@@ -261,9 +639,22 @@ def _ninja_targets(repo: str) -> list[dict[str, Any]]:
     if text is None:
         return []
     out = []
-    for name in re.findall(r"^build\s+([^:\s]+)\s*:", text, flags=re.MULTILINE):
+    for name, inputs in re.findall(r"^build\s+([^:\s]+)\s*:\s*[^\s:]+(?:\s+(.+))?$", text, flags=re.MULTILINE):
         if name != "test":
-            out.append({"name": name, "kind": "ninja", "source": "build.ninja", "confidence": "medium"})
+            source_files = [
+                _repo_relative(repo, token)
+                for token in (inputs or "").split()
+                if _looks_like_source_file(token)
+            ]
+            out.append(
+                {
+                    "name": name,
+                    "kind": "ninja",
+                    "source": "build.ninja",
+                    "confidence": "medium",
+                    "sourceFiles": source_files,
+                }
+            )
     return out
 
 
@@ -271,7 +662,13 @@ def _ninja_test_targets(repo: str) -> list[dict[str, Any]]:
     text = _read_optional(os.path.join(repo, "build.ninja"))
     if text is None or not re.search(r"^build\s+test\s*:", text, flags=re.MULTILINE):
         return []
-    return [{"name": "test", "kind": "ninja", "source": "build.ninja", "confidence": "medium"}]
+    match = re.search(r"^build\s+test\s*:\s*[^\s:]+(?:\s+(.+))?$", text, flags=re.MULTILINE)
+    record = {"name": "test", "kind": "ninja", "source": "build.ninja", "confidence": "medium"}
+    if match:
+        related = _first_build_target_token(match.group(1) or "")
+        if related:
+            record["relatedBuildTarget"] = related
+    return [record]
 
 
 def _make_targets(repo: str) -> list[dict[str, Any]]:
@@ -279,17 +676,236 @@ def _make_targets(repo: str) -> list[dict[str, Any]]:
     if text is None:
         return []
     out = []
-    for name in re.findall(r"^([A-Za-z0-9_.+-]+)\s*:", text, flags=re.MULTILINE):
+    for name, prerequisites in re.findall(r"^([A-Za-z0-9_.+-]+)\s*:\s*(.*)$", text, flags=re.MULTILINE):
         if name not in {"test", "clean", "all"}:
-            out.append({"name": name, "kind": "make", "source": "Makefile", "confidence": "medium"})
+            source_files = [
+                _repo_relative(repo, token)
+                for token in prerequisites.split()
+                if _looks_like_source_file(token)
+            ]
+            out.append(
+                {
+                    "name": name,
+                    "kind": "make",
+                    "source": "Makefile",
+                    "confidence": "medium",
+                    "sourceFiles": source_files,
+                }
+            )
     return out
 
 
 def _make_test_targets(repo: str) -> list[dict[str, Any]]:
     text = _read_optional(os.path.join(repo, "Makefile"))
-    if text is None or not re.search(r"^test\s*:", text, flags=re.MULTILINE):
+    if text is None:
         return []
-    return [{"name": "test", "kind": "make", "source": "Makefile", "confidence": "medium"}]
+    match = re.search(r"^test\s*:\s*(.*)$", text, flags=re.MULTILINE)
+    if not match:
+        return []
+    record = {"name": "test", "kind": "make", "source": "Makefile", "confidence": "medium"}
+    related = _first_build_target_token(match.group(1) or "")
+    if related:
+        record["relatedBuildTarget"] = related
+    return [record]
+
+
+def _xcode_targets(repo: str) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for project_source, text in _xcode_project_texts(repo):
+        file_refs = _xcode_file_refs(repo, text)
+        build_files = _xcode_build_files(text, file_refs)
+        source_phases = _xcode_source_phases(text, build_files)
+        native_targets = _xcode_native_target_blocks(text)
+        target_names = {target_id: name for target_id, name, _block in native_targets}
+        dependency_targets = _xcode_target_dependency_targets(text, target_names)
+        for target_id, name, block in native_targets:
+            phase_ids = _xcode_list_property(block, "buildPhases")
+            dependencies = [
+                dependency_targets[dependency_id]
+                for dependency_id in _xcode_list_property(block, "dependencies")
+                if dependency_id in dependency_targets
+            ]
+            source_files = sorted(
+                {
+                    source
+                    for phase_id in phase_ids
+                    for source in source_phases.get(phase_id, [])
+                }
+            )
+            product_type = _xcode_scalar_property(block, "productType")
+            out.append(
+                {
+                    "name": name,
+                    "kind": "xcode-target",
+                    "source": project_source,
+                    "confidence": "medium" if source_files else "low",
+                    "sourceFiles": source_files,
+                    "productType": product_type,
+                    "xcodeTargetId": target_id,
+                }
+            )
+            if dependencies:
+                out[-1]["dependencies"] = dependencies
+                out[-1]["relatedBuildTarget"] = dependencies[0]
+    return out
+
+
+def _xcode_tests(repo: str) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for target in _xcode_targets(repo):
+        product_type = str(target.get("productType") or "")
+        if "unit-test" not in product_type and "ui-testing" not in product_type:
+            continue
+        record = {
+            "name": str(target.get("name")),
+            "kind": "xcode-test",
+            "source": str(target.get("source")),
+            "confidence": "medium",
+            "relatedBuildTarget": str(target.get("relatedBuildTarget") or target.get("name")),
+            "productType": product_type,
+        }
+        dependencies = target.get("dependencies")
+        if isinstance(dependencies, list) and dependencies:
+            record["dependencies"] = dependencies
+        out.append(record)
+    return out
+
+
+def _xcode_project_texts(repo: str) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    try:
+        entries = sorted(os.listdir(repo))
+    except OSError:
+        return out
+    for entry in entries:
+        if not entry.endswith(".xcodeproj"):
+            continue
+        rel = os.path.join(entry, "project.pbxproj")
+        text = _read_optional(os.path.join(repo, rel))
+        if text is not None:
+            out.append((rel, text))
+    return out
+
+
+def _xcode_file_refs(repo: str, text: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for match in re.finditer(
+        r"(?P<id>[A-Za-z0-9]+)\s*/\*\s*(?P<comment>[^*]+?)\s*\*/\s*=\s*\{(?P<body>.*?)\};",
+        text,
+        flags=re.DOTALL,
+    ):
+        body = match.group("body")
+        if "isa = PBXFileReference" not in body:
+            continue
+        path = _xcode_scalar_property(body, "path") or match.group("comment").strip()
+        if _looks_like_source_file(path):
+            out[match.group("id")] = _repo_relative(repo, path)
+    return out
+
+
+def _xcode_build_files(text: str, file_refs: dict[str, str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for match in re.finditer(
+        r"(?P<id>[A-Za-z0-9]+)\s*/\*\s*[^*]+?\s*\*/\s*=\s*\{(?P<body>.*?)\};",
+        text,
+        flags=re.DOTALL,
+    ):
+        body = match.group("body")
+        if "isa = PBXBuildFile" not in body:
+            continue
+        file_ref = re.search(r"fileRef\s*=\s*([A-Za-z0-9]+)\s*/\*", body)
+        if file_ref and file_ref.group(1) in file_refs:
+            out[match.group("id")] = file_refs[file_ref.group(1)]
+    return out
+
+
+def _xcode_source_phases(text: str, build_files: dict[str, str]) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    for match in re.finditer(
+        r"(?P<id>[A-Za-z0-9]+)\s*/\*\s*Sources\s*\*/\s*=\s*\{(?P<body>.*?)\};",
+        text,
+        flags=re.DOTALL,
+    ):
+        body = match.group("body")
+        if "isa = PBXSourcesBuildPhase" not in body:
+            continue
+        file_ids = _xcode_list_property(body, "files")
+        out[match.group("id")] = [
+            build_files[file_id]
+            for file_id in file_ids
+            if file_id in build_files
+        ]
+    return out
+
+
+def _xcode_native_target_blocks(text: str) -> list[tuple[str, str, str]]:
+    out: list[tuple[str, str, str]] = []
+    for match in re.finditer(
+        r"(?P<id>[A-Za-z0-9]+)\s*/\*\s*(?P<comment>[^*]+?)\s*\*/\s*=\s*\{(?P<body>.*?)\};",
+        text,
+        flags=re.DOTALL,
+    ):
+        body = match.group("body")
+        if "isa = PBXNativeTarget" not in body:
+            continue
+        name = _xcode_scalar_property(body, "name") or match.group("comment").strip()
+        out.append((match.group("id"), name, body))
+    return out
+
+
+def _xcode_target_dependency_targets(text: str, target_names: dict[str, str]) -> dict[str, str]:
+    proxy_targets = _xcode_container_proxy_targets(text)
+    out: dict[str, str] = {}
+    for match in re.finditer(
+        r"(?P<id>[A-Za-z0-9]+)\s*/\*\s*[^*]+?\s*\*/\s*=\s*\{(?P<body>.*?)\};",
+        text,
+        flags=re.DOTALL,
+    ):
+        body = match.group("body")
+        if "isa = PBXTargetDependency" not in body:
+            continue
+        target_id = _xcode_object_reference(body, "target")
+        if not target_id:
+            proxy_id = _xcode_object_reference(body, "targetProxy")
+            target_id = proxy_targets.get(proxy_id or "")
+        if target_id and target_id in target_names:
+            out[match.group("id")] = target_names[target_id]
+    return out
+
+
+def _xcode_container_proxy_targets(text: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for match in re.finditer(
+        r"(?P<id>[A-Za-z0-9]+)\s*/\*\s*[^*]+?\s*\*/\s*=\s*\{(?P<body>.*?)\};",
+        text,
+        flags=re.DOTALL,
+    ):
+        body = match.group("body")
+        if "isa = PBXContainerItemProxy" not in body:
+            continue
+        target_id = _xcode_scalar_property(body, "remoteGlobalIDString")
+        if target_id:
+            out[match.group("id")] = target_id
+    return out
+
+
+def _xcode_object_reference(block: str, key: str) -> str | None:
+    match = re.search(rf"\b{re.escape(key)}\s*=\s*([A-Za-z0-9]+)\s*(?:/\*[^*]*\*/)?;", block)
+    return match.group(1) if match else None
+
+
+def _xcode_list_property(block: str, key: str) -> list[str]:
+    match = re.search(rf"\b{re.escape(key)}\s*=\s*\((.*?)\);", block, flags=re.DOTALL)
+    if not match:
+        return []
+    return re.findall(r"\b([A-Za-z0-9]+)\b\s*(?:/\*[^*]*\*/)?\s*,", match.group(1))
+
+
+def _xcode_scalar_property(block: str, key: str) -> str | None:
+    match = re.search(rf"\b{re.escape(key)}\s*=\s*(?:\"([^\"]+)\"|([^;\n]+));", block)
+    if not match:
+        return None
+    return (match.group(1) or match.group(2) or "").strip()
 
 
 def _confidence(
@@ -309,6 +925,14 @@ def _dedupe_named(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen: set[tuple[str, str, str]] = set()
     out = []
     for item in items:
+        item.setdefault(
+            "analysisKey",
+            _stable_analysis_key(
+                str(item.get("source", "")),
+                str(item.get("kind", "")),
+                str(item.get("name", "")),
+            ),
+        )
         key = (str(item.get("name")), str(item.get("kind", "")), str(item.get("source", "")))
         if key in seen:
             continue
@@ -333,3 +957,31 @@ def _read_optional(path: str) -> str | None:
             return f.read()
     except OSError:
         return None
+
+
+def _first_build_target_token(value: str) -> str | None:
+    for token in value.split():
+        if not token or token.startswith("$") or _looks_like_source_file(token):
+            continue
+        return token
+    return None
+
+
+def _stable_unique(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _stable_analysis_key(*parts: str) -> str:
+    cleaned = [
+        re.sub(r"[^A-Za-z0-9_.:/@+-]+", "-", str(part).strip()).strip("-")
+        for part in parts
+        if str(part).strip()
+    ]
+    return "|".join(cleaned)

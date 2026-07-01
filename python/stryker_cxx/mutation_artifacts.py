@@ -9,6 +9,8 @@ overlay implementation used today.
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -20,6 +22,8 @@ MUTATION_ARTIFACT_SCHEMA_VERSION = "stryker-cxx.mutation-artifact.v1"
 ARTIFACT_PLACEMENT_SCHEMA_VERSION = "stryker-cxx.artifact-placement.v1"
 SOURCE_OVERLAY_MODE = "source-overlay"
 COMPILED_ARTIFACT_MODE = "compiled-artifact"
+MUTANT_SWITCH_MODE = "mutant-switch"
+MUTANT_SWITCH_ACTIVE_ENV = "STRYKER_CXX_ACTIVE_MUTANT"
 
 
 def _workspace_is_retained(retain: bool, retain_state: dict[str, bool] | None) -> bool:
@@ -112,6 +116,52 @@ def artifact_placement_policy(
         },
     }
     return payload
+
+
+def mutant_switch_guard_id(mutant: Any) -> str:
+    data = dict(mutant.__dict__ if hasattr(mutant, "__dict__") else mutant)
+    identity = {
+        "id": data.get("id"),
+        "file": data.get("file"),
+        "line": data.get("line"),
+        "column": data.get("column", data.get("col")),
+        "mutator": data.get("mutator"),
+        "original": data.get("original"),
+        "mutated": data.get("mutated"),
+    }
+    digest = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return f"msw-{digest[:16]}"
+
+
+def mutant_switch_artifact_metadata(
+    *,
+    enabled: bool,
+    guard_count: int,
+    guards: list[dict[str, Any]] | None = None,
+    fallback_reason: str | None = None,
+    activation_environment: str = MUTANT_SWITCH_ACTIVE_ENV,
+    implementation: str = "guarded-source-overlay",
+) -> dict[str, Any]:
+    return {
+        "schemaVersion": MUTATION_ARTIFACT_SCHEMA_VERSION,
+        "mode": MUTANT_SWITCH_MODE,
+        "implementation": implementation,
+        "workspacePerMutant": False,
+        "parallelSafe": True,
+        "supportsCompiledReplacement": True,
+        "enabled": enabled,
+        "activationEnvironment": activation_environment,
+        "runtimeGuardCount": guard_count if enabled else 0,
+        "candidateGuardCount": guard_count,
+        "fallbackReason": fallback_reason,
+        "guards": list(guards or []),
+        "mutantSwitch": {
+            "guardStrategy": "environment-selected-conditional",
+            "activationEnvironment": activation_environment,
+        },
+    }
 
 
 def compiled_mutation_artifact_metadata(

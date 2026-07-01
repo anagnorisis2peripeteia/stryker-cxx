@@ -14,6 +14,9 @@ from .payload_contract import (
     supported_native_statuses,
 )
 
+ARTIFACT_BACKENDS = {"source-overlay", "compiled-executable", "compiled-library", "compiled-object"}
+ARTIFACT_FALLBACKS = {"none", "source-overlay"}
+
 
 def _expect(obj: Any, key: str, kind: type | tuple[type, ...] | None = None, *, require: bool = True) -> bool:
     if not isinstance(obj, dict):
@@ -98,13 +101,38 @@ def validate_report(payload: dict[str, Any]) -> list[str]:
     if not isinstance(exec_ctx, dict):
         errors.append(_collect("execution", "expected object"))
     else:
-        for key in ("mode", "worktreeMode", "jobs"):
+        for key in (
+            "mode",
+            "executionMode",
+            "requestedExecutionMode",
+            "artifactBackend",
+            "requestedArtifactBackend",
+            "artifactFallback",
+            "worktreeMode",
+            "jobs",
+        ):
             if key == "jobs":
                 if not isinstance(exec_ctx.get(key), int):
                     errors.append(_collect("execution.jobs", "expected integer"))
             else:
                 if key in exec_ctx and not isinstance(exec_ctx.get(key), str):
                     errors.append(_collect(f"execution.{key}", "expected string"))
+        for key in ("executionMode", "requestedExecutionMode"):
+            value = exec_ctx.get(key)
+            if isinstance(value, str) and value not in {"source-overlay", "mutant-switch"}:
+                errors.append(_collect(f"execution.{key}", f"unexpected mode {value!r}"))
+        for key in ("artifactBackend", "requestedArtifactBackend"):
+            value = exec_ctx.get(key)
+            if isinstance(value, str) and value not in ARTIFACT_BACKENDS:
+                errors.append(_collect(f"execution.{key}", f"unexpected backend {value!r}"))
+        fallback = exec_ctx.get("artifactFallback")
+        if isinstance(fallback, str) and fallback not in ARTIFACT_FALLBACKS:
+            errors.append(_collect("execution.artifactFallback", f"unexpected fallback {fallback!r}"))
+        if "artifactFallbackReason" in exec_ctx and not isinstance(
+            exec_ctx.get("artifactFallbackReason"),
+            (str, type(None)),
+        ):
+            errors.append(_collect("execution.artifactFallbackReason", "expected string or null"))
         optional_exec_types = {
             "initialTest": bool,
             "dryRunOnly": bool,
@@ -141,6 +169,25 @@ def validate_report(payload: dict[str, Any]) -> list[str]:
                             errors.append(_collect("execution.analysis.equivalentSuppression.suppressedMutants", "expected integer"))
                         if "suppressions" in suppression and not isinstance(suppression.get("suppressions"), list):
                             errors.append(_collect("execution.analysis.equivalentSuppression.suppressions", "expected array"))
+        mutant_switch = exec_ctx.get("mutantSwitch")
+        if mutant_switch is not None:
+            if not isinstance(mutant_switch, dict):
+                errors.append(_collect("execution.mutantSwitch", "expected object"))
+            else:
+                for key in ("enabled", "requested"):
+                    if key in mutant_switch and not isinstance(mutant_switch.get(key), bool):
+                        errors.append(_collect(f"execution.mutantSwitch.{key}", "expected boolean"))
+                for key in ("fallbackReason", "activationEnvironment"):
+                    if key in mutant_switch and not isinstance(mutant_switch.get(key), (str, type(None))):
+                        errors.append(_collect(f"execution.mutantSwitch.{key}", "expected string or null"))
+                for key in ("runtimeGuardCount", "candidateGuardCount"):
+                    if key in mutant_switch and not isinstance(mutant_switch.get(key), int):
+                        errors.append(_collect(f"execution.mutantSwitch.{key}", "expected integer"))
+                if "guards" in mutant_switch and not isinstance(mutant_switch.get("guards"), list):
+                    errors.append(_collect("execution.mutantSwitch.guards", "expected array"))
+                artifact_candidate = mutant_switch.get("artifactCandidate")
+                if artifact_candidate is not None and not isinstance(artifact_candidate, dict):
+                    errors.append(_collect("execution.mutantSwitch.artifactCandidate", "expected object"))
         batching = exec_ctx.get("batching")
         if batching is not None:
             if not isinstance(batching, dict):
@@ -151,6 +198,19 @@ def validate_report(payload: dict[str, Any]) -> list[str]:
                 for key in ("batchSize", "batches", "splitBatches", "batchedMutants"):
                     if key in batching and not isinstance(batching.get(key), int):
                         errors.append(_collect(f"execution.batching.{key}", "expected integer"))
+        distribution = exec_ctx.get("distribution")
+        if distribution is not None:
+            if not isinstance(distribution, dict):
+                errors.append(_collect("execution.distribution", "expected object"))
+            else:
+                if "schemaVersion" in distribution and not isinstance(distribution.get("schemaVersion"), str):
+                    errors.append(_collect("execution.distribution.schemaVersion", "expected string"))
+                for key in ("manifestPath", "workerLabel"):
+                    if key in distribution and not isinstance(distribution.get(key), (str, type(None))):
+                        errors.append(_collect(f"execution.distribution.{key}", "expected string or null"))
+                for key in ("shardIndex", "shardTotal", "selectedMutants"):
+                    if key in distribution and not isinstance(distribution.get(key), int):
+                        errors.append(_collect(f"execution.distribution.{key}", "expected integer"))
         compile_pruning = exec_ctx.get("compilePruning")
         if compile_pruning is not None:
             if not isinstance(compile_pruning, dict):
@@ -194,6 +254,54 @@ def validate_report(payload: dict[str, Any]) -> list[str]:
                         errors.append(_collect(f"execution.testScheduler.{key}", "expected integer"))
                 if "groups" in test_scheduler and not isinstance(test_scheduler.get("groups"), list):
                     errors.append(_collect("execution.testScheduler.groups", "expected array"))
+        reporter_runs = exec_ctx.get("reporterRuns")
+        if reporter_runs is not None:
+            if not isinstance(reporter_runs, list):
+                errors.append(_collect("execution.reporterRuns", "expected array"))
+            else:
+                for index, run in enumerate(reporter_runs):
+                    path = f"execution.reporterRuns[{index}]"
+                    if not isinstance(run, dict):
+                        errors.append(_collect(path, "expected object"))
+                        continue
+                    for key in (
+                        "plugin",
+                        "reporter",
+                        "hook",
+                        "phase",
+                        "command",
+                        "status",
+                        "log",
+                        "reason",
+                    ):
+                        if key in run and not isinstance(run.get(key), (str, type(None))):
+                            errors.append(_collect(f"{path}.{key}", "expected string or null"))
+                    for key in ("exitCode", "durationMs"):
+                        if key in run and not isinstance(run.get(key), (int, type(None))):
+                            errors.append(_collect(f"{path}.{key}", "expected integer or null"))
+                    if "environment" in run and not isinstance(run.get("environment"), (dict, type(None))):
+                        errors.append(_collect(f"{path}.environment", "expected object or null"))
+                    available_reporters = run.get("availableReporters")
+                    if available_reporters is not None:
+                        if not isinstance(available_reporters, list):
+                            errors.append(_collect(f"{path}.availableReporters", "expected array"))
+                        elif any(not isinstance(item, str) for item in available_reporters):
+                            errors.append(_collect(f"{path}.availableReporters", "expected string entries"))
+        plugin_lifecycle = exec_ctx.get("pluginLifecycle")
+        if plugin_lifecycle is not None:
+            if not isinstance(plugin_lifecycle, dict):
+                errors.append(_collect("execution.pluginLifecycle", "expected object"))
+            else:
+                if "schemaVersion" in plugin_lifecycle and not isinstance(plugin_lifecycle.get("schemaVersion"), str):
+                    errors.append(_collect("execution.pluginLifecycle.schemaVersion", "expected string"))
+                for key in ("supportedEvents", "loadOrder", "registeredHooks", "runs"):
+                    if key in plugin_lifecycle and not isinstance(plugin_lifecycle.get(key), list):
+                        errors.append(_collect(f"execution.pluginLifecycle.{key}", "expected array"))
+                if "legacyAliases" in plugin_lifecycle and not isinstance(plugin_lifecycle.get("legacyAliases"), dict):
+                    errors.append(_collect("execution.pluginLifecycle.legacyAliases", "expected object"))
+                for key in ("localOnly", "networkInstall"):
+                    if key in plugin_lifecycle and not isinstance(plugin_lifecycle.get(key), bool):
+                        errors.append(_collect(f"execution.pluginLifecycle.{key}", "expected boolean"))
         dashboard = exec_ctx.get("dashboard")
         if dashboard is not None:
             if not isinstance(dashboard, dict):
@@ -232,6 +340,39 @@ def validate_report(payload: dict[str, Any]) -> list[str]:
                                         "expected string or null",
                                     )
                                 )
+                        for key in ("status", "error"):
+                            if key in upload and not isinstance(upload.get(key), (str, type(None))):
+                                errors.append(
+                                    _collect(
+                                        f"execution.dashboard.upload.{key}",
+                                        "expected string or null",
+                                    )
+                                )
+                        for key in ("statusCode", "maxAttempts", "retryDelayMs"):
+                            if key in upload and not isinstance(upload.get(key), (int, type(None))):
+                                errors.append(
+                                    _collect(
+                                        f"execution.dashboard.upload.{key}",
+                                        "expected integer or null",
+                                    )
+                                )
+                        attempts = upload.get("attempts")
+                        if attempts is not None:
+                            if not isinstance(attempts, list):
+                                errors.append(_collect("execution.dashboard.upload.attempts", "expected array"))
+                            else:
+                                for index, attempt in enumerate(attempts):
+                                    if not isinstance(attempt, dict):
+                                        errors.append(_collect(f"execution.dashboard.upload.attempts[{index}]", "expected object"))
+                                        continue
+                                    if "attempt" in attempt and not isinstance(attempt.get("attempt"), int):
+                                        errors.append(_collect(f"execution.dashboard.upload.attempts[{index}].attempt", "expected integer"))
+                                    if "status" in attempt and not isinstance(attempt.get("status"), str):
+                                        errors.append(_collect(f"execution.dashboard.upload.attempts[{index}].status", "expected string"))
+                                    if "statusCode" in attempt and not isinstance(attempt.get("statusCode"), int):
+                                        errors.append(_collect(f"execution.dashboard.upload.attempts[{index}].statusCode", "expected integer"))
+                                    if "error" in attempt and not isinstance(attempt.get("error"), str):
+                                        errors.append(_collect(f"execution.dashboard.upload.attempts[{index}].error", "expected string"))
         resource = exec_ctx.get("resourceIsolation")
         if resource is not None:
             if not isinstance(resource, dict):
@@ -387,6 +528,38 @@ def validate_report(payload: dict[str, Any]) -> list[str]:
             for key in ("targetFiles", "buildSystems", "sourceTargets", "buildTargets", "testTargets"):
                 if key in project_analysis and not isinstance(project_analysis.get(key), list):
                     errors.append(_collect(f"projectAnalysis.{key}", "expected array"))
+            for key in ("buildSystems", "buildTargets", "testTargets"):
+                values = project_analysis.get(key)
+                if isinstance(values, list):
+                    for index, item in enumerate(values):
+                        if not isinstance(item, dict):
+                            errors.append(_collect(f"projectAnalysis.{key}[{index}]", "expected object"))
+                            continue
+                        if "analysisKey" in item and not isinstance(item.get("analysisKey"), str):
+                            errors.append(_collect(f"projectAnalysis.{key}[{index}].analysisKey", "expected string"))
+                        if "relatedBuildTarget" in item and not isinstance(item.get("relatedBuildTarget"), str):
+                            errors.append(_collect(f"projectAnalysis.{key}[{index}].relatedBuildTarget", "expected string"))
+            source_targets = project_analysis.get("sourceTargets")
+            if isinstance(source_targets, list):
+                for index, item in enumerate(source_targets):
+                    if not isinstance(item, dict):
+                        errors.append(_collect(f"projectAnalysis.sourceTargets[{index}]", "expected object"))
+                        continue
+                    if "analysisKey" in item and not isinstance(item.get("analysisKey"), str):
+                        errors.append(_collect(f"projectAnalysis.sourceTargets[{index}].analysisKey", "expected string"))
+                    ownership = item.get("ownership")
+                    if ownership is not None:
+                        if not isinstance(ownership, dict):
+                            errors.append(_collect(f"projectAnalysis.sourceTargets[{index}].ownership", "expected object"))
+                        else:
+                            if "key" in ownership and not isinstance(ownership.get("key"), str):
+                                errors.append(_collect(f"projectAnalysis.sourceTargets[{index}].ownership.key", "expected string"))
+                            build_targets = ownership.get("buildTargets")
+                            if build_targets is not None and (
+                                not isinstance(build_targets, list)
+                                or not all(isinstance(value, str) for value in build_targets)
+                            ):
+                                errors.append(_collect(f"projectAnalysis.sourceTargets[{index}].ownership.buildTargets", "expected string array"))
             compile_db = project_analysis.get("compileDatabase")
             if compile_db is not None and not isinstance(compile_db, dict):
                 errors.append(_collect("projectAnalysis.compileDatabase", "expected object"))
