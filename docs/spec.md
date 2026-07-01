@@ -1199,6 +1199,8 @@ Target CLI/config:
   `execution.executionBackendFallbackReason` in `stryker-cxx.report.v1`;
 - `execution.llvmSwitch` records whether the experimental guarded-source switch
   backend was active and why it fell back when inactive;
+- `execution.llvmSwitch.instrumentation` records whether the active backend is
+  only guarded-source switching or true LLVM IR/object instrumentation;
 - `parity` and `execution.parity` record the eight known Mull/Stryker.NET gaps,
   per-run evidence, and remaining work without claiming true LLVM IR mutation;
 - `execution.mutantSwitch.enabled`;

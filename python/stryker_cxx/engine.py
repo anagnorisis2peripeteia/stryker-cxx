@@ -4186,6 +4186,49 @@ def _llvm_switch_project_fallback_reason(project_analysis: dict[str, Any] | None
     return "llvm-switch requires compile_commands.json or CMake/CTest ownership evidence"
 
 
+def _llvm_switch_instrumentation_metadata(
+    *,
+    enabled: bool,
+    requested: bool,
+    implementation: str,
+    fallback_reason: str | None,
+    project_analysis: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    build_graph = (
+        project_analysis.get("buildGraph")
+        if isinstance(project_analysis, dict) and isinstance(project_analysis.get("buildGraph"), dict)
+        else {}
+    )
+    compile_database = (
+        project_analysis.get("compileDatabase")
+        if isinstance(project_analysis, dict) and isinstance(project_analysis.get("compileDatabase"), dict)
+        else {}
+    )
+    kind = "guarded-source-switch" if enabled and implementation == "guarded-source-switch" else "none"
+    return {
+        "schemaVersion": "stryker-cxx.llvm-instrumentation.v1",
+        "kind": kind,
+        "requested": requested,
+        "active": enabled,
+        "irMutation": False,
+        "objectInstrumentation": False,
+        "singleCompiledArtifact": bool(enabled),
+        "runtimeActivationEnvironment": MUTANT_SWITCH_ACTIVE_ENV if enabled else None,
+        "sourceMapping": "source-range" if enabled else "not-active",
+        "ownershipEvidence": {
+            "ownershipModel": build_graph.get("ownershipModel"),
+            "compileDatabasePresent": bool(compile_database.get("present")),
+        },
+        "fallbackReason": fallback_reason,
+        "parityStatus": "partial" if enabled else "missing",
+        "remaining": [
+            "implement LLVM IR/object mutation injection",
+            "prove object/bitcode guard placement",
+            "prove source mapping from injected IR/object mutations back to C/C++ ranges",
+        ],
+    }
+
+
 def _mutant_switch_span_mutated_expression(mut: Mutant, col: int, original_text: str) -> str | None:
     if mut.mutator in MUTANT_SWITCH_EXPRESSION_MUTATORS:
         return mut.mutated
@@ -6368,6 +6411,11 @@ def _parity_coverage(rep: Report, mutants: list[dict[str, Any]]) -> dict[str, An
         else {}
     )
     llvm_switch = execution.get("llvmSwitch") if isinstance(execution.get("llvmSwitch"), dict) else {}
+    llvm_instrumentation = (
+        llvm_switch.get("instrumentation")
+        if isinstance(llvm_switch.get("instrumentation"), dict)
+        else {}
+    )
     reporter_runs = execution.get("reporterRuns") if isinstance(execution.get("reporterRuns"), list) else []
     mutator_names = sorted({str(mut.get("mutator")) for mut in mutants if mut.get("mutator")})
     ignored_mutators = execution.get("ignoredMutators") if isinstance(execution.get("ignoredMutators"), list) else []
@@ -6389,17 +6437,31 @@ def _parity_coverage(rep: Report, mutants: list[dict[str, Any]]) -> dict[str, An
         or dashboard_export.get("enabled")
         or dashboard_upload.get("enabled")
     )
+    has_llvm_ir_instrumentation = bool(
+        llvm_instrumentation.get("kind") == "llvm-ir"
+        and llvm_instrumentation.get("irMutation")
+        and llvm_instrumentation.get("objectInstrumentation")
+        and llvm_instrumentation.get("singleCompiledArtifact")
+    )
+    has_guarded_source_switch = bool(
+        llvm_switch.get("enabled")
+        and llvm_instrumentation.get("kind") == "guarded-source-switch"
+    )
     ignored_count = len([mut for mut in mutants if str(mut.get("status", "")).upper() == "IGNORED"])
     items = [
         _parity_item(
             "llvm-mull-backend",
             "Mull-style single compiled artifact backend",
-            _parity_status(False, partial=True),
+            _parity_status(has_llvm_ir_instrumentation, partial=has_guarded_source_switch),
             [
                 f"executionBackend={execution.get('executionBackend')}",
                 f"llvmSwitch.implementation={llvm_switch.get('implementation', 'guarded-source-switch')}",
+                f"instrumentation.kind={llvm_instrumentation.get('kind', 'none')}",
+                f"instrumentation.irMutation={llvm_instrumentation.get('irMutation', False)}",
+                f"instrumentation.objectInstrumentation={llvm_instrumentation.get('objectInstrumentation', False)}",
+                f"instrumentation.singleCompiledArtifact={llvm_instrumentation.get('singleCompiledArtifact', False)}",
             ],
-            [
+            [] if has_llvm_ir_instrumentation else [
                 "replace guarded-source switch with true LLVM IR/object instrumentation",
                 "prove object/bitcode guard placement and source mapping across CMake/CTest fixtures",
             ],
@@ -9812,6 +9874,12 @@ def main(argv: list[str] | None = None) -> int:
                 "requested": requested_execution_backend == "llvm-switch",
                 "implementation": "guarded-source-switch",
                 "fallbackReason": execution_backend_fallback_reason,
+                "instrumentation": _llvm_switch_instrumentation_metadata(
+                    enabled=False,
+                    requested=requested_execution_backend == "llvm-switch",
+                    implementation="guarded-source-switch",
+                    fallback_reason=execution_backend_fallback_reason,
+                ),
                 "requires": [
                     "compile_commands.json or CMake/CTest ownership evidence",
                     "mutant-switch guardable source ranges",
@@ -10061,6 +10129,15 @@ def main(argv: list[str] | None = None) -> int:
             "activationEnvironment": MUTANT_SWITCH_ACTIVE_ENV
             if actual_execution_backend == "llvm-switch"
             else None,
+            "instrumentation": _llvm_switch_instrumentation_metadata(
+                enabled=actual_execution_backend == "llvm-switch",
+                requested=requested_execution_backend == "llvm-switch",
+                implementation="guarded-source-switch",
+                fallback_reason=execution_backend_fallback_reason,
+                project_analysis=rep.execution.get("projectAnalysis")
+                if isinstance(rep.execution.get("projectAnalysis"), dict)
+                else None,
+            ),
             "requires": [
                 "compile_commands.json or CMake/CTest ownership evidence",
                 "mutant-switch guardable source ranges",

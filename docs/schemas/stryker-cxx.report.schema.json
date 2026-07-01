@@ -130,6 +130,27 @@
             "implementation": { "type": "string" },
             "fallbackReason": { "type": ["string", "null"] },
             "activationEnvironment": { "type": ["string", "null"] },
+            "instrumentation": {
+              "type": "object",
+              "properties": {
+                "schemaVersion": { "const": "stryker-cxx.llvm-instrumentation.v1" },
+                "kind": { "type": "string" },
+                "requested": { "type": "boolean" },
+                "active": { "type": "boolean" },
+                "irMutation": { "type": "boolean" },
+                "objectInstrumentation": { "type": "boolean" },
+                "singleCompiledArtifact": { "type": "boolean" },
+                "runtimeActivationEnvironment": { "type": ["string", "null"] },
+                "sourceMapping": { "type": "string" },
+                "ownershipEvidence": { "type": "object" },
+                "fallbackReason": { "type": ["string", "null"] },
+                "parityStatus": { "enum": ["missing", "partial", "covered"] },
+                "remaining": {
+                  "type": "array",
+                  "items": { "type": "string" }
+                }
+              }
+            },
             "requires": {
               "type": "array",
               "items": { "type": "string" }

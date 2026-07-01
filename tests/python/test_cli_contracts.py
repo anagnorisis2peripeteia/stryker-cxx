@@ -286,6 +286,12 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(execution["requestedExecutionBackend"], "llvm-switch")
         self.assertEqual(execution["executionBackend"], "source-overlay")
         self.assertIn("llvm-switch", execution["executionBackendFallbackReason"])
+        instrumentation = execution["llvmSwitch"]["instrumentation"]
+        self.assertEqual(instrumentation["kind"], "none")
+        self.assertFalse(instrumentation["irMutation"])
+        self.assertFalse(instrumentation["objectInstrumentation"])
+        by_id = {item["id"]: item for item in payload["parity"]["items"]}
+        self.assertEqual(by_id["llvm-mull-backend"]["status"], "missing")
 
     def test_execution_backend_llvm_switch_uses_guarded_switch_when_compile_database_matches(self) -> None:
         self.source.write_text("int main() { return 1 == 1 ? 0 : 1; }\n")
@@ -346,9 +352,21 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(execution["executionMode"], "mutant-switch")
         self.assertTrue(execution["llvmSwitch"]["enabled"])
         self.assertEqual(execution["llvmSwitch"]["implementation"], "guarded-source-switch")
+        instrumentation = execution["llvmSwitch"]["instrumentation"]
+        self.assertEqual(instrumentation["schemaVersion"], "stryker-cxx.llvm-instrumentation.v1")
+        self.assertEqual(instrumentation["kind"], "guarded-source-switch")
+        self.assertFalse(instrumentation["irMutation"])
+        self.assertFalse(instrumentation["objectInstrumentation"])
+        self.assertTrue(instrumentation["singleCompiledArtifact"])
         self.assertTrue(execution["mutantSwitch"]["enabled"])
         self.assertEqual(execution["singleCompile"]["builds"], 1)
         self.assertEqual(payload["mutants"][0]["resultSource"], "mutant-switch")
+        by_id = {item["id"]: item for item in payload["parity"]["items"]}
+        self.assertEqual(by_id["llvm-mull-backend"]["status"], "partial")
+        self.assertIn(
+            "instrumentation.kind=guarded-source-switch",
+            by_id["llvm-mull-backend"]["evidence"],
+        )
 
     def test_execution_backend_mutant_switch_selects_switch_execution(self) -> None:
         self.source.write_text("int main() { return 1 == 1 ? 0 : 1; }\n")

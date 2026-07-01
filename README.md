@@ -104,6 +104,10 @@ fallback.
 This is intentionally not advertised as Mull-equivalent LLVM IR mutation yet:
 native reports include `parity` / `execution.parity` metadata that calls out the
 remaining IR/object instrumentation gap and the evidence available for each run.
+`execution.llvmSwitch.instrumentation` is the contract that keeps this honest:
+current guarded-source switch runs report `kind=guarded-source-switch`,
+`irMutation=false`, and `objectInstrumentation=false`; only a future true
+LLVM IR/object backend should make the `llvm-mull-backend` parity item covered.
 
 Compiled backends currently support CMake/CTest targets:
 
