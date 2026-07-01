@@ -89,6 +89,9 @@ class CliContractTests(unittest.TestCase):
         self.assertTrue(payload["execution"]["initialTest"])
         self.assertEqual(payload["execution"]["mode"], "token")
         self.assertEqual(payload["execution"]["analysis"]["engine"], "token")
+        self.assertEqual(payload["execution"]["analysis"]["sourcePrecision"]["schemaVersion"], "stryker-cxx.source-precision.v1")
+        self.assertEqual(payload["execution"]["analysis"]["sourcePrecision"]["totalMutants"], 1)
+        self.assertEqual(payload["execution"]["analysis"]["sourcePrecision"]["byKind"]["token-range"], 1)
         self.assertEqual(payload["execution"]["executionMode"], "source-overlay")
         self.assertEqual(payload["execution"]["requestedExecutionMode"], "source-overlay")
         self.assertFalse(payload["execution"]["mutantSwitch"]["enabled"])
@@ -118,6 +121,8 @@ class CliContractTests(unittest.TestCase):
         self.assertTrue(lifecycle_by_name["artifactRestoration"]["detail"]["restoreOriginals"])
         self.assertEqual(payload["mutationTestingElements"]["schemaVersion"], "2.0")
         first = payload["mutationTestingElements"]["files"]["sample.cpp"]["mutants"][0]
+        self.assertEqual(payload["mutants"][0]["sourcePrecision"]["kind"], "token-range")
+        self.assertEqual(first["sourcePrecision"]["kind"], "token-range")
         self.assertEqual(first["status"], "Survived")
         self.assertIn("stryker-cxx run-mutant", first["runCommand"])
         placement = payload["mutants"][0]["run"]["artifactPlacement"]
@@ -233,6 +238,162 @@ class CliContractTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1)
         self.assertIn("unknown config keys", result.stdout)
+
+    def test_execution_backend_llvm_switch_reports_explicit_fallback(self) -> None:
+        self.source.write_text("int main() { return 1 == 1 ? 0 : 1; }\n")
+        self._git("add", "sample.cpp")
+        self._git(
+            "-c",
+            "user.name=stryker-cxx",
+            "-c",
+            "user.email=stryker-cxx@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "llvm switch backend fixture",
+        )
+        report = self.repo / "llvm-switch-fallback.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "true",
+            "--report",
+            str(report),
+            "--max-mutants",
+            "1",
+            "--mutators",
+            "EqualityOperator",
+            "--execution-backend",
+            "llvm-switch",
+            "--threshold-break",
+            "0",
+            "--skip-initial-test",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        execution = payload["execution"]
+        self.assertEqual(execution["requestedExecutionBackend"], "llvm-switch")
+        self.assertEqual(execution["executionBackend"], "source-overlay")
+        self.assertIn("llvm-switch", execution["executionBackendFallbackReason"])
+
+    def test_execution_backend_llvm_switch_uses_guarded_switch_when_compile_database_matches(self) -> None:
+        self.source.write_text("int main() { return 1 == 1 ? 0 : 1; }\n")
+        compile_db = [
+            {
+                "directory": str(self.repo),
+                "command": "c++ -std=c++17 -c sample.cpp -o sample.o",
+                "file": str(self.source),
+                "output": str(self.repo / "sample.o"),
+            }
+        ]
+        (self.repo / "compile_commands.json").write_text(json.dumps(compile_db))
+        self._git("add", "sample.cpp", "compile_commands.json")
+        self._git(
+            "-c",
+            "user.name=stryker-cxx",
+            "-c",
+            "user.email=stryker-cxx@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "llvm switch compile database fixture",
+        )
+        report = self.repo / "llvm-switch-guarded.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "printf build >> build-count.txt && c++ -std=c++17 sample.cpp -o sample",
+            "--test-command",
+            "printf test >> test-count.txt && ./sample",
+            "--report",
+            str(report),
+            "--max-mutants",
+            "1",
+            "--mutators",
+            "EqualityOperator",
+            "--execution-backend",
+            "llvm-switch",
+            "--threshold-break",
+            "0",
+            "--skip-initial-test",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual((self.repo / "build-count.txt").read_text(), "build")
+        self.assertEqual((self.repo / "test-count.txt").read_text(), "test")
+        payload = json.loads(report.read_text())
+        execution = payload["execution"]
+        self.assertEqual(execution["requestedExecutionBackend"], "llvm-switch")
+        self.assertEqual(execution["executionBackend"], "llvm-switch")
+        self.assertIsNone(execution["executionBackendFallbackReason"])
+        self.assertEqual(execution["executionMode"], "mutant-switch")
+        self.assertTrue(execution["llvmSwitch"]["enabled"])
+        self.assertEqual(execution["llvmSwitch"]["implementation"], "guarded-source-switch")
+        self.assertTrue(execution["mutantSwitch"]["enabled"])
+        self.assertEqual(execution["singleCompile"]["builds"], 1)
+        self.assertEqual(payload["mutants"][0]["resultSource"], "mutant-switch")
+
+    def test_execution_backend_mutant_switch_selects_switch_execution(self) -> None:
+        self.source.write_text("int main() { return 1 == 1 ? 0 : 1; }\n")
+        self._git("add", "sample.cpp")
+        self._git(
+            "-c",
+            "user.name=stryker-cxx",
+            "-c",
+            "user.email=stryker-cxx@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "mutant switch backend fixture",
+        )
+        report = self.repo / "mutant-switch-backend.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "true",
+            "--report",
+            str(report),
+            "--max-mutants",
+            "1",
+            "--mutators",
+            "EqualityOperator",
+            "--execution-backend",
+            "mutant-switch",
+            "--threshold-break",
+            "0",
+            "--skip-initial-test",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        execution = payload["execution"]
+        self.assertEqual(execution["requestedExecutionBackend"], "mutant-switch")
+        self.assertEqual(execution["executionBackend"], "mutant-switch")
+        self.assertEqual(execution["executionMode"], "mutant-switch")
+        self.assertTrue(execution["mutantSwitch"]["enabled"])
 
     def test_execution_mode_mutant_switch_reports_source_overlay_fallback(self) -> None:
         self.source.write_text("struct Node { int value; }; int main() { Node node{1}; return node.value; }\n")
@@ -2710,6 +2871,13 @@ class CliContractTests(unittest.TestCase):
         self.assertTrue(compile_database["present"])
         self.assertEqual(compile_database["fileEntries"][0]["file"], "sample.cpp")
         self.assertEqual(compile_database["fileEntries"][0]["output"], "sample.o")
+        build_graph = payload["projectAnalysis"]["buildGraph"]
+        self.assertEqual(build_graph["schemaVersion"], "stryker-cxx.build-graph.v1")
+        self.assertEqual(build_graph["ownershipModel"], "compile-database")
+        self.assertEqual(build_graph["compileDatabase"]["matchedTargetFiles"], ["sample.cpp"])
+        self.assertEqual(build_graph["compileDatabase"]["missingTargetFiles"], [])
+        self.assertEqual(build_graph["sourceNodes"][0]["ownershipKind"], "compile-database-unit")
+        self.assertEqual(build_graph["sourceNodes"][0]["compileOutput"], "sample.o")
         source_target = payload["projectAnalysis"]["sourceTargets"][0]
         self.assertTrue(source_target["compileDatabaseMatched"])
         self.assertEqual(source_target["compileDirectory"], ".")
@@ -6536,7 +6704,12 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(payload["provenance"]["upload"]["status"], "disabled")
         self.assertIn(payload["thresholdStatus"], {"high", "low", "break"})
         self.assertEqual(payload["counts"]["totalMutants"], 1)
+        self.assertEqual(payload["analysis"]["sourcePrecision"]["schemaVersion"], "stryker-cxx.source-precision.v1")
+        self.assertEqual(payload["analysis"]["sourcePrecision"]["totalMutants"], 1)
+        self.assertEqual(payload["projectAnalysis"]["buildGraph"]["schemaVersion"], "stryker-cxx.build-graph.v1")
+        self.assertIn("ownershipModel", payload["projectAnalysis"]["buildGraph"])
         native = json.loads(report.read_text())
+        self.assertEqual(native["mutationTestingElements"]["strykerCxx"]["sourcePrecision"]["totalMutants"], 1)
         export = native["execution"]["dashboard"]["export"]
         self.assertTrue(export["enabled"])
         self.assertEqual(export["path"], str(dashboard))
@@ -6657,6 +6830,90 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(payload["mutants"][0]["status"], "SURVIVED")
         mte = payload["mutationTestingElements"]["files"]["sample.cpp"]["mutants"][0]
         self.assertEqual(mte["coveredBy"], ["MathTest.Basic"])
+
+    def test_coverage_analysis_off_disables_coverage_classification(self) -> None:
+        report = self.repo / "coverage-off.json"
+        coverage = self.repo / "coverage-off-input.json"
+        coverage.write_text(json.dumps({"files": {"sample.cpp": {"coveredLines": []}}}))
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "true",
+            "--coverage-file",
+            str(coverage),
+            "--coverage-analysis",
+            "off",
+            "--skip-initial-test",
+            "--report",
+            str(report),
+            "--max-mutants",
+            "1",
+            "--threshold-break",
+            "0",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["coverage"]["analysis"], "off")
+        self.assertEqual(payload["noCoverage"], 0)
+        self.assertEqual(payload["coverage"]["noCoverageMutants"], 0)
+        self.assertEqual(payload["coverage"]["unknownCoverageMutants"], 0)
+        self.assertEqual(payload["mutants"][0]["run"]["coverageStatus"], "disabled")
+        self.assertEqual(payload["mutants"][0]["status"], "SURVIVED")
+
+    def test_coverage_analysis_all_skips_per_test_command_selection(self) -> None:
+        report = self.repo / "coverage-all.json"
+        coverage = self.repo / "coverage-all-input.json"
+        coverage.write_text(json.dumps({
+            "files": {
+                "sample.cpp": {
+                    "coveredLines": [1],
+                    "coveredTests": {"1": ["MathTest.Basic"]},
+                }
+            }
+        }))
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "true",
+            "--coverage-file",
+            str(coverage),
+            "--coverage-analysis",
+            "all",
+            "--coverage-test-command-template",
+            "test {first_test}",
+            "--skip-initial-test",
+            "--report",
+            str(report),
+            "--max-mutants",
+            "1",
+            "--threshold-break",
+            "0",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["coverage"]["analysis"], "all")
+        self.assertEqual(payload["coverage"]["coveredMutants"], 1)
+        self.assertEqual(payload["coverage"]["testSelectedMutants"], 0)
+        self.assertNotIn("selectedTestCommand", payload["mutants"][0]["run"])
+        self.assertEqual(payload["mutants"][0]["run"]["coverageStatus"], "covered")
 
     def test_batched_coverage_selection_uses_union_test_command(self) -> None:
         self.source.write_text(

@@ -33,6 +33,7 @@ const lintTargets = [
   resolve("scripts", "check-config-schema.mjs"),
   resolve("scripts", "check-docs-commands.mjs"),
   resolve("scripts", "check-package-contents.mjs"),
+  resolve("scripts", "compare-mull-parity.mjs"),
   resolve("scripts", "run-tests.mjs"),
   resolve("scripts", "validate-full-spec.mjs"),
 ].filter((path) => existsSync(path));

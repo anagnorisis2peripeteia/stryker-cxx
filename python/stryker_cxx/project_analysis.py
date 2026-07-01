@@ -49,6 +49,15 @@ def analyze_project(
         cmake_targets=cmake_targets,
     )
     confidence = _confidence(build_systems, compile_database, build_targets, test_targets)
+    build_graph = _build_graph(
+        repo_root,
+        target_files,
+        compile_database,
+        source_targets,
+        build_targets,
+        test_targets,
+        confidence,
+    )
     return {
         "schemaVersion": "stryker-cxx.project-analysis.v1",
         "confidence": confidence,
@@ -56,6 +65,7 @@ def analyze_project(
         "targetFiles": [_repo_relative(repo_root, path) for path in target_files],
         "buildSystems": build_systems,
         "compileDatabase": compile_database,
+        "buildGraph": build_graph,
         "sourceTargets": source_targets,
         "buildTargets": build_targets,
         "testTargets": test_targets,
@@ -225,6 +235,114 @@ def _source_targets(
         out.append(
             record
         )
+    return out
+
+
+def _build_graph(
+    repo: str,
+    target_files: list[str],
+    compile_database: dict[str, Any],
+    source_targets: list[dict[str, Any]],
+    build_targets: list[dict[str, Any]],
+    test_targets: list[dict[str, Any]],
+    confidence: str,
+) -> dict[str, Any]:
+    relative_targets = [_repo_relative(repo, path) for path in target_files]
+    matched_files = [
+        str(item.get("file"))
+        for item in source_targets
+        if item.get("compileDatabaseMatched") and item.get("file")
+    ]
+    missing_files = sorted(set(relative_targets) - set(matched_files))
+    source_nodes = [_build_graph_source_node(item) for item in source_targets]
+    build_target_nodes = [_build_graph_target_node(item) for item in build_targets]
+    test_target_nodes = [_build_graph_target_node(item) for item in test_targets]
+    diagnostics: list[dict[str, Any]] = []
+    if not compile_database.get("present"):
+        diagnostics.append(
+            {
+                "level": "info",
+                "code": "compile-database-missing",
+                "message": "compile_commands.json not found; source ownership uses explicit file scope and build-system metadata",
+            }
+        )
+    elif missing_files:
+        diagnostics.append(
+            {
+                "level": "warning",
+                "code": "compile-database-target-miss",
+                "message": "compile_commands.json does not cover every target file",
+                "files": missing_files,
+            }
+        )
+    if not any(node.get("buildTargets") for node in source_nodes):
+        diagnostics.append(
+            {
+                "level": "info",
+                "code": "build-target-ownership-missing",
+                "message": "no build target owns the selected source files; compiled-object ownership may require explicit artifact paths",
+            }
+        )
+    ownership_model = "explicit-source"
+    if matched_files and not missing_files:
+        ownership_model = "compile-database"
+    elif any(node.get("buildTargets") for node in source_nodes):
+        ownership_model = "build-system-targets"
+    elif compile_database.get("present"):
+        ownership_model = "partial-compile-database"
+    return {
+        "schemaVersion": "stryker-cxx.build-graph.v1",
+        "confidence": confidence,
+        "ownershipModel": ownership_model,
+        "compileDatabase": {
+            "present": bool(compile_database.get("present")),
+            "path": compile_database.get("path"),
+            "status": compile_database.get("status"),
+            "entries": compile_database.get("entries", 0),
+            "matchedTargetFiles": sorted(matched_files),
+            "missingTargetFiles": missing_files,
+        },
+        "sourceNodes": source_nodes,
+        "buildTargetNodes": build_target_nodes,
+        "testTargetNodes": test_target_nodes,
+        "diagnostics": diagnostics,
+    }
+
+
+def _build_graph_source_node(item: dict[str, Any]) -> dict[str, Any]:
+    ownership = item.get("ownership") if isinstance(item.get("ownership"), dict) else {}
+    node = {
+        "file": item.get("file"),
+        "analysisKey": item.get("analysisKey"),
+        "ownershipKey": ownership.get("key"),
+        "ownershipKind": ownership.get("kind"),
+        "ownershipSource": ownership.get("source"),
+        "confidence": ownership.get("confidence") or item.get("confidence"),
+        "buildTargets": list(ownership.get("buildTargets") or item.get("owningBuildTargets") or []),
+        "compileDatabaseMatched": bool(item.get("compileDatabaseMatched")),
+    }
+    if item.get("compileDirectory") is not None:
+        node["compileDirectory"] = item.get("compileDirectory")
+    if item.get("compileOutput") is not None:
+        node["compileOutput"] = item.get("compileOutput")
+    if item.get("compileCommand") is not None:
+        node["compileCommand"] = item.get("compileCommand")
+    if item.get("compileArguments") is not None:
+        node["compileArguments"] = item.get("compileArguments")
+    return node
+
+
+def _build_graph_target_node(item: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "name": item.get("name"),
+        "kind": item.get("kind"),
+        "source": item.get("source"),
+        "confidence": item.get("confidence"),
+        "analysisKey": item.get("analysisKey"),
+    }
+    for key in ("sourceFiles", "dependencies", "relatedBuildTarget", "command"):
+        if item.get(key) is not None:
+            out[key] = item.get(key)
     return out
 
 

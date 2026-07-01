@@ -31,6 +31,7 @@
     "evidence:p0": "node scripts/check-p0-evidence.mjs",
     "evidence:p1": "node scripts/check-p1-evidence.mjs",
     "evidence:p2": "node scripts/check-p2-evidence.mjs",
+    "compare:mull": "node scripts/compare-mull-parity.mjs",
     "validate:full-spec": "node scripts/validate-full-spec.mjs",
     "lint": "node scripts/lint.mjs",
     "release:dry-run": "npm publish --dry-run --provenance --access public",

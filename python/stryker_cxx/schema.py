@@ -105,6 +105,8 @@ def validate_report(payload: dict[str, Any]) -> list[str]:
             "mode",
             "executionMode",
             "requestedExecutionMode",
+            "executionBackend",
+            "requestedExecutionBackend",
             "artifactBackend",
             "requestedArtifactBackend",
             "artifactFallback",
@@ -125,6 +127,28 @@ def validate_report(payload: dict[str, Any]) -> list[str]:
             value = exec_ctx.get(key)
             if isinstance(value, str) and value not in ARTIFACT_BACKENDS:
                 errors.append(_collect(f"execution.{key}", f"unexpected backend {value!r}"))
+        for key in ("executionBackend", "requestedExecutionBackend"):
+            value = exec_ctx.get(key)
+            if isinstance(value, str) and value not in {"auto", "source-overlay", "mutant-switch", "compiled-artifact", "llvm-switch"}:
+                errors.append(_collect(f"execution.{key}", f"unexpected backend {value!r}"))
+        if "executionBackendFallbackReason" in exec_ctx and not isinstance(
+            exec_ctx.get("executionBackendFallbackReason"),
+            (str, type(None)),
+        ):
+            errors.append(_collect("execution.executionBackendFallbackReason", "expected string or null"))
+        llvm_switch = exec_ctx.get("llvmSwitch")
+        if llvm_switch is not None:
+            if not isinstance(llvm_switch, dict):
+                errors.append(_collect("execution.llvmSwitch", "expected object"))
+            else:
+                for key in ("enabled", "requested"):
+                    if key in llvm_switch and not isinstance(llvm_switch.get(key), bool):
+                        errors.append(_collect(f"execution.llvmSwitch.{key}", "expected boolean"))
+                if "fallbackReason" in llvm_switch and not isinstance(
+                    llvm_switch.get("fallbackReason"),
+                    (str, type(None)),
+                ):
+                    errors.append(_collect("execution.llvmSwitch.fallbackReason", "expected string or null"))
         fallback = exec_ctx.get("artifactFallback")
         if isinstance(fallback, str) and fallback not in ARTIFACT_FALLBACKS:
             errors.append(_collect("execution.artifactFallback", f"unexpected fallback {fallback!r}"))
@@ -563,6 +587,18 @@ def validate_report(payload: dict[str, Any]) -> list[str]:
             compile_db = project_analysis.get("compileDatabase")
             if compile_db is not None and not isinstance(compile_db, dict):
                 errors.append(_collect("projectAnalysis.compileDatabase", "expected object"))
+            build_graph = project_analysis.get("buildGraph")
+            if build_graph is not None:
+                if not isinstance(build_graph, dict):
+                    errors.append(_collect("projectAnalysis.buildGraph", "expected object"))
+                else:
+                    if "schemaVersion" in build_graph and not isinstance(build_graph.get("schemaVersion"), str):
+                        errors.append(_collect("projectAnalysis.buildGraph.schemaVersion", "expected string"))
+                    if "ownershipModel" in build_graph and not isinstance(build_graph.get("ownershipModel"), str):
+                        errors.append(_collect("projectAnalysis.buildGraph.ownershipModel", "expected string"))
+                    for key in ("sourceNodes", "buildTargetNodes", "testTargetNodes", "diagnostics"):
+                        if key in build_graph and not isinstance(build_graph.get(key), list):
+                            errors.append(_collect(f"projectAnalysis.buildGraph.{key}", "expected array"))
             commands = project_analysis.get("commands")
             if commands is not None and not isinstance(commands, dict):
                 errors.append(_collect("projectAnalysis.commands", "expected object"))

@@ -52,6 +52,7 @@ run("npm", ["run", "schema:check"]);
 run("npm", ["run", "evidence:p0"]);
 run("npm", ["run", "evidence:p1"]);
 run("npm", ["run", "evidence:p2"]);
+run("npm", ["run", "compare:mull"]);
 run("npm", ["run", "package:check"]);
 run("git", ["diff", "--check"]);
 

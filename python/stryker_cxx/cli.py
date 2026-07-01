@@ -32,6 +32,7 @@ SENSITIVE_KEY_RE = re.compile(
     re.IGNORECASE,
 )
 EXECUTION_MODES = {"source-overlay", "mutant-switch"}
+EXECUTION_BACKENDS = {"auto", "source-overlay", "mutant-switch", "compiled-artifact", "llvm-switch"}
 SHELL_ASSIGNMENT_RE = re.compile(
     r"(?P<prefix>(^|[\s;])(?:export\s+)?)"
     r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)="
@@ -57,6 +58,7 @@ thresholds:
 execution:
   mode: token
   executionMode: source-overlay
+  executionBackend: auto
   equivalentSuppression: conservative
   buildSystem: cmake
   buildDir: build
@@ -249,6 +251,8 @@ CONFIG_ALLOWED_TOP_LEVEL = {
     "mutationArtifact",
     "report",
     "coverageFile",
+    "coverageAnalysis",
+    "executionBackend",
     "coverageProvider",
     "coverageHelperCommandTemplate",
     "coverageHelperTests",
@@ -292,6 +296,7 @@ CONFIG_ALLOWED_NESTED = {
         "envBlock",
         "mode",
         "executionMode",
+        "executionBackend",
         "jobs",
         "worktreeMode",
         "workTreeMode",
@@ -302,6 +307,7 @@ CONFIG_ALLOWED_NESTED = {
         "dryRunOnly",
         "skipTests",
         "coverageFile",
+        "coverageAnalysis",
         "coverageProvider",
         "coverageTestCommandTemplate",
         "coverageHelperCommandTemplate",
@@ -872,6 +878,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--format", choices=["json", "markdown", "html", "sarif", "github-annotations", "mutation-testing-elements"], default="json")
     run.add_argument("--mode", choices=["token", "clang", "clang-ast"], default=None)
     run.add_argument("--execution-mode", choices=sorted(EXECUTION_MODES), default=None, dest="execution_mode")
+    run.add_argument("--execution-backend", choices=sorted(EXECUTION_BACKENDS), default=None, dest="execution_backend")
     run.add_argument("--equivalent-suppression", choices=["off", "conservative", "aggressive"], default=None, dest="equivalent_suppression")
     run.add_argument("--jobs", type=int, default=None, help="Parallel mutant execution with isolated worktrees.")
     run.add_argument("--batch-mutants", action="store_true", dest="batch_mutants")
@@ -892,6 +899,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--dry-run-only", action="store_true", dest="dry_run_only")
     run.add_argument("--skip-tests", action="store_true", dest="skip_tests")
     run.add_argument("--coverage-file", default=None, dest="coverage_file")
+    run.add_argument("--coverage-analysis", default=None, choices=["off", "all", "perTest", "perTestInIsolation"], dest="coverage_analysis")
     run.add_argument("--coverage-provider", default=None, dest="coverage_provider")
     run.add_argument("--coverage-test-command-template", default=None, dest="coverage_test_command_template")
     run.add_argument("--coverage-helper-command-template", default=None, dest="coverage_helper_command_template")
@@ -1012,6 +1020,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_mutant.add_argument("--dry-run-only", action="store_true", dest="dry_run_only")
     run_mutant.add_argument("--skip-tests", action="store_true", dest="skip_tests")
     run_mutant.add_argument("--coverage-file", default=None, dest="coverage_file")
+    run_mutant.add_argument("--coverage-analysis", default=None, choices=["off", "all", "perTest", "perTestInIsolation"], dest="coverage_analysis")
     run_mutant.add_argument("--coverage-provider", default=None, dest="coverage_provider")
     run_mutant.add_argument("--coverage-test-command-template", default=None, dest="coverage_test_command_template")
     run_mutant.add_argument("--coverage-helper-command-template", default=None, dest="coverage_helper_command_template")
@@ -1069,6 +1078,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_mutant.add_argument("--threshold-break", type=float, default=None, dest="threshold_break")
     run_mutant.add_argument("--mode", choices=["token", "clang", "clang-ast"], default=None)
     run_mutant.add_argument("--execution-mode", choices=sorted(EXECUTION_MODES), default=None, dest="execution_mode")
+    run_mutant.add_argument("--execution-backend", choices=sorted(EXECUTION_BACKENDS), default=None, dest="execution_backend")
     run_mutant.add_argument("--equivalent-suppression", choices=["off", "conservative", "aggressive"], default=None, dest="equivalent_suppression")
     run_mutant.add_argument("--artifact-backend", choices=["source-overlay", "compiled-executable", "compiled-library", "compiled-object"], default=None, dest="artifact_backend")
     run_mutant.add_argument("--artifact-fallback", choices=["none", "source-overlay"], default=None, dest="artifact_fallback")
@@ -1408,6 +1418,12 @@ def _resolve_defaults(args: argparse.Namespace) -> dict[str, Any]:
         "dry_run_only": bool(getattr(args, "dry_run_only", False) or execution.get("dryRunOnly", False)),
         "skip_tests": bool(getattr(args, "skip_tests", False) or execution.get("skipTests", False)),
         "coverage_file": getattr(args, "coverage_file", None) or execution.get("coverageFile") or cfg.get("coverageFile"),
+        "coverage_analysis": (
+            getattr(args, "coverage_analysis", None)
+            or execution.get("coverageAnalysis")
+            or cfg.get("coverageAnalysis")
+            or "perTest"
+        ),
         "coverage_provider": getattr(args, "coverage_provider", None) or execution.get("coverageProvider") or cfg.get("coverageProvider"),
         "coverage_test_command_template": getattr(args, "coverage_test_command_template", None) or execution.get("coverageTestCommandTemplate"),
         "coverage_helper_command_template": (
@@ -1495,6 +1511,11 @@ def _resolve_defaults(args: argparse.Namespace) -> dict[str, Any]:
             if getattr(args, "execution_mode", None) is not None
             else execution.get("executionMode", "source-overlay")
         ),
+        "execution_backend": (
+            getattr(args, "execution_backend", None)
+            if getattr(args, "execution_backend", None) is not None
+            else execution.get("executionBackend", "auto")
+        ),
         "equivalent_suppression": (
             getattr(args, "equivalent_suppression", None)
             or execution.get("equivalentSuppression", "conservative")
@@ -1568,6 +1589,11 @@ def _resolve_defaults(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--timeout-constant-ms must be >= 0")
     if defaults["execution_mode"] not in EXECUTION_MODES:
         raise ValueError("--execution-mode must be one of: mutant-switch, source-overlay")
+    if defaults["execution_backend"] not in EXECUTION_BACKENDS:
+        raise ValueError(
+            "--execution-backend must be one of: "
+            + ", ".join(sorted(EXECUTION_BACKENDS))
+        )
     if defaults["dry_run_only"] and defaults["skip_initial_test"]:
         raise ValueError("--dry-run-only cannot be combined with --skip-initial-test")
 
@@ -1680,6 +1706,8 @@ def _run(args: argparse.Namespace) -> int:
         legacy_args.extend(["--mode", str(cfg["mode"])])
     if cfg["execution_mode"] is not None:
         legacy_args.extend(["--execution-mode", str(cfg["execution_mode"])])
+    if cfg["execution_backend"] is not None:
+        legacy_args.extend(["--execution-backend", str(cfg["execution_backend"])])
     if cfg["equivalent_suppression"]:
         legacy_args.extend(["--equivalent-suppression", str(cfg["equivalent_suppression"])])
     if cfg["jobs"] is not None:
@@ -1752,6 +1780,8 @@ def _run(args: argparse.Namespace) -> int:
         legacy_args.append("--skip-tests")
     if cfg["coverage_file"]:
         legacy_args.extend(["--coverage-file", cfg["coverage_file"]])
+    if cfg["coverage_analysis"]:
+        legacy_args.extend(["--coverage-analysis", cfg["coverage_analysis"]])
     if cfg["coverage_provider"]:
         legacy_args.extend(["--coverage-provider", cfg["coverage_provider"]])
     if cfg["coverage_test_command_template"]:
@@ -1928,6 +1958,8 @@ def _run_mutant(args: argparse.Namespace) -> int:
         legacy_args.extend(["--mode", str(cfg["mode"])])
     if cfg["execution_mode"] is not None:
         legacy_args.extend(["--execution-mode", str(cfg["execution_mode"])])
+    if cfg["execution_backend"] is not None:
+        legacy_args.extend(["--execution-backend", str(cfg["execution_backend"])])
     if cfg["equivalent_suppression"]:
         legacy_args.extend(["--equivalent-suppression", str(cfg["equivalent_suppression"])])
     if cfg["jobs"] is not None:
@@ -1994,6 +2026,8 @@ def _run_mutant(args: argparse.Namespace) -> int:
         legacy_args.append("--skip-tests")
     if cfg["coverage_file"]:
         legacy_args.extend(["--coverage-file", cfg["coverage_file"]])
+    if cfg["coverage_analysis"]:
+        legacy_args.extend(["--coverage-analysis", cfg["coverage_analysis"]])
     if cfg["coverage_provider"]:
         legacy_args.extend(["--coverage-provider", cfg["coverage_provider"]])
     if cfg["coverage_test_command_template"]:

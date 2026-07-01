@@ -2,6 +2,7 @@
 fixtures/adapters/make/math_test
 fixtures/adapters/ninja/math_test
 fixtures/adapters/ninja/.ninja_log
+agent_space/
 
 # Generic build/test noise
 *.o

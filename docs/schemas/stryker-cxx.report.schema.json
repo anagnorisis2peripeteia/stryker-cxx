@@ -51,6 +51,9 @@
         "mode": { "type": "string" },
         "executionMode": { "enum": ["source-overlay", "mutant-switch"] },
         "requestedExecutionMode": { "enum": ["source-overlay", "mutant-switch"] },
+        "executionBackend": { "enum": ["auto", "source-overlay", "mutant-switch", "compiled-artifact", "llvm-switch"] },
+        "requestedExecutionBackend": { "enum": ["auto", "source-overlay", "mutant-switch", "compiled-artifact", "llvm-switch"] },
+        "executionBackendFallbackReason": { "type": ["string", "null"] },
         "artifactBackend": {
           "enum": ["source-overlay", "compiled-executable", "compiled-library", "compiled-object"]
         },
@@ -65,6 +68,7 @@
             "engine": { "type": "string" },
             "macroRejectedMutants": { "type": "integer", "minimum": 0 },
             "macroRejections": { "type": "array" },
+            "sourcePrecision": { "type": "object" },
             "equivalentSuppression": {
               "type": "object",
               "properties": {
@@ -106,6 +110,20 @@
             "runtimeGuardCount": { "type": "integer", "minimum": 0 },
             "builds": { "type": "integer", "minimum": 0 },
             "checks": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "llvmSwitch": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "requested": { "type": "boolean" },
+            "implementation": { "type": "string" },
+            "fallbackReason": { "type": ["string", "null"] },
+            "activationEnvironment": { "type": ["string", "null"] },
+            "requires": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
           }
         },
         "dashboard": {
@@ -319,6 +337,31 @@
           }
         },
         "compileDatabase": { "type": "object" },
+        "buildGraph": {
+          "type": "object",
+          "properties": {
+            "schemaVersion": { "type": "string" },
+            "confidence": { "type": "string" },
+            "ownershipModel": { "type": "string" },
+            "compileDatabase": { "type": "object" },
+            "sourceNodes": {
+              "type": "array",
+              "items": { "type": "object" }
+            },
+            "buildTargetNodes": {
+              "type": "array",
+              "items": { "type": "object" }
+            },
+            "testTargetNodes": {
+              "type": "array",
+              "items": { "type": "object" }
+            },
+            "diagnostics": {
+              "type": "array",
+              "items": { "type": "object" }
+            }
+          }
+        },
         "sourceTargets": {
           "type": "array",
           "items": {

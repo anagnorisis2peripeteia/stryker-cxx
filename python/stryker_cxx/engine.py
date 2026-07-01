@@ -720,6 +720,7 @@ RETAINABLE_STATUSES = FATAL_STATUSES | {"RUNTIME_ERROR", "PENDING"}
 COMPILE_PRUNED_STATUSES = {"BUILD_ERROR", "CHECK_ERROR"}
 ARTIFACT_BACKENDS = {"source-overlay", "compiled-executable", "compiled-library", "compiled-object"}
 EXECUTION_MODES = {"source-overlay", "mutant-switch"}
+EXECUTION_BACKENDS = {"auto", "source-overlay", "mutant-switch", "compiled-artifact", "llvm-switch"}
 MUTANT_SWITCH_ACTIVE_ENV = "STRYKER_CXX_ACTIVE_MUTANT"
 MUTANT_SWITCH_EXPRESSION_MUTATORS = {
     "BooleanLiteral",
@@ -4057,6 +4058,75 @@ def _mutant_switch_fallback_reason(repo: str, mutants: list[Mutant], args: argpa
     return _mutant_switch_edit_fallback_reason(repo, mutants)
 
 
+def _implied_execution_backend(execution_mode: str, artifact_backend: str) -> str:
+    if artifact_backend != "source-overlay":
+        return "compiled-artifact"
+    if execution_mode == "mutant-switch":
+        return "mutant-switch"
+    return "source-overlay"
+
+
+def _resolve_execution_backend(
+    requested_backend: str,
+    execution_mode: str,
+    artifact_backend: str,
+    mutant_switch_fallback_reason: str | None = None,
+) -> tuple[str, str | None]:
+    implied = _implied_execution_backend(execution_mode, artifact_backend)
+    if requested_backend == "auto":
+        return implied, None
+    if requested_backend == "llvm-switch":
+        if execution_mode == "mutant-switch" and mutant_switch_fallback_reason is None:
+            return "llvm-switch", None
+        return (
+            implied,
+            mutant_switch_fallback_reason
+            or f"llvm-switch backend is experimental and unavailable; using {implied}",
+        )
+    if requested_backend == "compiled-artifact":
+        if artifact_backend == "source-overlay":
+            return (
+                implied,
+                "compiled-artifact backend requires --artifact-backend compiled-executable, "
+                "compiled-library, or compiled-object; using source-overlay",
+            )
+        return implied, None
+    if requested_backend == "mutant-switch":
+        if implied == "mutant-switch":
+            return implied, None
+        reason = mutant_switch_fallback_reason or "mutant-switch backend could not create a guarded artifact"
+        return implied, reason
+    if requested_backend == "source-overlay":
+        if implied == "source-overlay":
+            return implied, None
+        return implied, f"source-overlay backend requested but {implied} backend is active"
+    return implied, None
+
+
+def _llvm_switch_project_fallback_reason(project_analysis: dict[str, Any] | None) -> str | None:
+    if not isinstance(project_analysis, dict):
+        return "llvm-switch requires project analysis evidence"
+    build_graph = project_analysis.get("buildGraph")
+    compile_database = project_analysis.get("compileDatabase")
+    build_systems = project_analysis.get("buildSystems")
+    if isinstance(build_graph, dict):
+        graph_compile_database = build_graph.get("compileDatabase")
+        if isinstance(graph_compile_database, dict) and graph_compile_database.get("present"):
+            return None
+        ownership_model = str(build_graph.get("ownershipModel", ""))
+        if ownership_model in {"compile-database", "build-system-targets", "partial-compile-database"}:
+            return None
+    if isinstance(compile_database, dict) and compile_database.get("present"):
+        return None
+    if isinstance(build_systems, list):
+        for item in build_systems:
+            if not isinstance(item, dict):
+                continue
+            if item.get("name") in {"cmake", "ctest", "compile-database"}:
+                return None
+    return "llvm-switch requires compile_commands.json or CMake/CTest ownership evidence"
+
+
 def _mutant_switch_span_mutated_expression(mut: Mutant, col: int, original_text: str) -> str | None:
     if mut.mutator in MUTANT_SWITCH_EXPRESSION_MUTATORS:
         return mut.mutated
@@ -4752,6 +4822,8 @@ def _baseline_config_hash(args: argparse.Namespace, enabled: list[str]) -> str:
             "testCommand": args.test_cmd,
             "skipTests": args.skip_tests,
             "coverageFile": args.coverage_file,
+            "coverageAnalysis": args.coverage_analysis,
+            "executionBackend": getattr(args, "execution_backend", "auto"),
             "coverageProvider": args.coverage_provider,
             "coverageTestCommandTemplate": args.coverage_test_command_template,
             "coverageHelperCommandTemplate": args.coverage_helper_command_template,
@@ -5979,7 +6051,85 @@ def _normalize_mutant_record(mut: dict[str, Any] | Mutant) -> dict[str, Any]:
             rec["ignoreReason"] = rec.get("detail", "")
         if rec.get("ignoreReason") and not rec.get("detail"):
             rec["detail"] = rec["ignoreReason"]
+    rec.setdefault("sourcePrecision", _source_precision_for_record(rec))
     return rec
+
+
+def _source_precision_for_record(mut: dict[str, Any]) -> dict[str, Any]:
+    strategy = str(mut.get("rewriteStrategy", "") or "")
+    node_kind = str(mut.get("nodeKind", "") or "")
+    source_range = mut.get("sourceRange")
+    has_range = isinstance(source_range, dict) and bool(source_range)
+    range_kind = str(source_range.get("kind", "") or "") if isinstance(source_range, dict) else ""
+    if strategy.startswith("clang-ast-direct"):
+        kind = "ast-direct"
+        confidence = "high"
+    elif strategy == "clang-confirmed-token" or node_kind:
+        kind = "ast-confirmed-token"
+        confidence = "medium"
+    elif has_range and strategy.startswith("token-"):
+        kind = "token-range"
+        confidence = "medium"
+    elif has_range:
+        kind = "source-range"
+        confidence = "medium"
+    else:
+        kind = "token-only"
+        confidence = "low"
+    return {
+        "kind": kind,
+        "confidence": confidence,
+        "rewriteStrategy": strategy,
+        "nodeKind": node_kind,
+        "hasSourceRange": has_range,
+        "sourceRangeKind": range_kind,
+    }
+
+
+def _source_precision_summary(mutants: list[dict[str, Any]]) -> dict[str, Any]:
+    by_kind: dict[str, int] = {}
+    by_strategy: dict[str, int] = {}
+    by_range_kind: dict[str, int] = {}
+    ranged = 0
+    ast_direct = 0
+    token_only = 0
+    for mut in mutants:
+        precision = mut.get("sourcePrecision") if isinstance(mut.get("sourcePrecision"), dict) else _source_precision_for_record(mut)
+        kind = str(precision.get("kind", "token-only"))
+        strategy = str(precision.get("rewriteStrategy", "") or "")
+        range_kind = str(precision.get("sourceRangeKind", "") or "")
+        by_kind[kind] = by_kind.get(kind, 0) + 1
+        if strategy:
+            by_strategy[strategy] = by_strategy.get(strategy, 0) + 1
+        if range_kind:
+            by_range_kind[range_kind] = by_range_kind.get(range_kind, 0) + 1
+        if precision.get("hasSourceRange"):
+            ranged += 1
+        if kind == "ast-direct":
+            ast_direct += 1
+        if kind == "token-only":
+            token_only += 1
+    diagnostics = []
+    if token_only:
+        diagnostics.append(
+            {
+                "level": "info",
+                "code": "token-only-mutants-present",
+                "message": "some mutants do not have a sourceRange; use clang-ast where source-range proof is required",
+                "count": token_only,
+            }
+        )
+    return {
+        "schemaVersion": "stryker-cxx.source-precision.v1",
+        "totalMutants": len(mutants),
+        "withSourceRange": ranged,
+        "astDirectMutants": ast_direct,
+        "tokenOnlyMutants": token_only,
+        "byKind": dict(sorted(by_kind.items())),
+        "byRewriteStrategy": dict(sorted(by_strategy.items())),
+        "bySourceRangeKind": dict(sorted(by_range_kind.items())),
+        "diagnostics": diagnostics,
+    }
 
 
 def _apply_shard(mutants: list[Mutant], shard_index: int | None, shard_total: int | None) -> list[Mutant]:
@@ -6127,6 +6277,12 @@ def _report_dict(rep: Report, repo: str | None = None, base: str | None = None,
         execution["analysis"] = {"engine": execution.get("mode", "token")}
     elif "engine" not in execution["analysis"]:
         execution["analysis"]["engine"] = execution.get("mode", "token")
+    existing_source_precision = execution["analysis"].get("sourcePrecision")
+    execution["analysis"]["sourcePrecision"] = (
+        _source_precision_summary(normalized_mutants)
+        if normalized_mutants or not isinstance(existing_source_precision, dict)
+        else existing_source_precision
+    )
     execution["testScheduler"] = _test_scheduler_metadata(rep, normalized_mutants)
     thresholds = dict(rep.thresholds or {})
     if "break" not in thresholds:
@@ -6478,6 +6634,8 @@ def _mutation_testing_elements(rep: Report) -> dict:
             "status": _mte_status(mut.get("status", "PENDING")),
             "statusReason": mut.get("detail", ""),
             "nodeKind": mut.get("nodeKind", ""),
+            "rewriteStrategy": mut.get("rewriteStrategy", ""),
+            "sourcePrecision": mut.get("sourcePrecision", {}),
             "runCommand": mut.get("run", {}).get("reproCommand") if isinstance(mut.get("run"), dict) else None,
             "location": {
                 "start": {"line": mut["line"], "column": start_col},
@@ -6509,6 +6667,16 @@ def _mutation_testing_elements(rep: Report) -> dict:
                 rep.execution.get("analysis", {}).get("engine")
                 if isinstance(rep.execution.get("analysis"), dict)
                 else rep.execution.get("mode", "token")
+            ),
+            "sourcePrecision": (
+                _source_precision_summary([_normalize_mutant_record(mut) for mut in rep.mutants])
+                if rep.mutants
+                else (
+                    rep.execution.get("analysis", {}).get("sourcePrecision")
+                    if isinstance(rep.execution.get("analysis"), dict)
+                    and isinstance(rep.execution.get("analysis", {}).get("sourcePrecision"), dict)
+                    else _source_precision_summary([])
+                )
             ),
         },
     }
@@ -6729,6 +6897,14 @@ def _format_github_annotations(rep: Report) -> str:
 
 def _dashboard_payload(rep: Report) -> dict[str, Any]:
     mutants = [_normalize_mutant_record(mut) for mut in rep.mutants]
+    analysis = rep.execution.get("analysis") if isinstance(rep.execution.get("analysis"), dict) else {}
+    source_precision = (
+        _source_precision_summary(mutants)
+        if mutants or not isinstance(analysis.get("sourcePrecision"), dict)
+        else analysis["sourcePrecision"]
+    )
+    project_analysis = rep.execution.get("projectAnalysis") if isinstance(rep.execution.get("projectAnalysis"), dict) else {}
+    build_graph = project_analysis.get("buildGraph") if isinstance(project_analysis.get("buildGraph"), dict) else {}
     dashboard = rep.execution.get("dashboard", {})
     if not isinstance(dashboard, dict):
         dashboard = {}
@@ -6797,6 +6973,26 @@ def _dashboard_payload(rep: Report) -> dict[str, Any]:
         "score": rep.score,
         "thresholds": rep.thresholds,
         "thresholdStatus": (rep.thresholds or {}).get("status") if isinstance(rep.thresholds, dict) else None,
+        "analysis": {
+            "engine": analysis.get("engine", rep.execution.get("mode", "token")),
+            "sourcePrecision": source_precision,
+        },
+        "projectAnalysis": {
+            "schemaVersion": project_analysis.get("schemaVersion"),
+            "confidence": project_analysis.get("confidence"),
+            "buildSystems": [
+                item.get("name")
+                for item in project_analysis.get("buildSystems") or []
+                if isinstance(item, dict) and item.get("name")
+            ],
+            "buildGraph": {
+                "schemaVersion": build_graph.get("schemaVersion"),
+                "confidence": build_graph.get("confidence"),
+                "ownershipModel": build_graph.get("ownershipModel"),
+                "compileDatabase": build_graph.get("compileDatabase"),
+                "diagnostics": build_graph.get("diagnostics", []),
+            },
+        },
         "summary": _summary(mutants),
         "counts": {
             "totalMutants": rep.total,
@@ -6816,6 +7012,9 @@ def _dashboard_payload(rep: Report) -> dict[str, Any]:
                 "mutator": mut.get("mutator"),
                 "status": mut.get("status"),
                 "resultSource": mut.get("resultSource", "executed"),
+                "rewriteStrategy": mut.get("rewriteStrategy"),
+                "nodeKind": mut.get("nodeKind"),
+                "sourcePrecision": mut.get("sourcePrecision"),
             }
             for mut in mutants
         ],
@@ -9031,6 +9230,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="Run build/check phases only and mark viable mutants as survived")
     ap.add_argument("--coverage-file", default=None,
                     help="Optional llvm-cov JSON, simple JSON, or LCOV file used to mark NO_COVERAGE mutants")
+    ap.add_argument("--coverage-analysis", default="perTest", choices=["off", "all", "perTest", "perTestInIsolation"],
+                    help="Stryker-style coverage mode: off, all, perTest, or perTestInIsolation")
     ap.add_argument("--coverage-provider", default=None)
     ap.add_argument("--coverage-test-command-template", default=None,
                     help="Optional command template for test-level coverage selection; supports {tests}, {tests_csv}, {tests_space}, {first_test}")
@@ -9083,6 +9284,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--artifact-backend", default="source-overlay", choices=sorted(ARTIFACT_BACKENDS))
     ap.add_argument("--artifact-fallback", default="none", choices=["none", "source-overlay"])
     ap.add_argument("--execution-mode", default="source-overlay", choices=sorted(EXECUTION_MODES))
+    ap.add_argument("--execution-backend", default="auto", choices=sorted(EXECUTION_BACKENDS))
     ap.add_argument("--worktree-mode", dest="worktree_mode", choices=["inplace", "git-worktree", "copy"], default="inplace")
     ap.add_argument("--allow-dirty", action="store_true")
     ap.add_argument("--output-format", default="legacy", choices=["legacy", "stryker-cxx"],
@@ -9292,9 +9494,16 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("cannot run parallel in-place mutation")
 
     artifact_root = args.artifact_dir or os.path.join(repo, "agent_space", "stryker-cxx")
-    requested_execution_mode = args.execution_mode
+    requested_execution_backend = args.execution_backend
+    requested_execution_mode = "mutant-switch" if requested_execution_backend in {"mutant-switch", "llvm-switch"} else args.execution_mode
     actual_execution_mode = requested_execution_mode
     mutant_switch_fallback_reason: str | None = None
+    actual_execution_backend, execution_backend_fallback_reason = _resolve_execution_backend(
+        requested_execution_backend,
+        actual_execution_mode,
+        args.artifact_backend,
+        mutant_switch_fallback_reason,
+    )
     rep = Report(
         target_files=files,
         repo=repo,
@@ -9309,6 +9518,9 @@ def main(argv: list[str] | None = None) -> int:
             "mode": args.mode,
             "executionMode": actual_execution_mode,
             "requestedExecutionMode": requested_execution_mode,
+            "executionBackend": actual_execution_backend,
+            "requestedExecutionBackend": requested_execution_backend,
+            "executionBackendFallbackReason": execution_backend_fallback_reason,
             "artifactBackend": args.artifact_backend,
             "requestedArtifactBackend": requested_artifact_backend,
             "artifactPath": args.artifact_path,
@@ -9337,6 +9549,16 @@ def main(argv: list[str] | None = None) -> int:
                 "fallbackReason": mutant_switch_fallback_reason,
                 "activationEnvironment": MUTANT_SWITCH_ACTIVE_ENV,
                 "runtimeGuardCount": 0,
+            },
+            "llvmSwitch": {
+                "enabled": False,
+                "requested": requested_execution_backend == "llvm-switch",
+                "implementation": "guarded-source-switch",
+                "fallbackReason": execution_backend_fallback_reason,
+                "requires": [
+                    "compile_commands.json or CMake/CTest ownership evidence",
+                    "mutant-switch guardable source ranges",
+                ],
             },
             "timeoutFactor": args.timeout_factor,
             "timeoutConstantMs": args.timeout_constant_ms,
@@ -9545,14 +9767,47 @@ def main(argv: list[str] | None = None) -> int:
     discovered = _apply_shard(discovered, args.shard_index, args.shard_total)
     if requested_execution_mode == "mutant-switch":
         mutant_switch_fallback_reason = _mutant_switch_fallback_reason(repo, discovered, args)
+        if requested_execution_backend == "llvm-switch":
+            llvm_switch_fallback_reason = _llvm_switch_project_fallback_reason(
+                rep.execution.get("projectAnalysis")
+            )
+            if llvm_switch_fallback_reason:
+                mutant_switch_fallback_reason = llvm_switch_fallback_reason
+            elif mutant_switch_fallback_reason:
+                mutant_switch_fallback_reason = (
+                    "llvm-switch guarded backend unavailable: "
+                    + mutant_switch_fallback_reason
+                )
         if mutant_switch_fallback_reason:
             actual_execution_mode = "source-overlay"
         else:
             actual_execution_mode = "mutant-switch"
         rep.execution["executionMode"] = actual_execution_mode
         rep.execution["requestedExecutionMode"] = requested_execution_mode
+        actual_execution_backend, execution_backend_fallback_reason = _resolve_execution_backend(
+            requested_execution_backend,
+            actual_execution_mode,
+            args.artifact_backend,
+            mutant_switch_fallback_reason,
+        )
+        rep.execution["executionBackend"] = actual_execution_backend
+        rep.execution["requestedExecutionBackend"] = requested_execution_backend
+        rep.execution["executionBackendFallbackReason"] = execution_backend_fallback_reason
         rep.execution["mutantSwitch"]["enabled"] = actual_execution_mode == "mutant-switch"
         rep.execution["mutantSwitch"]["fallbackReason"] = mutant_switch_fallback_reason
+        rep.execution["llvmSwitch"] = {
+            "enabled": actual_execution_backend == "llvm-switch",
+            "requested": requested_execution_backend == "llvm-switch",
+            "implementation": "guarded-source-switch",
+            "fallbackReason": execution_backend_fallback_reason,
+            "activationEnvironment": MUTANT_SWITCH_ACTIVE_ENV
+            if actual_execution_backend == "llvm-switch"
+            else None,
+            "requires": [
+                "compile_commands.json or CMake/CTest ownership evidence",
+                "mutant-switch guardable source ranges",
+            ],
+        }
         guards = []
         for mut in discovered:
             guard_id = mutant_switch_guard_id(mut)
@@ -9601,6 +9856,9 @@ def main(argv: list[str] | None = None) -> int:
     rep.execution["distribution"]["selectedMutants"] = len(discovered)
     _write_distribution_manifest(args.distribution_manifest, rep, discovered, args, worker_label)
     rep.total = len(discovered)
+    rep.execution["analysis"]["sourcePrecision"] = _source_precision_summary(
+        [_normalize_mutant_record(mut) for mut in discovered]
+    )
     if not args.quiet:
         print(f"[stryker-cxx] {rep.total} mutants across {len(files)} file(s)\n")
 
@@ -9633,20 +9891,28 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
 
-    coverage_map, coverage_tests, coverage_meta = _load_coverage(
-        repo,
-        args.coverage_file,
-        args.coverage_provider,
-        plugins,
-        artifact_root,
-        env_overrides,
-        env_inherit,
-        env_block,
-        args.coverage_helper_command_template,
-        coverage_helper_tests,
-    )
+    if args.coverage_analysis == "off":
+        coverage_map, coverage_tests, coverage_meta = {}, {}, {
+            "provider": None,
+            "analysis": "off",
+            "enabled": False,
+        }
+    else:
+        coverage_map, coverage_tests, coverage_meta = _load_coverage(
+            repo,
+            args.coverage_file,
+            args.coverage_provider,
+            plugins,
+            artifact_root,
+            env_overrides,
+            env_inherit,
+            env_block,
+            args.coverage_helper_command_template,
+            coverage_helper_tests,
+        )
     rep.coverage = {
         **coverage_meta,
+        "analysis": args.coverage_analysis,
         "coveredMutants": 0,
         "noCoverageMutants": 0,
         "unknownCoverageMutants": 0,
@@ -9843,7 +10109,9 @@ def main(argv: list[str] | None = None) -> int:
             rec["resultSource"] = "ignored"
             rep.mutants.append(rec)
             continue
-        if coverage_map:
+        if args.coverage_analysis == "off":
+            m.run["coverageStatus"] = "disabled"
+        elif coverage_map:
             covered = _covered_lines_for(coverage_map, repo, m.file)
             if covered is None:
                 m.run["coverageStatus"] = "unknown"
@@ -9862,7 +10130,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 m.run["coverageStatus"] = "covered"
                 rep.coverage["coveredMutants"] = int(rep.coverage.get("coveredMutants", 0)) + 1
-            if args.coverage_test_command_template:
+            if args.coverage_analysis in {"perTest", "perTestInIsolation"} and args.coverage_test_command_template:
                 tests = _covered_tests_for(coverage_tests, repo, m.file, m.line)
                 if tests:
                     m.run["coveredBy"] = tests

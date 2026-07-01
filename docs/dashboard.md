@@ -44,6 +44,9 @@ Dashboard payloads include:
 - `provenance.configHash` and `provenance.configPath`;
 - `score`, `thresholds`, and `thresholdStatus` for CI gating without
   recomputing threshold-band policy;
+- `analysis.sourcePrecision` for source-range confidence across native JSON,
+  MTE, and dashboard artifacts;
+- `projectAnalysis.buildGraph` ownership summary for source/build/test evidence;
 - explicit or environment-derived CI project, branch, commit, top-level
   `runId`, and build URL metadata;
 - upload auth metadata containing the env var/header names, never token values;

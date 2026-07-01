@@ -53,7 +53,8 @@ backend and mutation runs through compiled artifacts, is tracked in
 - `--check-command`
 - `--check-system clang-tidy|cppcheck`, `--check-args`
 - `--skip-tests`
-- `--coverage-file`, `--coverage-provider`
+- `--coverage-file`, `--coverage-analysis`, `--coverage-provider`
+- `--execution-backend auto|source-overlay|mutant-switch|compiled-artifact|llvm-switch`
 - `--coverage-helper-command-template`, `--coverage-helper-tests`
 - `--incremental`
 - `--baseline-file`, `--write-baseline`, `--clear-baseline`
@@ -357,9 +358,9 @@ Stryker-family ecosystem parity boundaries.
   materialization, including artifact swapping, restoration-by-hash, and
   compiled batch sessions.
 - Project analysis maps CMake/CTest, Ninja, Make, Meson, Bazel, and Xcode
-  fixture
-  sources to build targets, relates discovered test targets to the build target
-  they exercise where the build metadata exposes that relationship, and emits
+  fixture sources to build targets, relates discovered test targets to the build target,
+  emits `projectAnalysis.buildGraph` source/build/test node ownership evidence
+  where the build metadata exposes that relationship, and emits
   deterministic analysis/ownership keys for baseline and resume stability.
 - Explicit `--artifact-fallback source-overlay` downgrade for unsupported
   compiled-artifact requests, with requested/actual backend and fallback reason
@@ -1029,6 +1030,10 @@ Suggested model:
 
 `stryker-cxx` accepts supplied line coverage via simple JSON, `llvm-cov export`
 JSON, or LCOV and marks mutants outside covered lines as native `NO_COVERAGE`.
+`--coverage-analysis off|all|perTest|perTestInIsolation` names the Stryker-style
+coverage mode in reports. `off` disables coverage classification, `all` uses
+line coverage without per-test command selection, and the `perTest` modes enable
+per-mutant selected test commands when covering-test metadata is available.
 `stryker-cxx` accepts test-level coverage mappings in JSON coverage files and
 can select per-mutant test commands via `--coverage-test-command-template`.
 When test-level maps are not available up front, `stryker-cxx` can run a
@@ -1179,8 +1184,14 @@ Required behavior:
 Target CLI/config:
 
 - `--execution-mode source-overlay|mutant-switch` (default `source-overlay`);
+- `--execution-backend auto|source-overlay|mutant-switch|compiled-artifact|llvm-switch`
+  (default `auto`);
 - `execution.executionMode` in `mutation-testing-elements` and
   `stryker-cxx.report.v1`;
+- `execution.executionBackend`, `execution.requestedExecutionBackend`, and
+  `execution.executionBackendFallbackReason` in `stryker-cxx.report.v1`;
+- `execution.llvmSwitch` records whether the experimental guarded-source switch
+  backend was active and why it fell back when inactive;
 - `execution.mutantSwitch.enabled`;
 - `execution.mutantSwitch.fallbackReason`;
 - per-mutant `run.mutantSwitchEnabled` metadata;
@@ -1289,9 +1300,12 @@ Required behavior:
 The report should include:
 
 - `execution.analysis.engine = token|clang-confirmed|clang-ast`;
+- `execution.analysis.sourcePrecision` summarizes source-range confidence and
+  rewrite strategy coverage;
 - per-mutant `nodeKind`;
 - per-mutant `rewriteStrategy`;
 - per-mutant `sourceRange`;
+- per-mutant `sourcePrecision`;
 - `execution.analysis.macroRejectedMutants`;
 - `execution.analysis.macroRejections[]` diagnostics for candidates rejected
   because they overlap macro expansion ranges.

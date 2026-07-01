@@ -88,6 +88,13 @@ stryker-cxx run \
   --report mutation.json
 ```
 
+Use `--execution-backend auto|source-overlay|mutant-switch|compiled-artifact|llvm-switch`
+to record the requested execution backend separately from the artifact backend.
+`llvm-switch` is experimental: when compile-database or CMake/CTest ownership
+evidence is available and every selected mutant is guardable, it uses the
+single-compile guarded-source switch path; otherwise it reports an explicit
+fallback.
+
 Compiled backends currently support CMake/CTest targets:
 
 - `compiled-executable` swaps a rebuilt executable into the original test

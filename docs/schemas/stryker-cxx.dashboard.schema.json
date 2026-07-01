@@ -95,6 +95,8 @@
       }
     },
     "thresholdStatus": { "enum": ["failed", "low", "acceptable", "high", null] },
+    "analysis": { "type": "object" },
+    "projectAnalysis": { "type": "object" },
     "summary": { "type": "object" },
     "counts": { "type": "object" },
     "mutants": {
@@ -106,7 +108,8 @@
           "file": { "type": "string" },
           "line": { "type": "integer" },
           "mutator": { "type": "string" },
-          "status": { "type": "string" }
+          "status": { "type": "string" },
+          "sourcePrecision": { "type": "object" }
         }
       }
     }

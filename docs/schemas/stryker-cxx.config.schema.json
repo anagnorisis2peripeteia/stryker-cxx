@@ -147,6 +147,7 @@
         },
         "mode": { "enum": ["token", "clang", "clang-ast"] },
         "executionMode": { "enum": ["source-overlay", "mutant-switch"] },
+        "executionBackend": { "enum": ["auto", "source-overlay", "mutant-switch", "compiled-artifact", "llvm-switch"] },
         "jobs": { "type": "integer", "minimum": 1 },
         "batchMutants": { "type": "boolean" },
         "batchSize": { "type": "integer", "minimum": 1 },
@@ -158,6 +159,7 @@
         "dryRunOnly": { "type": "boolean" },
         "skipTests": { "type": "boolean" },
         "coverageFile": { "type": "string" },
+        "coverageAnalysis": { "enum": ["off", "all", "perTest", "perTestInIsolation"] },
         "coverageProvider": { "type": "string" },
         "coverageTestCommandTemplate": { "type": "string" },
         "coverageHelperCommandTemplate": { "type": "string" },
@@ -222,6 +224,8 @@
       }
     },
     "coverageFile": { "type": "string" },
+    "coverageAnalysis": { "enum": ["off", "all", "perTest", "perTestInIsolation"] },
+    "executionBackend": { "enum": ["auto", "source-overlay", "mutant-switch", "compiled-artifact", "llvm-switch"] },
     "coverageProvider": { "type": "string" },
     "coverageHelperCommandTemplate": { "type": "string" },
     "coverageHelperTests": {
