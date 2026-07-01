@@ -47,6 +47,8 @@ Dashboard payloads include:
 - `analysis.sourcePrecision` for source-range confidence across native JSON,
   MTE, and dashboard artifacts;
 - `projectAnalysis.buildGraph` ownership summary for source/build/test evidence;
+- `parity` / `execution.parity` for the eight-gap Mull/Stryker.NET convergence
+  checklist and explicit LLVM IR/object instrumentation boundary;
 - explicit or environment-derived CI project, branch, commit, top-level
   `runId`, and build URL metadata;
 - upload auth metadata containing the env var/header names, never token values;

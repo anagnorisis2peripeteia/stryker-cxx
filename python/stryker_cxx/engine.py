@@ -546,6 +546,32 @@ SOURCE_EXTENSIONS = {
     ".metal",
 }
 DEFAULT_MUTATORS = ["ConditionalBoundary", "EqualityOperator", "LogicalOperator", "BooleanLiteral"]
+MUTATION_LEVEL_ADVANCED_MUTATORS = [
+    "ConditionalBoundary",
+    "EqualityOperator",
+    "LogicalOperator",
+    "BooleanLiteral",
+    "ArithmeticOperator",
+    "ReturnValue",
+    "IntegerLiteral",
+    "UnaryOperator",
+    "UpdateOperator",
+    "AssignmentOperator",
+    "BitwiseOperator",
+    "ShiftOperator",
+]
+MUTATION_LEVEL_NAMES = {"Standard", "Advanced", "Complete"}
+
+
+def mutators_for_level(level: str) -> list[str]:
+    normalized = (level or "Standard").strip()
+    if normalized not in MUTATION_LEVEL_NAMES:
+        raise ValueError("--mutation-level must be one of: Advanced, Complete, Standard")
+    if normalized == "Standard":
+        return list(DEFAULT_MUTATORS)
+    if normalized == "Advanced":
+        return [name for name in MUTATION_LEVEL_ADVANCED_MUTATORS if name in MUTATORS]
+    return sorted(MUTATORS)
 EQUIVALENT_SUPPRESSION_MODES = {"off", "conservative", "aggressive"}
 GENERATED_CODE_MARKERS = (
     "auto-generated",
@@ -6259,6 +6285,178 @@ def _test_scheduler_metadata(rep: Report, mutants: list[dict[str, Any]]) -> dict
     return build_test_scheduler_metadata(mutants, rep.execution.get("batching", {}))
 
 
+def _parity_status(covered: bool, partial: bool = False, external: bool = False) -> str:
+    if external:
+        return "external"
+    if covered:
+        return "covered"
+    if partial:
+        return "partial"
+    return "missing"
+
+
+def _parity_item(
+    item_id: str,
+    title: str,
+    status: str,
+    evidence: list[str],
+    remaining: list[str],
+) -> dict[str, Any]:
+    return {
+        "id": item_id,
+        "title": title,
+        "status": status,
+        "evidence": evidence,
+        "remaining": remaining,
+    }
+
+
+def _parity_coverage(rep: Report, mutants: list[dict[str, Any]]) -> dict[str, Any]:
+    execution = rep.execution if isinstance(rep.execution, dict) else {}
+    analysis = execution.get("analysis") if isinstance(execution.get("analysis"), dict) else {}
+    project_analysis = execution.get("projectAnalysis") if isinstance(execution.get("projectAnalysis"), dict) else {}
+    build_graph = (
+        project_analysis.get("buildGraph")
+        if isinstance(project_analysis.get("buildGraph"), dict)
+        else {}
+    )
+    coverage = rep.coverage if isinstance(rep.coverage, dict) else {}
+    baseline = rep.baseline if isinstance(rep.baseline, dict) else {}
+    scheduler = execution.get("testScheduler") if isinstance(execution.get("testScheduler"), dict) else {}
+    dashboard = execution.get("dashboard") if isinstance(execution.get("dashboard"), dict) else {}
+    dashboard_export = (
+        dashboard.get("export")
+        if isinstance(dashboard.get("export"), dict)
+        else {}
+    )
+    dashboard_upload = (
+        dashboard.get("upload")
+        if isinstance(dashboard.get("upload"), dict)
+        else {}
+    )
+    llvm_switch = execution.get("llvmSwitch") if isinstance(execution.get("llvmSwitch"), dict) else {}
+    reporter_runs = execution.get("reporterRuns") if isinstance(execution.get("reporterRuns"), list) else []
+    mutator_names = sorted({str(mut.get("mutator")) for mut in mutants if mut.get("mutator")})
+    mutation_level = str(execution.get("mutationLevel") or "Custom")
+    ownership_model = str(build_graph.get("ownershipModel") or "none")
+    has_build_ownership = ownership_model not in {"none", "explicit-source"}
+    has_coverage_selection = bool(
+        coverage.get("testSelectedMutants")
+        or scheduler.get("coverageSelectedSessions")
+        or coverage.get("helper")
+    )
+    has_scheduler = bool(scheduler) or bool(execution.get("batching"))
+    has_since = bool(rep.base or execution.get("since"))
+    has_baseline = bool(baseline.get("enabled") or baseline.get("writePath"))
+    has_reporter_surface = bool(
+        execution.get("reporters")
+        or reporter_runs
+        or dashboard_export.get("enabled")
+        or dashboard_upload.get("enabled")
+    )
+    ignored_count = len([mut for mut in mutants if str(mut.get("status", "")).upper() == "IGNORED"])
+    items = [
+        _parity_item(
+            "llvm-mull-backend",
+            "Mull-style single compiled artifact backend",
+            _parity_status(False, partial=True),
+            [
+                f"executionBackend={execution.get('executionBackend')}",
+                f"llvmSwitch.implementation={llvm_switch.get('implementation', 'guarded-source-switch')}",
+            ],
+            [
+                "replace guarded-source switch with true LLVM IR/object instrumentation",
+                "prove object/bitcode guard placement and source mapping across CMake/CTest fixtures",
+            ],
+        ),
+        _parity_item(
+            "build-graph-ownership",
+            "Compiler-derived source/build/test ownership graph",
+            _parity_status(has_build_ownership, partial=bool(build_graph)),
+            [
+                f"ownershipModel={ownership_model}",
+                f"sourceNodes={len(build_graph.get('sourceNodes') or [])}",
+                f"buildTargets={len(build_graph.get('buildTargetNodes') or [])}",
+                f"testTargets={len(build_graph.get('testTargetNodes') or [])}",
+            ],
+            [] if has_build_ownership else ["provide compile_commands.json, CMake File API, or explicit build-target ownership"],
+        ),
+        _parity_item(
+            "coverage-scheduler",
+            "Stryker.NET-style coverage-aware and mixed-mutant scheduler",
+            _parity_status(has_coverage_selection and has_scheduler, partial=has_scheduler),
+            [
+                f"coverageAnalysis={coverage.get('analysis')}",
+                f"testSelectedMutants={coverage.get('testSelectedMutants', 0)}",
+                f"schedulerSessions={scheduler.get('sessions', 0)}",
+            ],
+            [] if has_coverage_selection else ["feed per-test coverage or helper coverage to select test sessions"],
+        ),
+        _parity_item(
+            "baseline-since",
+            "Stryker.NET since/baseline ergonomics",
+            _parity_status(has_since and has_baseline, partial=has_since or has_baseline),
+            [
+                f"base={rep.base}",
+                f"baselineEnabled={baseline.get('enabled', False)}",
+                f"baselineWrites={baseline.get('cacheWrites', 0)}",
+            ],
+            [] if has_since and has_baseline else ["use --since/--base with --incremental or --write-baseline"],
+        ),
+        _parity_item(
+            "mutator-levels",
+            "Stryker-style mutation levels and broader C++ mutator catalog",
+            _parity_status(mutation_level in {"Advanced", "Complete"}, partial=bool(mutator_names)),
+            [
+                f"mutationLevel={mutation_level}",
+                f"enabledMutators={len(mutator_names)}",
+            ],
+            [] if mutation_level in {"Advanced", "Complete"} else ["run --mutation-level Advanced or Complete for broader parity coverage"],
+        ),
+        _parity_item(
+            "ignore-directives",
+            "Stryker disable/restore source directives",
+            _parity_status(True),
+            [
+                "supports // Stryker disable|restore all|once|next-line",
+                f"ignoredMutants={ignored_count}",
+            ],
+            [],
+        ),
+        _parity_item(
+            "reporter-dashboard",
+            "Reporter, dashboard, CI artifact, and MTE ecosystem",
+            _parity_status(has_reporter_surface, partial=True),
+            [
+                f"reporters={execution.get('reporters', [])}",
+                f"reporterRuns={len(reporter_runs)}",
+                f"dashboardExport={dashboard_export.get('enabled', False)}",
+                f"dashboardUpload={dashboard_upload.get('enabled', False)}",
+            ],
+            [] if has_reporter_surface else ["enable --format, --reporter, or --dashboard-export/upload in CI profiles"],
+        ),
+        _parity_item(
+            "marmorkrebs-review-ux",
+            "Marmorkrebs review-provider UX and metadata preservation",
+            _parity_status(True, external=True),
+            [
+                "native stryker-cxx report contains MTE, source precision, build graph, scheduler, and parity metadata",
+                "Marmorkrebs is responsible for normalizing this provider boundary",
+            ],
+            ["keep Marmorkrebs adapter forwarding every review-relevant provider option"],
+        ),
+    ]
+    counts: dict[str, int] = {}
+    for item in items:
+        counts[str(item["status"])] = counts.get(str(item["status"]), 0) + 1
+    return {
+        "schemaVersion": "stryker-cxx.parity.v1",
+        "scope": "mull-stryker-net-eight-gap-audit",
+        "statusCounts": counts,
+        "items": items,
+    }
+
+
 def _report_dict(rep: Report, repo: str | None = None, base: str | None = None,
                  threshold: float | None = None, startedAt: str | None = None) -> dict:
     normalized_mutants = [_normalize_mutant_record(mut) for mut in rep.mutants]
@@ -6284,6 +6482,9 @@ def _report_dict(rep: Report, repo: str | None = None, base: str | None = None,
         else existing_source_precision
     )
     execution["testScheduler"] = _test_scheduler_metadata(rep, normalized_mutants)
+    rep.execution["testScheduler"] = execution["testScheduler"]
+    execution["parity"] = _parity_coverage(rep, normalized_mutants)
+    rep.execution["parity"] = execution["parity"]
     thresholds = dict(rep.thresholds or {})
     if "break" not in thresholds:
         thresholds = _resolve_thresholds(
@@ -6325,6 +6526,7 @@ def _report_dict(rep: Report, repo: str | None = None, base: str | None = None,
         "dryRun": rep.dryRun or {"status": "NOT_RUN"},
         "coverage": rep.coverage or {"enabled": False, "provider": "none"},
         "baseline": rep.baseline or {"enabled": False},
+        "parity": execution["parity"],
         "projectAnalysis": execution.get("projectAnalysis", {}),
         "mutationArtifact": execution.get("mutationArtifact", {}),
         "artifactPlacement": execution.get("artifactPlacement", {}),
@@ -6678,6 +6880,7 @@ def _mutation_testing_elements(rep: Report) -> dict:
                     else _source_precision_summary([])
                 )
             ),
+            "parity": rep.execution.get("parity"),
         },
     }
 
@@ -6905,6 +7108,7 @@ def _dashboard_payload(rep: Report) -> dict[str, Any]:
     )
     project_analysis = rep.execution.get("projectAnalysis") if isinstance(rep.execution.get("projectAnalysis"), dict) else {}
     build_graph = project_analysis.get("buildGraph") if isinstance(project_analysis.get("buildGraph"), dict) else {}
+    parity = rep.execution.get("parity") if isinstance(rep.execution.get("parity"), dict) else _parity_coverage(rep, mutants)
     dashboard = rep.execution.get("dashboard", {})
     if not isinstance(dashboard, dict):
         dashboard = {}
@@ -6977,6 +7181,7 @@ def _dashboard_payload(rep: Report) -> dict[str, Any]:
             "engine": analysis.get("engine", rep.execution.get("mode", "token")),
             "sourcePrecision": source_precision,
         },
+        "parity": parity,
         "projectAnalysis": {
             "schemaVersion": project_analysis.get("schemaVersion"),
             "confidence": project_analysis.get("confidence"),
@@ -9215,7 +9420,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--effective-config-json", default=None)
     ap.add_argument("--max-mutants", type=int, default=0)
     ap.add_argument("--include-metal", action="store_true", dest="include_metal")
-    ap.add_argument("--mutators", default=",".join(DEFAULT_MUTATORS))
+    ap.add_argument("--mutators", default=None)
+    ap.add_argument("--mutation-level", choices=sorted(MUTATION_LEVEL_NAMES), default="Standard", dest="mutation_level")
     ap.add_argument("--timeout", type=int, default=None, dest="timeout_seconds",
                     help="Per-mutant timeout in seconds")
     ap.add_argument("--timeout-factor", type=float, default=1.5,
@@ -9470,10 +9676,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[error] {exc}", file=sys.stderr)
         return 1
 
+    mutator_spec = args.mutators or ",".join(mutators_for_level(args.mutation_level))
     try:
-        enabled = normalize_mutator_list(args.mutators)
+        enabled = normalize_mutator_list(mutator_spec)
     except ValueError as exc:
         ap.error(str(exc))
+    level_mutators = set(mutators_for_level(args.mutation_level))
+    reported_mutation_level = (
+        args.mutation_level
+        if set(enabled) == level_mutators
+        else "Custom"
+    )
 
     repo = _ensure_target_root(args.repo)
     files = [p.strip() for p in args.files.split(",") if p.strip()]
@@ -9516,6 +9729,8 @@ def main(argv: list[str] | None = None) -> int:
         testCommand=args.test_cmd,
         execution={
             "mode": args.mode,
+            "mutationLevel": reported_mutation_level,
+            "enabledMutators": sorted(enabled),
             "executionMode": actual_execution_mode,
             "requestedExecutionMode": requested_execution_mode,
             "executionBackend": actual_execution_backend,

@@ -3,7 +3,8 @@
 This roadmap tracks the seven-phase plan for making `stryker-cxx` closer to
 Mull's C/C++ execution strengths and Stryker.NET's orchestration maturity.
 
-Status: implemented and locally validated.
+Status: implemented and locally validated before the parity-audit extension;
+current work adds explicit eight-gap report metadata and should be revalidated.
 
 Validation evidence:
 
@@ -48,6 +49,8 @@ Current implementation:
 - `llvm-switch` is an experimental guarded-source switch implementation for
   compile-database or CMake/CTest-backed runs with guardable mutants; unsupported
   projects still report explicit fallback instead of claiming LLVM parity.
+- native reports now include `parity` metadata that marks this as partial until a
+  true LLVM IR/object instrumentation backend exists.
 
 ## Phase 3: build graph ownership
 
@@ -66,6 +69,8 @@ Current implementation:
   and Xcode-oriented command synthesis;
 - `projectAnalysis.buildGraph` records source nodes, build/test target nodes,
   compile-database match/miss evidence, and ownership diagnostics;
+- CMake File API codemodel replies under the selected build directory are used
+  as high-confidence target/source/artifact ownership evidence when present;
 - unsupported ownership paths remain fallback/preflight decisions rather than
   hidden source-overlay behavior.
 
@@ -90,6 +95,8 @@ Current implementation:
 - `perTest` modes can select per-mutant commands from supplied coverage data;
 - existing batch mode groups compatible mutants and splits failed batches for
   deterministic attribution.
+- `execution.parity` records whether a run used coverage-selected scheduling or
+  only the generic deterministic scheduler path.
 
 ## Phase 5: AST precision layer
 
@@ -128,11 +135,14 @@ Current implementation:
 - native JSON, Mutation Testing Elements, Markdown, SARIF, HTML, and GitHub
   annotation formats are contract-tested through the repo validation path;
 - baseline cache commands and threshold bands are first-class CLI/report fields;
+- `--since <ref>` is accepted as the Stryker.NET-style alias for `--base <ref>`;
 - dashboard export now carries `analysis.sourcePrecision` and
   `projectAnalysis.buildGraph` summaries so CI artifacts preserve the same
   parity evidence as native JSON;
 - dashboard export/upload metadata includes retry, retention, project, branch,
   commit, build URL, and auth-header provenance.
+- `stryker-cxx parity-audit --report <path>` renders the native parity metadata
+  as JSON or Markdown for CI and review bundles.
 
 ## Phase 7: Mull interop
 

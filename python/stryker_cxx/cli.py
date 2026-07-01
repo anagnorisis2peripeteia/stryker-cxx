@@ -57,6 +57,7 @@ thresholds:
   break: 0.6
 execution:
   mode: token
+  mutationLevel: Standard
   executionMode: source-overlay
   executionBackend: auto
   equivalentSuppression: conservative
@@ -244,8 +245,10 @@ def _config_for_preset(preset: str | None) -> str:
 CONFIG_ALLOWED_TOP_LEVEL = {
     "schemaVersion",
     "base",
+    "since",
     "files",
     "mutators",
+    "mutationLevel",
     "thresholds",
     "execution",
     "mutationArtifact",
@@ -274,6 +277,7 @@ CONFIG_ALLOWED_NESTED = {
         "maxMutants",
         "includeMetal",
         "mutators",
+        "mutationLevel",
         "mutationMutators",
         "threshold",
         "thresholdHigh",
@@ -829,11 +833,16 @@ def _build_parser() -> argparse.ArgumentParser:
     baseline_history.add_argument("--status", default=None)
     baseline_history.add_argument("--branch", default=None)
 
+    parity_audit = subparsers.add_parser("parity-audit", help="summarize Mull/Stryker.NET parity coverage from a report")
+    parity_audit.add_argument("--report", required=True)
+    parity_audit.add_argument("--format", choices=["json", "markdown"], default="json")
+
     run = subparsers.add_parser("run", help="discover, mutate, build, and run tests")
     run.add_argument("--config", default=None, help="Optional YAML/JSON config file")
     run.add_argument("--repo", required=True)
     run.add_argument("--files", required=False)
     run.add_argument("--base", default=None)
+    run.add_argument("--since", default=None, help="Stryker.NET-style alias for --base")
     run.add_argument("--lines", default=None)
     run.add_argument("--build-command", required=False, dest="build_command")
     run.add_argument("--check-command", required=False, dest="check_command")
@@ -874,6 +883,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--include", default=None)
     run.add_argument("--exclude", default=None)
     run.add_argument("--mutators", default=None)
+    run.add_argument("--mutation-level", choices=sorted(engine.MUTATION_LEVEL_NAMES), default=None, dest="mutation_level")
     run.add_argument("--output-format", choices=["legacy", "stryker-cxx"], default="stryker-cxx")
     run.add_argument("--format", choices=["json", "markdown", "html", "sarif", "github-annotations", "mutation-testing-elements"], default="json")
     run.add_argument("--mode", choices=["token", "clang", "clang-ast"], default=None)
@@ -959,12 +969,14 @@ def _build_parser() -> argparse.ArgumentParser:
     list_mutants.add_argument("--repo", required=True)
     list_mutants.add_argument("--files", required=False)
     list_mutants.add_argument("--base", default=None)
+    list_mutants.add_argument("--since", default=None, help="Stryker.NET-style alias for --base")
     list_mutants.add_argument("--lines", default=None)
     list_mutants.add_argument("--max-mutants", type=int, default=None)
     list_mutants.add_argument("--include-metal", action="store_true")
     list_mutants.add_argument("--include", default=None)
     list_mutants.add_argument("--exclude", default=None)
     list_mutants.add_argument("--mutators", default=None)
+    list_mutants.add_argument("--mutation-level", choices=sorted(engine.MUTATION_LEVEL_NAMES), default=None, dest="mutation_level")
     list_mutants.add_argument("--mode", choices=["token", "clang", "clang-ast"], default=None)
     list_mutants.add_argument("--equivalent-suppression", choices=["off", "conservative", "aggressive"], default=None, dest="equivalent_suppression")
     list_mutants.add_argument("--plugin", action="append", default=[])
@@ -1010,6 +1022,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run_mutant.add_argument("--report", required=True)
     run_mutant.add_argument("--base", default=None)
+    run_mutant.add_argument("--since", default=None, help="Stryker.NET-style alias for --base")
     run_mutant.add_argument("--lines", default=None)
     run_mutant.add_argument("--output-format", choices=["legacy", "stryker-cxx"], default="stryker-cxx")
     run_mutant.add_argument("--format", choices=["json", "markdown", "html", "sarif", "github-annotations", "mutation-testing-elements"], default="json")
@@ -1071,6 +1084,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_mutant.add_argument("--env-inherit", action="append", default=[], dest="env_inherit")
     run_mutant.add_argument("--env-block", action="append", default=[], dest="env_block")
     run_mutant.add_argument("--mutators", default=None)
+    run_mutant.add_argument("--mutation-level", choices=sorted(engine.MUTATION_LEVEL_NAMES), default=None, dest="mutation_level")
     run_mutant.add_argument("--fail-on-empty", action="store_true", dest="fail_on_empty")
     run_mutant.add_argument("--threshold", type=float, default=None)
     run_mutant.add_argument("--threshold-high", type=float, default=None, dest="threshold_high")
@@ -1266,6 +1280,34 @@ def _baseline_history(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parity_audit(args: argparse.Namespace) -> int:
+    with open(args.report, encoding="utf-8") as f:
+        payload = json.load(f)
+    if not isinstance(payload, dict):
+        raise ValueError("--report must contain a JSON object")
+    parity = payload.get("parity")
+    if not isinstance(parity, dict):
+        execution = payload.get("execution") if isinstance(payload.get("execution"), dict) else {}
+        parity = execution.get("parity") if isinstance(execution.get("parity"), dict) else None
+    if not isinstance(parity, dict):
+        raise ValueError("report does not contain stryker-cxx parity metadata")
+    if args.format == "json":
+        print(json.dumps(parity, indent=2, sort_keys=True))
+        return 0
+    print("# stryker-cxx parity audit")
+    print()
+    print(f"Schema: `{parity.get('schemaVersion', 'unknown')}`")
+    print()
+    for item in parity.get("items", []):
+        if not isinstance(item, dict):
+            continue
+        print(f"- `{item.get('status', 'unknown')}` {item.get('id', 'unknown')}: {item.get('title', '')}")
+        remaining = item.get("remaining")
+        if isinstance(remaining, list) and remaining:
+            print(f"  remaining: {'; '.join(str(value) for value in remaining)}")
+    return 0
+
+
 def _baseline_entry_file_exists(repo: str, value: Any) -> bool:
     if not isinstance(value, dict):
         return False
@@ -1354,7 +1396,12 @@ def _resolve_defaults(args: argparse.Namespace) -> dict[str, Any]:
     defaults = {
         "repo": getattr(args, "repo", None),
         "files": files_value,
-        "base": getattr(args, "base", None) if getattr(args, "base", None) is not None else cfg.get("base"),
+        "base": (
+            getattr(args, "base", None)
+            or getattr(args, "since", None)
+            or cfg.get("base")
+            or cfg.get("since")
+        ),
         "build_command": getattr(args, "build_command", None) or execution.get("buildCommand") or adapter.get("build"),
         "check_command": getattr(args, "check_command", None) or execution.get("checkCommand") or checker,
         "test_command": getattr(args, "test_command", None) or execution.get("testCommand") or adapter.get("test"),
@@ -1383,6 +1430,12 @@ def _resolve_defaults(args: argparse.Namespace) -> dict[str, Any]:
             or execution.get("includeMetal", False)
         ),
         "mutators": getattr(args, "mutators", None) or execution.get("mutators") or execution.get("mutationMutators") or cfg.get("mutators"),
+        "mutation_level": (
+            getattr(args, "mutation_level", None)
+            or execution.get("mutationLevel")
+            or cfg.get("mutationLevel")
+            or "Standard"
+        ),
         "threshold": getattr(args, "threshold", None) if getattr(args, "threshold", None) is not None else execution.get("threshold"),
         "threshold_high": (
             getattr(args, "threshold_high", None)
@@ -1570,7 +1623,7 @@ def _resolve_defaults(args: argparse.Namespace) -> dict[str, Any]:
         defaults["mutators"] = ",".join(exec_mutators)
 
     if defaults["mutators"] is None:
-        defaults["mutators"] = ",".join(engine.DEFAULT_MUTATORS)
+        defaults["mutators"] = ",".join(engine.mutators_for_level(defaults["mutation_level"]))
 
     if defaults["threshold"] is None:
         defaults["threshold"] = defaults.get("report_threshold")
@@ -1679,6 +1732,8 @@ def _run(args: argparse.Namespace) -> int:
         cfg["format"],
         "--mutators",
         mutators,
+        "--mutation-level",
+        cfg["mutation_level"],
     ]
     if cfg["base"]:
         legacy_args.extend(["--diff-base", cfg["base"]])
@@ -1943,6 +1998,8 @@ def _run_mutant(args: argparse.Namespace) -> int:
         args.id,
         "--mutators",
         cfg["mutators"],
+        "--mutation-level",
+        cfg["mutation_level"],
     ]
     if cfg["base"]:
         legacy_args.extend(["--diff-base", cfg["base"]])
@@ -2115,6 +2172,8 @@ def main(argv: list[str] | None = None) -> int:
             return _baseline_info(args)
         if args.command == "baseline-history":
             return _baseline_history(args)
+        if args.command == "parity-audit":
+            return _parity_audit(args)
         parser.error(f"unsupported command: {args.command}")
     except Exception as exc:
         print(f"error: {exc}")

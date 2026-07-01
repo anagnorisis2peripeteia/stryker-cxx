@@ -96,6 +96,7 @@
     },
     "thresholdStatus": { "enum": ["failed", "low", "acceptable", "high", null] },
     "analysis": { "type": "object" },
+    "parity": { "type": "object" },
     "projectAnalysis": { "type": "object" },
     "summary": { "type": "object" },
     "counts": { "type": "object" },

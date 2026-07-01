@@ -37,12 +37,17 @@ Run mutation testing directly:
 ```bash
 stryker-cxx run \
   --repo . \
-  --base origin/main \
+  --since origin/main \
   --files src/foo.cpp \
   --build-command "ninja -C build target" \
   --test-command "./build/bin/target_test" \
   --report mutation.json
 ```
+
+`--since <ref>` is the Stryker.NET-style spelling for `--base <ref>` and scopes
+mutation to the local diff against that ref. Use `--mutation-level
+Standard|Advanced|Complete` to select a Stryker-style default mutator set; an
+explicit `--mutators` list still wins when a review needs an exact surface.
 
 For common static-check phases, use `--check-system clang-tidy|cppcheck` with
 optional `--check-args` to synthesize a check command from the current
@@ -94,6 +99,9 @@ to record the requested execution backend separately from the artifact backend.
 evidence is available and every selected mutant is guardable, it uses the
 single-compile guarded-source switch path; otherwise it reports an explicit
 fallback.
+This is intentionally not advertised as Mull-equivalent LLVM IR mutation yet:
+native reports include `parity` / `execution.parity` metadata that calls out the
+remaining IR/object instrumentation gap and the evidence available for each run.
 
 Compiled backends currently support CMake/CTest targets:
 
@@ -139,6 +147,9 @@ Use `stryker-cxx baseline-info --baseline-file <path>` to inspect cache status
 and `stryker-cxx baseline-history --baseline-file <path>` to review newest
 entries, by-day status buckets, branches, mutant locations, and optional repo
 file-existence diagnostics before or after merge/prune maintenance.
+Use `stryker-cxx parity-audit --report mutation.json --format markdown` to turn
+the native eight-gap Mull/Stryker.NET parity metadata into a CI-readable
+checklist.
 
 For dashboard uploads, `--dashboard-upload-url <url>` remains explicit and
 optional. Add `--dashboard-auth-token-env STRYKER_CXX_DASHBOARD_TOKEN`,

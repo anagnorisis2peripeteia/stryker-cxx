@@ -25,7 +25,7 @@ def analyze_project(
     repo_root = os.path.abspath(repo)
     compile_database = _compile_database(repo_root)
     cmake_targets = _cmake_target_sources(repo_root)
-    build_target_sources = _build_target_sources(repo_root, cmake_targets)
+    build_target_sources = _build_target_sources(repo_root, cmake_targets, build_dir=build_dir)
     build_systems = _build_systems(
         repo_root,
         build_system=build_system,
@@ -340,7 +340,7 @@ def _build_graph_target_node(item: dict[str, Any]) -> dict[str, Any]:
         "confidence": item.get("confidence"),
         "analysisKey": item.get("analysisKey"),
     }
-    for key in ("sourceFiles", "dependencies", "relatedBuildTarget", "command"):
+    for key in ("sourceFiles", "dependencies", "relatedBuildTarget", "command", "artifacts", "targetId"):
         if item.get(key) is not None:
             out[key] = item.get(key)
     return out
@@ -393,8 +393,11 @@ def _test_targets(
 def _build_target_sources(
     repo: str,
     cmake_targets: dict[str, dict[str, Any]] | None = None,
+    build_dir: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
+    for target in _cmake_file_api_targets(repo, build_dir):
+        _record_target_source(out, target)
     for target in list((cmake_targets or _cmake_target_sources(repo)).values()):
         _record_target_source(out, target)
     for target in _meson_targets(repo):
@@ -535,6 +538,115 @@ def _cmake_target_sources(repo: str) -> dict[str, dict[str, Any]]:
         existing = list(target.get("sourceFiles") or [])
         target["sourceFiles"] = _stable_unique(existing + source_files)
     return targets
+
+
+def _cmake_file_api_targets(repo: str, build_dir: str | None = None) -> list[dict[str, Any]]:
+    reply_dirs = []
+    if build_dir:
+        reply_dirs.append(os.path.join(repo, build_dir, ".cmake", "api", "v1", "reply"))
+        if os.path.isabs(build_dir):
+            reply_dirs.append(os.path.join(build_dir, ".cmake", "api", "v1", "reply"))
+    reply_dirs.append(os.path.join(repo, "build", ".cmake", "api", "v1", "reply"))
+    reply_dirs.append(os.path.join(repo, ".cmake", "api", "v1", "reply"))
+    out: list[dict[str, Any]] = []
+    seen_reply_dirs: set[str] = set()
+    for reply_dir in reply_dirs:
+        reply_dir = os.path.abspath(reply_dir)
+        if reply_dir in seen_reply_dirs or not os.path.isdir(reply_dir):
+            continue
+        seen_reply_dirs.add(reply_dir)
+        out.extend(_cmake_file_api_targets_from_reply(repo, reply_dir))
+    return out
+
+
+def _cmake_file_api_targets_from_reply(repo: str, reply_dir: str) -> list[dict[str, Any]]:
+    indexes = sorted(
+        [
+            os.path.join(reply_dir, name)
+            for name in os.listdir(reply_dir)
+            if name.startswith("index-") and name.endswith(".json")
+        ],
+        key=lambda path: os.path.getmtime(path),
+        reverse=True,
+    )
+    for index_path in indexes:
+        index = _read_json_optional(index_path)
+        if not isinstance(index, dict):
+            continue
+        objects = index.get("objects")
+        if not isinstance(objects, list):
+            continue
+        codemodel_ref = next(
+            (
+                item
+                for item in objects
+                if isinstance(item, dict)
+                and item.get("kind") == "codemodel"
+                and isinstance(item.get("jsonFile"), str)
+            ),
+            None,
+        )
+        if codemodel_ref is None:
+            continue
+        codemodel = _read_json_optional(os.path.join(reply_dir, str(codemodel_ref["jsonFile"])))
+        if isinstance(codemodel, dict):
+            return _cmake_file_api_targets_from_codemodel(repo, reply_dir, codemodel)
+    return []
+
+
+def _cmake_file_api_targets_from_codemodel(repo: str, reply_dir: str, codemodel: dict[str, Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    configs = codemodel.get("configurations")
+    if not isinstance(configs, list):
+        return out
+    for config in configs:
+        if not isinstance(config, dict):
+            continue
+        for target_ref in config.get("targets") or []:
+            if not isinstance(target_ref, dict) or not isinstance(target_ref.get("jsonFile"), str):
+                continue
+            target = _read_json_optional(os.path.join(reply_dir, str(target_ref["jsonFile"])))
+            if not isinstance(target, dict):
+                continue
+            source_files = _stable_unique(
+                [
+                    _repo_relative(repo, str(source.get("path")))
+                    for source in target.get("sources") or []
+                    if isinstance(source, dict)
+                    and isinstance(source.get("path"), str)
+                    and _looks_like_source_file(str(source.get("path")))
+                ]
+            )
+            artifacts = _stable_unique(
+                [
+                    _repo_relative(repo, str(artifact.get("path")))
+                    for artifact in target.get("artifacts") or []
+                    if isinstance(artifact, dict) and isinstance(artifact.get("path"), str)
+                ]
+            )
+            if not source_files and not artifacts:
+                continue
+            record: dict[str, Any] = {
+                "name": str(target.get("name") or target_ref.get("name") or ""),
+                "kind": str(target.get("type") or "cmake-target").lower(),
+                "source": "cmake-file-api",
+                "confidence": "high",
+                "sourceFiles": source_files,
+            }
+            if artifacts:
+                record["artifacts"] = artifacts
+            if target.get("id") is not None:
+                record["targetId"] = str(target.get("id"))
+            out.append(record)
+    return out
+
+
+def _read_json_optional(path: str) -> Any:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 def _cmake_tokens(block: str) -> list[str]:

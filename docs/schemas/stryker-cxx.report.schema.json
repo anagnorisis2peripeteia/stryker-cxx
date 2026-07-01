@@ -49,6 +49,11 @@
       "type": "object",
       "properties": {
         "mode": { "type": "string" },
+        "mutationLevel": { "enum": ["Standard", "Advanced", "Complete", "Custom"] },
+        "enabledMutators": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
         "executionMode": { "enum": ["source-overlay", "mutant-switch"] },
         "requestedExecutionMode": { "enum": ["source-overlay", "mutant-switch"] },
         "executionBackend": { "enum": ["auto", "source-overlay", "mutant-switch", "compiled-artifact", "llvm-switch"] },
@@ -126,6 +131,7 @@
             }
           }
         },
+        "parity": { "$ref": "#/$defs/parity" },
         "dashboard": {
           "type": "object",
           "properties": {
@@ -517,6 +523,7 @@
         }
       }
     },
+    "parity": { "$ref": "#/$defs/parity" },
     "summary": {
       "type": "object",
       "required": ["byStatus", "byFile", "byMutator"],
@@ -576,6 +583,36 @@
         "runtimeErrors": { "type": "integer", "minimum": 0 },
         "pending": { "type": "integer", "minimum": 0 },
         "score": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "parity": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": { "const": "stryker-cxx.parity.v1" },
+        "scope": { "type": "string" },
+        "statusCounts": {
+          "type": "object",
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string" },
+              "title": { "type": "string" },
+              "status": { "enum": ["covered", "partial", "external", "missing"] },
+              "evidence": {
+                "type": "array",
+                "items": { "type": "string" }
+              },
+              "remaining": {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            }
+          }
+        }
       }
     }
   }

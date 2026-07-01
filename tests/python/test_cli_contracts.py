@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 
 from stryker_cxx.cli import _adapter_commands, _checker_command
+from stryker_cxx.project_analysis import analyze_project
 
 
 def _sha256(path: Path) -> str:
@@ -7143,6 +7144,102 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["byStatus"]["SURVIVED"], 1)
         self.assertEqual(payload["summary"]["byFile"]["sample.cpp"]["survived"], 1)
         self.assertEqual(payload["summary"]["byMutator"]["EqualityOperator"]["survived"], 1)
+
+    def test_mutation_level_advanced_emits_parity_metadata(self) -> None:
+        self.source.write_text("int add(int a, int b) { return a + b; }\nint main() { return add(1, 1) == 2 ? 0 : 1; }\n")
+        self._git("add", "sample.cpp")
+        self._git("-c", "user.name=stryker-cxx", "-c", "user.email=stryker-cxx@example.invalid", "commit", "-q", "-m", "arithmetic")
+        report = self.repo / "advanced-parity.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "true",
+            "--report",
+            str(report),
+            "--mutation-level",
+            "Advanced",
+            "--max-mutants",
+            "1",
+            "--skip-initial-test",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["execution"]["mutationLevel"], "Advanced")
+        self.assertIn("ArithmeticOperator", payload["execution"]["enabledMutators"])
+        self.assertEqual(payload["parity"]["schemaVersion"], "stryker-cxx.parity.v1")
+        by_id = {item["id"]: item for item in payload["parity"]["items"]}
+        self.assertEqual(by_id["mutator-levels"]["status"], "covered")
+        self.assertEqual(payload["mutationTestingElements"]["strykerCxx"]["parity"]["schemaVersion"], "stryker-cxx.parity.v1")
+
+        audit = self._cli("parity-audit", "--report", str(report), "--format", "markdown")
+        self.assertEqual(audit.returncode, 0, audit.stderr + audit.stdout)
+        self.assertIn("mutator-levels", audit.stdout)
+
+    def test_since_alias_maps_to_base_for_local_dirty_diff(self) -> None:
+        self.source.write_text("int main() { if (1 != 1) return 0; return 1; }\n")
+        report = self.repo / "since.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--since",
+            "HEAD",
+            "--allow-dirty",
+            "--build-command",
+            "true",
+            "--test-command",
+            "true",
+            "--report",
+            str(report),
+            "--max-mutants",
+            "1",
+            "--skip-initial-test",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["base"], "HEAD")
+        by_id = {item["id"]: item for item in payload["parity"]["items"]}
+        self.assertIn(by_id["baseline-since"]["status"], {"partial", "covered"})
+
+    def test_project_analysis_reads_cmake_file_api_codemodel_targets(self) -> None:
+        build_reply = self.repo / "build" / ".cmake" / "api" / "v1" / "reply"
+        build_reply.mkdir(parents=True)
+        (build_reply / "index-1.json").write_text(json.dumps({
+            "objects": [{"kind": "codemodel", "jsonFile": "codemodel-v2.json"}],
+        }))
+        (build_reply / "codemodel-v2.json").write_text(json.dumps({
+            "configurations": [{"targets": [{"name": "sample", "jsonFile": "target-sample.json"}]}],
+        }))
+        (build_reply / "target-sample.json").write_text(json.dumps({
+            "name": "sample",
+            "type": "EXECUTABLE",
+            "id": "sample::@root",
+            "sources": [{"path": "sample.cpp"}],
+            "artifacts": [{"path": "build/sample"}],
+        }))
+
+        analysis = analyze_project(str(self.repo), ["sample.cpp"], build_system="cmake", build_dir="build")
+        graph = analysis["buildGraph"]
+        self.assertEqual(graph["ownershipModel"], "build-system-targets")
+        targets = graph["buildTargetNodes"]
+        self.assertTrue(any(target.get("source") == "cmake-file-api" for target in targets))
+        cmake_target = next(target for target in targets if target.get("source") == "cmake-file-api")
+        self.assertEqual(cmake_target["confidence"], "high")
+        self.assertEqual(cmake_target["artifacts"], ["build/sample"])
 
 
 if __name__ == "__main__":

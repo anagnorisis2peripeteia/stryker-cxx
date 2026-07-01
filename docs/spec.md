@@ -39,8 +39,9 @@ backend and mutation runs through compiled artifacts, is tracked in
 - `stryker-cxx init`
 - `stryker-cxx list-mutants`
 - `stryker-cxx run-mutant`
-- `--base`, `--lines`, `--include`, `--exclude`
-- `--mutators`, `--max-mutants`, `--include-metal`
+- `--base`, `--since`, `--lines`, `--include`, `--exclude`
+- `--mutators`, `--mutation-level Standard|Advanced|Complete`,
+  `--max-mutants`, `--include-metal`
 - `--mode token`
 - `--mode clang` using libclang parse validation and AST-confirmed source mutations
 - `--mode clang-ast` using AST cursor ranges before source rewrite candidate generation
@@ -58,6 +59,7 @@ backend and mutation runs through compiled artifacts, is tracked in
 - `--coverage-helper-command-template`, `--coverage-helper-tests`
 - `--incremental`
 - `--baseline-file`, `--write-baseline`, `--clear-baseline`
+- `parity-audit`
 - `--batch-mutants`, `--batch-size`
 - local plugin manifests via `--plugin` / `--plugin-dir`
 - plugin-contributed token mutators
@@ -1088,6 +1090,7 @@ Required behavior:
 Implemented CLI/config:
 
 - `--incremental`;
+- `--since <ref>` as the Stryker.NET-style alias for `--base <ref>`;
 - `--baseline-file`;
 - `--baseline-max-age-days`;
 - `--baseline-branch`;
@@ -1095,6 +1098,8 @@ Implemented CLI/config:
 - `--clear-baseline`;
 - `baseline-info`, `baseline-history`, `baseline-merge`, and
   `baseline-prune` maintenance commands;
+- `parity-audit --report <path>` for the report's eight-gap
+  Mull/Stryker.NET parity checklist.
 
 The native report should include:
 
@@ -1192,6 +1197,8 @@ Target CLI/config:
   `execution.executionBackendFallbackReason` in `stryker-cxx.report.v1`;
 - `execution.llvmSwitch` records whether the experimental guarded-source switch
   backend was active and why it fell back when inactive;
+- `parity` and `execution.parity` record the eight known Mull/Stryker.NET gaps,
+  per-run evidence, and remaining work without claiming true LLVM IR mutation;
 - `execution.mutantSwitch.enabled`;
 - `execution.mutantSwitch.fallbackReason`;
 - per-mutant `run.mutantSwitchEnabled` metadata;
@@ -1219,6 +1226,12 @@ Acceptance criteria:
 
 The current mutators cover the first useful set. Full parity requires broader
 C/C++ semantics.
+
+Mutation-level presets are implemented as Stryker-style default mutator sets:
+`Standard` is the historical safe default, `Advanced` adds broader arithmetic,
+return, literal, unary, assignment, bitwise, shift, and update families, and
+`Complete` enables every built-in mutator. An explicit `--mutators` list remains
+authoritative for exact PR-scope proof runs.
 
 Implemented opt-in mutator targets:
 
