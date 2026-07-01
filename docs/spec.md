@@ -41,6 +41,7 @@ backend and mutation runs through compiled artifacts, is tracked in
 - `stryker-cxx run-mutant`
 - `--base`, `--since`, `--lines`, `--include`, `--exclude`
 - `--mutators`, `--mutation-level Basic|Standard|Advanced|Complete`,
+  `--ignore-mutations`,
   `--max-mutants`, `--include-metal`
 - `--mode token`
 - `--mode clang` using libclang parse validation and AST-confirmed source mutations
@@ -374,7 +375,8 @@ Stryker-family ecosystem parity boundaries.
 - Basic dashboard upload/export policy plus explicit auth/env redaction metadata.
 - PR/CI-facing reporting including Markdown/HTML/SARIF/GitHub annotations and
   mutation element projection.
-- Core mutator families and ignore-comment support used by `stryker-cxx`/Marmorkrebs.
+- Core mutator families, ignore-comment support, and config-level
+  `ignoreMutations` filters used by `stryker-cxx`/Marmorkrebs.
 - Conservative equivalent/noise suppression for generated-code markers,
   duplicate logical/bitwise operands, duplicate conditional branches,
   arithmetic identity rewrites, and duplicate-operand standard-library min/max
@@ -1233,6 +1235,10 @@ coverage, `Standard` is the historical safe default, `Advanced` adds broader
 return, literal, unary, assignment, bitwise, shift, and update families, and
 `Complete` enables every built-in mutator. An explicit `--mutators` list remains
 authoritative for exact PR-scope proof runs.
+`ignoreMutations` and `--ignore-mutations` accept the same mutator names and
+aliases as Stryker disable comments. Matching mutants are retained in the report
+with status `IGNORED` so review gates can prove a mutator family was excluded
+intentionally rather than silently omitted.
 
 Implemented opt-in mutator targets:
 

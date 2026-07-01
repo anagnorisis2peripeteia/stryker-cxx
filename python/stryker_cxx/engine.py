@@ -1713,6 +1713,30 @@ def normalize_mutator_list(raw: str) -> list[str]:
     return vals
 
 
+def normalize_ignore_mutation_list(raw: str) -> list[str]:
+    vals = [_normalize_ignore_target(v.strip()) for v in (raw or "").split(",") if v.strip()]
+    unknown = [v for v in vals if v not in MUTATORS]
+    if unknown:
+        raise ValueError(f"unknown ignored mutators: {unknown}")
+    return list(dict.fromkeys(vals))
+
+
+def apply_configured_ignore_mutations(mutants: list[Mutant], ignored_mutators: list[str]) -> list[Mutant]:
+    ignored = set(ignored_mutators)
+    if not ignored:
+        return mutants
+    for mut in mutants:
+        if mut.status == "IGNORED" or mut.mutator not in ignored:
+            continue
+        reason = f"ignored by configured ignoreMutations: {mut.mutator}"
+        mut.status = "IGNORED"
+        mut.detail = reason
+        mut.ignoreReason = reason
+        mut.run["suppression"] = "ignore-mutations"
+        mut.run["suppressionReason"] = reason
+    return mutants
+
+
 def _normalize_ignore_target(raw: str) -> str:
     key = re.sub(r"[^A-Za-z0-9]", "", raw).lower()
     return IGNORE_MUTATOR_ALIASES.get(key, raw.strip())
@@ -6346,6 +6370,7 @@ def _parity_coverage(rep: Report, mutants: list[dict[str, Any]]) -> dict[str, An
     llvm_switch = execution.get("llvmSwitch") if isinstance(execution.get("llvmSwitch"), dict) else {}
     reporter_runs = execution.get("reporterRuns") if isinstance(execution.get("reporterRuns"), list) else []
     mutator_names = sorted({str(mut.get("mutator")) for mut in mutants if mut.get("mutator")})
+    ignored_mutators = execution.get("ignoredMutators") if isinstance(execution.get("ignoredMutators"), list) else []
     mutation_level = str(execution.get("mutationLevel") or "Custom")
     has_official_mutation_level = mutation_level in MUTATION_LEVEL_NAMES
     ownership_model = str(build_graph.get("ownershipModel") or "none")
@@ -6408,6 +6433,7 @@ def _parity_coverage(rep: Report, mutants: list[dict[str, Any]]) -> dict[str, An
             _parity_status(has_since and has_baseline, partial=has_since or has_baseline),
             [
                 f"base={rep.base}",
+                f"since={execution.get('since')}",
                 f"baselineEnabled={baseline.get('enabled', False)}",
                 f"baselineWrites={baseline.get('cacheWrites', 0)}",
             ],
@@ -6425,10 +6451,11 @@ def _parity_coverage(rep: Report, mutants: list[dict[str, Any]]) -> dict[str, An
         ),
         _parity_item(
             "ignore-directives",
-            "Stryker disable/restore source directives",
+            "Stryker disable/restore source directives and ignore-mutation filters",
             _parity_status(True),
             [
                 "supports // Stryker disable|restore all|once|next-line",
+                f"configuredIgnoredMutators={len(ignored_mutators)}",
                 f"ignoredMutants={ignored_count}",
             ],
             [],
@@ -9409,6 +9436,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--repo-dir", dest="repo", required=True)
     ap.add_argument("--files", required=True)
     ap.add_argument("--diff-base", default=None, dest="diff_base")
+    ap.add_argument("--since-label", default=None, dest="since_label")
     ap.add_argument("--lines", default=None)
     ap.add_argument("--build-cmd", required=True, dest="build_cmd")
     ap.add_argument("--check-cmd", required=False, default=None, dest="check_cmd")
@@ -9432,6 +9460,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--include-metal", action="store_true", dest="include_metal")
     ap.add_argument("--mutators", default=None)
     ap.add_argument("--mutation-level", choices=sorted(MUTATION_LEVEL_NAMES), default="Standard", dest="mutation_level")
+    ap.add_argument("--ignore-mutations", default="", dest="ignore_mutations")
     ap.add_argument("--timeout", type=int, default=None, dest="timeout_seconds",
                     help="Per-mutant timeout in seconds")
     ap.add_argument("--timeout-factor", type=float, default=1.5,
@@ -9689,6 +9718,7 @@ def main(argv: list[str] | None = None) -> int:
     mutator_spec = args.mutators or ",".join(mutators_for_level(args.mutation_level))
     try:
         enabled = normalize_mutator_list(mutator_spec)
+        ignored_mutators = normalize_ignore_mutation_list(args.ignore_mutations)
     except ValueError as exc:
         ap.error(str(exc))
     level_mutators = set(mutators_for_level(args.mutation_level))
@@ -9741,6 +9771,8 @@ def main(argv: list[str] | None = None) -> int:
             "mode": args.mode,
             "mutationLevel": reported_mutation_level,
             "enabledMutators": sorted(enabled),
+            "ignoredMutators": sorted(ignored_mutators),
+            "since": args.since_label,
             "executionMode": actual_execution_mode,
             "requestedExecutionMode": requested_execution_mode,
             "executionBackend": actual_execution_backend,
@@ -9989,6 +10021,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.max_mutants:
         discovered = discovered[: args.max_mutants]
 
+    discovered = apply_configured_ignore_mutations(discovered, ignored_mutators)
     discovered = _apply_shard(discovered, args.shard_index, args.shard_total)
     if requested_execution_mode == "mutant-switch":
         mutant_switch_fallback_reason = _mutant_switch_fallback_reason(repo, discovered, args)

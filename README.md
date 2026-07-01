@@ -48,6 +48,8 @@ stryker-cxx run \
 mutation to the local diff against that ref. Use `--mutation-level
 Basic|Standard|Advanced|Complete` to select a Stryker-style default mutator set; an
 explicit `--mutators` list still wins when a review needs an exact surface.
+Use `--ignore-mutations <names>` or config `ignoreMutations` to keep selected
+mutator families visible in the report as `IGNORED` without executing them.
 
 For common static-check phases, use `--check-system clang-tidy|cppcheck` with
 optional `--check-args` to synthesize a check command from the current

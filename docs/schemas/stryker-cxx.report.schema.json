@@ -54,6 +54,11 @@
           "type": "array",
           "items": { "type": "string" }
         },
+        "ignoredMutators": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "since": { "type": ["string", "null"] },
         "executionMode": { "enum": ["source-overlay", "mutant-switch"] },
         "requestedExecutionMode": { "enum": ["source-overlay", "mutant-switch"] },
         "executionBackend": { "enum": ["auto", "source-overlay", "mutant-switch", "compiled-artifact", "llvm-switch"] },

@@ -52,6 +52,7 @@ mutators:
   - EqualityOperator
   - LogicalOperator
   - BooleanLiteral
+ignoreMutations: []
 thresholds:
   high: 0.9
   low: 0.7
@@ -250,6 +251,7 @@ CONFIG_ALLOWED_TOP_LEVEL = {
     "files",
     "mutators",
     "mutationLevel",
+    "ignoreMutations",
     "thresholds",
     "execution",
     "mutationArtifact",
@@ -279,6 +281,7 @@ CONFIG_ALLOWED_NESTED = {
         "includeMetal",
         "mutators",
         "mutationLevel",
+        "ignoreMutations",
         "mutationMutators",
         "threshold",
         "thresholdHigh",
@@ -891,6 +894,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--exclude", default=None)
     run.add_argument("--mutators", default=None)
     run.add_argument("--mutation-level", choices=sorted(engine.MUTATION_LEVEL_NAMES), default=None, dest="mutation_level")
+    run.add_argument("--ignore-mutations", default=None, dest="ignore_mutations")
     run.add_argument("--output-format", choices=["legacy", "stryker-cxx"], default="stryker-cxx")
     run.add_argument("--format", choices=["json", "markdown", "html", "sarif", "github-annotations", "mutation-testing-elements"], default="json")
     run.add_argument("--mode", choices=["token", "clang", "clang-ast"], default=None)
@@ -984,6 +988,7 @@ def _build_parser() -> argparse.ArgumentParser:
     list_mutants.add_argument("--exclude", default=None)
     list_mutants.add_argument("--mutators", default=None)
     list_mutants.add_argument("--mutation-level", choices=sorted(engine.MUTATION_LEVEL_NAMES), default=None, dest="mutation_level")
+    list_mutants.add_argument("--ignore-mutations", default=None, dest="ignore_mutations")
     list_mutants.add_argument("--mode", choices=["token", "clang", "clang-ast"], default=None)
     list_mutants.add_argument("--equivalent-suppression", choices=["off", "conservative", "aggressive"], default=None, dest="equivalent_suppression")
     list_mutants.add_argument("--plugin", action="append", default=[])
@@ -1092,6 +1097,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_mutant.add_argument("--env-block", action="append", default=[], dest="env_block")
     run_mutant.add_argument("--mutators", default=None)
     run_mutant.add_argument("--mutation-level", choices=sorted(engine.MUTATION_LEVEL_NAMES), default=None, dest="mutation_level")
+    run_mutant.add_argument("--ignore-mutations", default=None, dest="ignore_mutations")
     run_mutant.add_argument("--fail-on-empty", action="store_true", dest="fail_on_empty")
     run_mutant.add_argument("--threshold", type=float, default=None)
     run_mutant.add_argument("--threshold-high", type=float, default=None, dest="threshold_high")
@@ -1439,6 +1445,7 @@ def _resolve_defaults(args: argparse.Namespace) -> dict[str, Any]:
             or cfg.get("base")
             or cfg.get("since")
         ),
+        "since": getattr(args, "since", None) or cfg.get("since"),
         "build_command": getattr(args, "build_command", None) or execution.get("buildCommand") or adapter.get("build"),
         "check_command": getattr(args, "check_command", None) or execution.get("checkCommand") or checker,
         "test_command": getattr(args, "test_command", None) or execution.get("testCommand") or adapter.get("test"),
@@ -1467,6 +1474,11 @@ def _resolve_defaults(args: argparse.Namespace) -> dict[str, Any]:
             or execution.get("includeMetal", False)
         ),
         "mutators": getattr(args, "mutators", None) or execution.get("mutators") or execution.get("mutationMutators") or cfg.get("mutators"),
+        "ignore_mutations": (
+            _coerce_list(getattr(args, "ignore_mutations", None))
+            or _coerce_list(execution.get("ignoreMutations"))
+            or _coerce_list(cfg.get("ignoreMutations"))
+        ),
         "mutation_level": (
             getattr(args, "mutation_level", None)
             or execution.get("mutationLevel")
@@ -1774,12 +1786,16 @@ def _run(args: argparse.Namespace) -> int:
     ]
     if cfg["base"]:
         legacy_args.extend(["--diff-base", cfg["base"]])
+    if cfg["since"]:
+        legacy_args.extend(["--since-label", cfg["since"]])
     if args.lines:
         legacy_args.extend(["--lines", args.lines])
     if cfg["max_mutants"]:
         legacy_args.extend(["--max-mutants", str(cfg["max_mutants"])])
     if cfg["include_metal"]:
         legacy_args.append("--include-metal")
+    if cfg["ignore_mutations"]:
+        legacy_args.extend(["--ignore-mutations", ",".join(cfg["ignore_mutations"])])
     if cfg["threshold"] is not None:
         legacy_args.extend(["--threshold", str(cfg["threshold"])])
     if cfg["threshold_high"] is not None:
@@ -1969,6 +1985,9 @@ def _list_mutants(args: argparse.Namespace) -> int:
 
     if cfg["max_mutants"]:
         pending = pending[: cfg["max_mutants"]]
+    if cfg["ignore_mutations"]:
+        ignored_mutators = engine.normalize_ignore_mutation_list(",".join(cfg["ignore_mutations"]))
+        pending = engine.apply_configured_ignore_mutations(pending, ignored_mutators)
 
     payload = [
         {
@@ -2038,8 +2057,12 @@ def _run_mutant(args: argparse.Namespace) -> int:
         "--mutation-level",
         cfg["mutation_level"],
     ]
+    if cfg["ignore_mutations"]:
+        legacy_args.extend(["--ignore-mutations", ",".join(cfg["ignore_mutations"])])
     if cfg["base"]:
         legacy_args.extend(["--diff-base", cfg["base"]])
+    if cfg["since"]:
+        legacy_args.extend(["--since-label", cfg["since"]])
     if args.lines:
         legacy_args.extend(["--lines", args.lines])
     if cfg["timeout"] is not None:

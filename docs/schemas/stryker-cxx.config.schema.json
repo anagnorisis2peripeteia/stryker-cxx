@@ -35,6 +35,12 @@
       ]
     },
     "mutationLevel": { "enum": ["Basic", "Standard", "Advanced", "Complete"] },
+    "ignoreMutations": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "array", "items": { "type": "string" } }
+      ]
+    },
     "thresholds": {
       "type": "object",
       "additionalProperties": false,
@@ -85,6 +91,12 @@
         "includeMetal": { "type": "boolean" },
         "mutators": {},
         "mutationLevel": { "enum": ["Basic", "Standard", "Advanced", "Complete"] },
+        "ignoreMutations": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "string" } }
+          ]
+        },
         "threshold": { "type": "number", "minimum": 0, "maximum": 1 },
         "thresholdHigh": { "type": "number", "minimum": 0, "maximum": 1 },
         "thresholdLow": { "type": "number", "minimum": 0, "maximum": 1 },

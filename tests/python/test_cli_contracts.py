@@ -7198,6 +7198,41 @@ class CliContractTests(unittest.TestCase):
         self.assertIn("EqualityOperator", standard)
         self.assertNotIn("EqualityOperator", basic)
 
+    def test_ignore_mutations_marks_matching_mutants_ignored(self) -> None:
+        report = self.repo / "ignore-mutations.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "true",
+            "--report",
+            str(report),
+            "--mutators",
+            "EqualityOperator",
+            "--ignore-mutations",
+            "equality",
+            "--max-mutants",
+            "1",
+            "--skip-initial-test",
+            "--quiet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        self.assertEqual(payload["ignored"], 1)
+        self.assertEqual(payload["mutants"][0]["status"], "IGNORED")
+        self.assertEqual(payload["mutants"][0]["ignoreReason"], "ignored by configured ignoreMutations: EqualityOperator")
+        self.assertEqual(payload["execution"]["ignoredMutators"], ["EqualityOperator"])
+        by_id = {item["id"]: item for item in payload["parity"]["items"]}
+        ignore_evidence = by_id["ignore-directives"]["evidence"]
+        self.assertIn("configuredIgnoredMutators=1", ignore_evidence)
+
     def test_since_alias_maps_to_base_for_local_dirty_diff(self) -> None:
         self.source.write_text("int main() { if (1 != 1) return 0; return 1; }\n")
         report = self.repo / "since.json"
@@ -7226,6 +7261,7 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
         payload = json.loads(report.read_text())
         self.assertEqual(payload["base"], "HEAD")
+        self.assertEqual(payload["execution"]["since"], "HEAD")
         by_id = {item["id"]: item for item in payload["parity"]["items"]}
         self.assertIn(by_id["baseline-since"]["status"], {"partial", "covered"})
 
