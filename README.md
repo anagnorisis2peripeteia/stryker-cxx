@@ -46,7 +46,7 @@ stryker-cxx run \
 
 `--since <ref>` is the Stryker.NET-style spelling for `--base <ref>` and scopes
 mutation to the local diff against that ref. Use `--mutation-level
-Standard|Advanced|Complete` to select a Stryker-style default mutator set; an
+Basic|Standard|Advanced|Complete` to select a Stryker-style default mutator set; an
 explicit `--mutators` list still wins when a review needs an exact surface.
 
 For common static-check phases, use `--check-system clang-tidy|cppcheck` with
@@ -149,7 +149,8 @@ entries, by-day status buckets, branches, mutant locations, and optional repo
 file-existence diagnostics before or after merge/prune maintenance.
 Use `stryker-cxx parity-audit --report mutation.json --format markdown` to turn
 the native eight-gap Mull/Stryker.NET parity metadata into a CI-readable
-checklist.
+checklist. Add `--profile review` to fail missing/unknown parity evidence, or
+`--profile strict` to fail partial parity evidence too.
 
 For dashboard uploads, `--dashboard-upload-url <url>` remains explicit and
 optional. Add `--dashboard-auth-token-env STRYKER_CXX_DASHBOARD_TOKEN`,

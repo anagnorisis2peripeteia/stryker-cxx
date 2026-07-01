@@ -142,7 +142,8 @@ Current implementation:
 - dashboard export/upload metadata includes retry, retention, project, branch,
   commit, build URL, and auth-header provenance.
 - `stryker-cxx parity-audit --report <path>` renders the native parity metadata
-  as JSON or Markdown for CI and review bundles.
+  as JSON or Markdown for CI and review bundles; `--profile review|strict`
+  turns the eight-gap metadata into a failing gate.
 
 ## Phase 7: Mull interop
 

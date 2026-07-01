@@ -546,6 +546,12 @@ SOURCE_EXTENSIONS = {
     ".metal",
 }
 DEFAULT_MUTATORS = ["ConditionalBoundary", "EqualityOperator", "LogicalOperator", "BooleanLiteral"]
+MUTATION_LEVEL_BASIC_MUTATORS = [
+    "ConditionalBoundary",
+    "LogicalOperator",
+    "ArithmeticOperator",
+    "BitwiseOperator",
+]
 MUTATION_LEVEL_ADVANCED_MUTATORS = [
     "ConditionalBoundary",
     "EqualityOperator",
@@ -560,13 +566,16 @@ MUTATION_LEVEL_ADVANCED_MUTATORS = [
     "BitwiseOperator",
     "ShiftOperator",
 ]
-MUTATION_LEVEL_NAMES = {"Standard", "Advanced", "Complete"}
+MUTATION_LEVEL_NAMES = {"Basic", "Standard", "Advanced", "Complete"}
 
 
 def mutators_for_level(level: str) -> list[str]:
     normalized = (level or "Standard").strip()
     if normalized not in MUTATION_LEVEL_NAMES:
-        raise ValueError("--mutation-level must be one of: Advanced, Complete, Standard")
+        allowed = ", ".join(sorted(MUTATION_LEVEL_NAMES))
+        raise ValueError(f"--mutation-level must be one of: {allowed}")
+    if normalized == "Basic":
+        return [name for name in MUTATION_LEVEL_BASIC_MUTATORS if name in MUTATORS]
     if normalized == "Standard":
         return list(DEFAULT_MUTATORS)
     if normalized == "Advanced":
@@ -6338,6 +6347,7 @@ def _parity_coverage(rep: Report, mutants: list[dict[str, Any]]) -> dict[str, An
     reporter_runs = execution.get("reporterRuns") if isinstance(execution.get("reporterRuns"), list) else []
     mutator_names = sorted({str(mut.get("mutator")) for mut in mutants if mut.get("mutator")})
     mutation_level = str(execution.get("mutationLevel") or "Custom")
+    has_official_mutation_level = mutation_level in MUTATION_LEVEL_NAMES
     ownership_model = str(build_graph.get("ownershipModel") or "none")
     has_build_ownership = ownership_model not in {"none", "explicit-source"}
     has_coverage_selection = bool(
@@ -6406,12 +6416,12 @@ def _parity_coverage(rep: Report, mutants: list[dict[str, Any]]) -> dict[str, An
         _parity_item(
             "mutator-levels",
             "Stryker-style mutation levels and broader C++ mutator catalog",
-            _parity_status(mutation_level in {"Advanced", "Complete"}, partial=bool(mutator_names)),
+            _parity_status(has_official_mutation_level and bool(mutator_names), partial=bool(mutator_names)),
             [
                 f"mutationLevel={mutation_level}",
                 f"enabledMutators={len(mutator_names)}",
             ],
-            [] if mutation_level in {"Advanced", "Complete"} else ["run --mutation-level Advanced or Complete for broader parity coverage"],
+            [] if has_official_mutation_level else ["run --mutation-level Basic, Standard, Advanced, or Complete"],
         ),
         _parity_item(
             "ignore-directives",

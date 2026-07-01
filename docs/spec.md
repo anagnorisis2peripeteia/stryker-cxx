@@ -40,7 +40,7 @@ backend and mutation runs through compiled artifacts, is tracked in
 - `stryker-cxx list-mutants`
 - `stryker-cxx run-mutant`
 - `--base`, `--since`, `--lines`, `--include`, `--exclude`
-- `--mutators`, `--mutation-level Standard|Advanced|Complete`,
+- `--mutators`, `--mutation-level Basic|Standard|Advanced|Complete`,
   `--max-mutants`, `--include-metal`
 - `--mode token`
 - `--mode clang` using libclang parse validation and AST-confirmed source mutations
@@ -1228,7 +1228,8 @@ The current mutators cover the first useful set. Full parity requires broader
 C/C++ semantics.
 
 Mutation-level presets are implemented as Stryker-style default mutator sets:
-`Standard` is the historical safe default, `Advanced` adds broader arithmetic,
+`Basic` is the smaller starter level for branch/logical/arithmetic/bitwise
+coverage, `Standard` is the historical safe default, `Advanced` adds broader
 return, literal, unary, assignment, bitwise, shift, and update families, and
 `Complete` enables every built-in mutator. An explicit `--mutators` list remains
 authoritative for exact PR-scope proof runs.

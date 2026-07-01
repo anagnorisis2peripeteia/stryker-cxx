@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from stryker_cxx import engine
 from stryker_cxx.cli import _adapter_commands, _checker_command
 from stryker_cxx.project_analysis import analyze_project
 
@@ -7183,6 +7184,19 @@ class CliContractTests(unittest.TestCase):
         audit = self._cli("parity-audit", "--report", str(report), "--format", "markdown")
         self.assertEqual(audit.returncode, 0, audit.stderr + audit.stdout)
         self.assertIn("mutator-levels", audit.stdout)
+        review_audit = self._cli("parity-audit", "--report", str(report), "--profile", "review")
+        self.assertEqual(review_audit.returncode, 2, review_audit.stderr + review_audit.stdout)
+        self.assertIn("baseline-since=missing", review_audit.stderr)
+        strict_audit = self._cli("parity-audit", "--report", str(report), "--profile", "strict")
+        self.assertEqual(strict_audit.returncode, 2, strict_audit.stderr + strict_audit.stdout)
+
+    def test_mutation_level_basic_matches_stryker_level_contract(self) -> None:
+        basic = engine.mutators_for_level("Basic")
+        standard = engine.mutators_for_level("Standard")
+        self.assertIn("ArithmeticOperator", basic)
+        self.assertIn("BitwiseOperator", basic)
+        self.assertIn("EqualityOperator", standard)
+        self.assertNotIn("EqualityOperator", basic)
 
     def test_since_alias_maps_to_base_for_local_dirty_diff(self) -> None:
         self.source.write_text("int main() { if (1 != 1) return 0; return 1; }\n")

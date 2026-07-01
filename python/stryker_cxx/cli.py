@@ -11,6 +11,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from datetime import datetime, timezone
 from typing import Any
 
@@ -836,6 +837,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parity_audit = subparsers.add_parser("parity-audit", help="summarize Mull/Stryker.NET parity coverage from a report")
     parity_audit.add_argument("--report", required=True)
     parity_audit.add_argument("--format", choices=["json", "markdown"], default="json")
+    parity_audit.add_argument(
+        "--profile",
+        choices=["summary", "review", "strict"],
+        default="summary",
+        help="summary prints only; review fails missing items; strict fails missing or partial items",
+    )
 
     run = subparsers.add_parser("run", help="discover, mutate, build, and run tests")
     run.add_argument("--config", default=None, help="Optional YAML/JSON config file")
@@ -1291,12 +1298,20 @@ def _parity_audit(args: argparse.Namespace) -> int:
         parity = execution.get("parity") if isinstance(execution.get("parity"), dict) else None
     if not isinstance(parity, dict):
         raise ValueError("report does not contain stryker-cxx parity metadata")
+    failures = _parity_profile_failures(parity, args.profile)
     if args.format == "json":
         print(json.dumps(parity, indent=2, sort_keys=True))
+        if failures:
+            print(
+                f"parity audit failed profile={args.profile}: {', '.join(failures)}",
+                file=sys.stderr,
+            )
+            return 2
         return 0
     print("# stryker-cxx parity audit")
     print()
     print(f"Schema: `{parity.get('schemaVersion', 'unknown')}`")
+    print(f"Profile: `{args.profile}`")
     print()
     for item in parity.get("items", []):
         if not isinstance(item, dict):
@@ -1305,7 +1320,29 @@ def _parity_audit(args: argparse.Namespace) -> int:
         remaining = item.get("remaining")
         if isinstance(remaining, list) and remaining:
             print(f"  remaining: {'; '.join(str(value) for value in remaining)}")
+    if failures:
+        print()
+        print(f"Failed profile `{args.profile}`: {', '.join(failures)}")
+        return 2
     return 0
+
+
+def _parity_profile_failures(parity: dict[str, Any], profile: str) -> list[str]:
+    if profile == "summary":
+        return []
+    allowed = {"covered", "partial", "external"} if profile == "review" else {"covered", "external"}
+    failures: list[str] = []
+    items = parity.get("items")
+    if not isinstance(items, list) or not items:
+        return ["missing-parity-items"]
+    for item in items:
+        if not isinstance(item, dict):
+            failures.append("invalid-parity-item")
+            continue
+        status = str(item.get("status") or "unknown")
+        if status not in allowed:
+            failures.append(f"{item.get('id', 'unknown')}={status}")
+    return failures
 
 
 def _baseline_entry_file_exists(repo: str, value: Any) -> bool:

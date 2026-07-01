@@ -34,7 +34,7 @@
         }
       ]
     },
-    "mutationLevel": { "enum": ["Standard", "Advanced", "Complete"] },
+    "mutationLevel": { "enum": ["Basic", "Standard", "Advanced", "Complete"] },
     "thresholds": {
       "type": "object",
       "additionalProperties": false,
@@ -84,7 +84,7 @@
         "maxMutants": { "type": "integer", "minimum": 1 },
         "includeMetal": { "type": "boolean" },
         "mutators": {},
-        "mutationLevel": { "enum": ["Standard", "Advanced", "Complete"] },
+        "mutationLevel": { "enum": ["Basic", "Standard", "Advanced", "Complete"] },
         "threshold": { "type": "number", "minimum": 0, "maximum": 1 },
         "thresholdHigh": { "type": "number", "minimum": 0, "maximum": 1 },
         "thresholdLow": { "type": "number", "minimum": 0, "maximum": 1 },
