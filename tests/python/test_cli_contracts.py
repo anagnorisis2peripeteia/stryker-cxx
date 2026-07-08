@@ -3738,7 +3738,14 @@ class CliContractTests(unittest.TestCase):
         )
         self._git("add", "sample.cpp", "WORKSPACE.bazel", "BUILD.bazel")
         self._git("-c", "user.name=stryker-cxx", "-c", "user.email=stryker-cxx@example.invalid", "commit", "-q", "-m", "compiled-bazel-backend")
-        subprocess.run(["bazel", "build", "//:sample"], cwd=self.repo, check=True, text=True, capture_output=True)
+        try:
+            subprocess.run(["bazel", "build", "//:sample"], cwd=self.repo, check=True, text=True, capture_output=True)
+        except subprocess.CalledProcessError as exc:
+            # bazel is on PATH (bazelisk ships on GitHub ubuntu/macos runners) but can't actually
+            # build here — e.g. it can't fetch a toolchain in a sandboxed CI. That's environmental,
+            # not a stryker-cxx failure, so skip rather than error. `skipIf(which("bazel") is None)`
+            # alone was too weak — "binary present" != "bazel works" — which kept CI chronically red.
+            self.skipTest(f"bazel present but cannot build in this environment: {(exc.stderr or '')[:300]}")
         original_source = self.source.read_text()
         executable = self.repo / "bazel-bin" / "sample"
         original_executable_hash = _sha256(executable)
