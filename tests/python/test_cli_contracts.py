@@ -3729,14 +3729,21 @@ class CliContractTests(unittest.TestCase):
             "  return value(1) == 2 ? EXIT_SUCCESS : EXIT_FAILURE;\n"
             "}\n"
         )
-        (self.repo / "WORKSPACE.bazel").write_text("")
+        # bzlmod fixture (Bazel 9 removed built-in C++ rules) so the build succeeds and this test
+        # runs for real rather than self-skipping; the compiled-executable backend places the
+        # mutant into bazel's read-only `bazel-bin/` cache via _place_compiled_artifact.
+        (self.repo / "MODULE.bazel").write_text(
+            'bazel_dep(name = "rules_cc", version = "0.2.17")\n'
+        )
         (self.repo / "BUILD.bazel").write_text(
+            'load("@rules_cc//cc:defs.bzl", "cc_binary")\n'
+            "\n"
             "cc_binary(\n"
-            "    name = 'sample',\n"
-            "    srcs = ['sample.cpp'],\n"
+            '    name = "sample",\n'
+            '    srcs = ["sample.cpp"],\n'
             ")\n"
         )
-        self._git("add", "sample.cpp", "WORKSPACE.bazel", "BUILD.bazel")
+        self._git("add", "sample.cpp", "MODULE.bazel", "BUILD.bazel")
         self._git("-c", "user.name=stryker-cxx", "-c", "user.email=stryker-cxx@example.invalid", "commit", "-q", "-m", "compiled-bazel-backend")
         try:
             subprocess.run(["bazel", "build", "//:sample"], cwd=self.repo, check=True, text=True, capture_output=True)
@@ -3792,6 +3799,30 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(run["configureCommand"], None)
         self.assertIn("bazel build", run["buildCommand"])
         self.assertEqual(run["artifactBackend"], "compiled-executable")
+
+    def test_place_compiled_artifact_replaces_readonly_and_preserves_symlink(self) -> None:
+        # A read-only regular output (bazel's 0444 bazel-bin/<t>) is replaced by entry unlink, not
+        # a write-through that would EACCES; a symlink dst stays a symlink (its target changes) so
+        # the swap/restore round-trip never turns a symlink into a regular file.
+        from stryker_cxx.engine import _place_compiled_artifact
+
+        src = self.repo / "src.bin"
+        src.write_text("MUT")
+
+        readonly = self.repo / "readonly.bin"
+        readonly.write_text("ORIG")
+        os.chmod(readonly, 0o444)
+        _place_compiled_artifact(str(src), str(readonly))
+        self.assertFalse(os.path.islink(readonly))
+        self.assertEqual(readonly.read_text(), "MUT")
+
+        target = self.repo / "target.bin"
+        target.write_text("ORIG")
+        link = self.repo / "link.bin"
+        os.symlink(target, link)
+        _place_compiled_artifact(str(src), str(link))
+        self.assertTrue(os.path.islink(link))
+        self.assertEqual(target.read_text(), "MUT")
 
     def test_compiled_executable_backend_supports_xcodebuild_executable_with_explicit_artifact(self) -> None:
         self.source.write_text(
