@@ -6319,6 +6319,7 @@ class CliContractTests(unittest.TestCase):
             "user.email=stryker-cxx@example.invalid",
             "commit",
             "-q",
+            "-m",
             "clang-ast-extra-literal-fixture",
         )
         report = self.repo / "clang-ast-extra-literals.json"
@@ -6356,7 +6357,8 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(char_mut["original"].strip(), "'A'")
         self.assertEqual(char_mut["mutated"].strip(), "'x'")
         self.assertEqual(float_mut["original"].strip(), "0.5")
-        self.assertEqual(float_mut["mutated"].strip(), "1.0")
+        # _mutate_floating_literal: zero-like -> 1.0, everything else -> 0.0. 0.5 is non-zero.
+        self.assertEqual(float_mut["mutated"].strip(), "0.0")
         self.assertEqual(string_mut["original"].strip(), '"x"')
         self.assertEqual(string_mut["mutated"].strip(), '""')
 

@@ -1924,10 +1924,29 @@ def _clang_file_name(location: Any) -> str:
     return str(getattr(file_obj, "name", "") or "")
 
 
+# A COMPOUND_STMT whose parent is one of these is a function/method/lambda BODY, not an inner
+# block. Removing the whole body just empties the function (a low-value, near-equivalent mutant),
+# so BlockRemoval excludes it. Relying instead on the accident that a multi-line body's first
+# line isn't brace-delimited wrongly mutated single-line bodies (`int main() {{...} ...}`).
+_CLANG_FUNCTION_BODY_PARENT_KINDS = frozenset(
+    {
+        "FUNCTION_DECL",
+        "CXX_METHOD",
+        "CONSTRUCTOR",
+        "DESTRUCTOR",
+        "CONVERSION_FUNCTION",
+        "FUNCTION_TEMPLATE",
+        "LAMBDA_EXPR",
+        "OBJC_INSTANCE_METHOD_DECL",
+        "OBJC_CLASS_METHOD_DECL",
+    }
+)
+
+
 def _collect_clang_cursor_ranges(cursor: Any, full_path: str) -> list[dict[str, int | str]]:
     out: list[dict[str, int | str]] = []
 
-    def visit(node: Any) -> None:
+    def visit(node: Any, parent_kind: str) -> None:
         try:
             children = list(node.get_children())
         except Exception:
@@ -1942,20 +1961,21 @@ def _collect_clang_cursor_ranges(cursor: Any, full_path: str) -> list[dict[str, 
         except Exception:
             start_file = ""
         if kind and start and end and start_file == full_path:
-            out.append(
-                {
-                    "kind": kind,
-                    "startLine": int(getattr(start, "line", 0) or 0),
-                    "startColumn": int(getattr(start, "column", 0) or 0),
-                    "endLine": int(getattr(end, "line", 0) or 0),
-                    "endColumn": int(getattr(end, "column", 0) or 0),
-                }
-            )
+            entry: dict[str, int | str] = {
+                "kind": kind,
+                "startLine": int(getattr(start, "line", 0) or 0),
+                "startColumn": int(getattr(start, "column", 0) or 0),
+                "endLine": int(getattr(end, "line", 0) or 0),
+                "endColumn": int(getattr(end, "column", 0) or 0),
+            }
+            if kind == "COMPOUND_STMT" and parent_kind in _CLANG_FUNCTION_BODY_PARENT_KINDS:
+                entry["isFunctionBody"] = 1
+            out.append(entry)
 
         for child in children:
-            visit(child)
+            visit(child, kind)
 
-    visit(cursor)
+    visit(cursor, "")
     return out
 
 
@@ -5550,7 +5570,13 @@ def _direct_ast_range_mutants(
             mut.rewriteStrategy = "clang-ast-direct-statement"
             out.append(mut)
 
-    if "BlockRemoval" in enabled and kind in AST_MUTATOR_CURSOR_KINDS["BlockRemoval"] and stripped.startswith("{") and stripped.endswith("}"):
+    if (
+        "BlockRemoval" in enabled
+        and kind in AST_MUTATOR_CURSOR_KINDS["BlockRemoval"]
+        and stripped.startswith("{")
+        and stripped.endswith("}")
+        and not item.get("isFunctionBody")
+    ):
         mut = Mutant("BlockRemoval", path, line_no, col0 + leading, stripped, "{}")
         mut.id = stable_id(mut)
         mut.nodeKind = kind
