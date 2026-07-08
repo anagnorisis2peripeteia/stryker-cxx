@@ -7638,6 +7638,24 @@ def _sha256_file(path: str) -> str:
     return digest.hexdigest()
 
 
+def _place_compiled_artifact(src: str, dst: str) -> None:
+    """Copy ``src`` onto ``dst``, tolerating a read-only *regular* build output such as bazel's
+    ``bazel-bin/<t>`` (mode 0444), where ``shutil.copy2`` alone fails with EACCES. For a regular
+    file we unlink ``dst`` first — replacing the entry rather than writing through to the read-only
+    file (its parent dir is writable even when the file is 0444), with a chmod fallback. A SYMLINK
+    ``dst`` is deliberately left in place and copied through, so the round-trip never turns a
+    symlink into a regular file (artifact-hygiene contract); its target is what actually changes."""
+    if os.path.lexists(dst) and not os.path.islink(dst):
+        try:
+            os.remove(dst)
+        except OSError:
+            try:
+                os.chmod(dst, 0o644)
+            except OSError:
+                pass
+    shutil.copy2(src, dst)
+
+
 def _ignore_for_compiled_scratch(build_dir: str | None, artifact_root: str | None):
     ignored = {".git", "__pycache__", ".pytest_cache", "node_modules"}
     if build_dir and not os.path.isabs(build_dir):
@@ -8583,7 +8601,7 @@ def _run_mutant_once_compiled_artifact(
             "waitMs": int((time.perf_counter() - lock_wait_start) * 1000),
         }
         shutil.copy2(original_artifact, backup_artifact)
-        shutil.copy2(mutated_artifact, original_artifact)
+        _place_compiled_artifact(mutated_artifact, original_artifact)
         mut.run["artifactPlaced"] = True
         mut.run["scheduler"] = per_mutant_scheduler_record(
             coverage_selected=bool(mut.run.get("selectedTestCommand")),
@@ -8622,7 +8640,7 @@ def _run_mutant_once_compiled_artifact(
     finally:
         try:
             if os.path.isfile(backup_artifact):
-                shutil.copy2(backup_artifact, original_artifact)
+                _place_compiled_artifact(backup_artifact, original_artifact)
                 original_hash_after = _sha256_file(original_artifact)
             elif os.path.isfile(original_artifact):
                 original_hash_after = _sha256_file(original_artifact)
@@ -8910,7 +8928,7 @@ def _run_batch_probe_compiled_artifact(
             "waitMs": int((time.perf_counter() - lock_wait_start) * 1000),
         }
         shutil.copy2(original_artifact, backup_artifact)
-        shutil.copy2(mutated_artifact, original_artifact)
+        _place_compiled_artifact(mutated_artifact, original_artifact)
         run["artifactPlaced"] = True
         if skip_tests:
             result = (
@@ -8959,7 +8977,7 @@ def _run_batch_probe_compiled_artifact(
         status = result[0] if result else "PENDING"
         try:
             if os.path.isfile(backup_artifact):
-                shutil.copy2(backup_artifact, original_artifact)
+                _place_compiled_artifact(backup_artifact, original_artifact)
                 original_hash_after = _sha256_file(original_artifact)
             elif os.path.isfile(original_artifact):
                 original_hash_after = _sha256_file(original_artifact)
