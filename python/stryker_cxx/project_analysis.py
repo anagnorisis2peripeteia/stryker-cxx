@@ -142,6 +142,7 @@ def _build_systems(
         ("meson", "meson.build"),
         ("bazel", "WORKSPACE.bazel"),
         ("bazel", "WORKSPACE"),
+        ("bazel", "MODULE.bazel"),  # bzlmod-only projects (Bazel 9) have no WORKSPACE
     ]
     for name, marker in markers:
         if os.path.exists(os.path.join(repo, marker)):

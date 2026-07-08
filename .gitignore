@@ -13,3 +13,7 @@ agent_space/
 *.dylib
 *.out
 *.class
+
+# Bazel convenience symlinks + resolved lockfile left by the adapter fixture smoke test
+/fixtures/adapters/bazel/bazel-*
+/fixtures/adapters/bazel/MODULE.bazel.lock
