@@ -1,0 +1,4 @@
+module(name = "stryker_cxx_bazel_fixture", version = "0.0.0")
+
+# Bazel 9 removed the built-in C++ rules; load them from rules_cc explicitly (bzlmod-only).
+bazel_dep(name = "rules_cc", version = "0.2.17")
