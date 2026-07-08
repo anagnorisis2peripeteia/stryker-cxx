@@ -30,7 +30,7 @@ stryker-cxx init --preset cmake-gtest
 
 Supported presets include `cmake`, `ctest`, `ninja`, `make`, `meson`, `bazel`,
 `cmake-gtest`, `cmake-catch2`, `cmake-doctest`, `ninja-gtest`,
-`meson-catch2`, and `bazel-gtest`.
+`meson-catch2`, `bazel-gtest`, and `metal` (Metal Shading Language kernels).
 
 Run mutation testing directly:
 
@@ -212,6 +212,35 @@ stryker-cxx --mte ./mutation-testing-elements.json --summary --json
 stryker-cxx --mte ./mutation-testing-elements.json --survivors
 stryker-cxx --mte ./mutation-testing-elements.json --survivors --json
 ```
+
+### Metal (MSL) kernels
+
+Metal Shading Language (`.metal`) is C++14-based, so `stryker-cxx` mutates it with the
+regular C++ mutators plus two Metal-specific ones: `MetalAddressSpace`
+(`device`/`constant`/`threadgroup` swaps) and `MetalThreadPosition`
+(`thread_position_in_grid` and friends). Metal source is **excluded by default** and
+opted in with `--include-metal`, which also activates the Metal-specific mutators
+regardless of `--mutation-level` (an explicit `--mutators` list is still honoured
+verbatim). Because Metal compiles through `xcrun metal` into a `.metallib` and runs on
+the GPU, your `--build-command` must recompile the `.metallib` and your
+`--test-command` must dispatch the kernel and assert its output.
+
+```bash
+stryker-cxx init --preset metal   # scaffolds includeMetal + xcrun-metal build/test
+
+stryker-cxx run \
+  --repo . \
+  --files src/add.metal \
+  --include-metal \
+  --mutation-level Complete \
+  --build-command "mkdir -p build && xcrun metal -o build/kernels.metallib src/add.metal && swiftc -O host/main.swift -o build/hosttest" \
+  --test-command "./build/hosttest" \
+  --report mutation.json
+```
+
+A runnable example lives in `fixtures/metal/`. Address-space mutants that write through
+a `constant` pointer fail to compile and are reported as `BUILD_ERROR` (which makes
+`run` exit non-zero even when the surviving-mutant threshold is met).
 
 ### Supported input shapes
 

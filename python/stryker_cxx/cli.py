@@ -201,12 +201,57 @@ CONFIG_PRESETS: dict[str, dict[str, str]] = {
         "xcodeDestination": "",
         "testFramework": "xctest",
     },
+    # `metal` is rendered by a dedicated template (_metal_config) because a Metal
+    # config also rewrites top-level files.include/mutators, which the generic
+    # execution-key injector below cannot express. The empty dict keeps it in the
+    # --preset choices list.
+    "metal": {},
 }
+
+
+def _metal_config() -> str:
+    """Starter config for mutation-testing Metal Shading Language (.metal) kernels.
+
+    Metal is compiled by `xcrun metal` into a .metallib and exercised by a GPU host
+    harness, so the build/test commands differ from a normal C++ toolchain and
+    .metal mutation must be opted in via includeMetal. The build/test commands below
+    are placeholders -- edit them to compile your kernels and run your GPU test.
+    """
+    cfg = DEFAULT_CONFIG
+    cfg = cfg.replace('    - "src/**/*.cpp"', '    - "**/*.metal"')
+    cfg = cfg.replace(
+        "mutators:\n"
+        "  - ConditionalBoundary\n"
+        "  - EqualityOperator\n"
+        "  - LogicalOperator\n"
+        "  - BooleanLiteral",
+        "mutators:\n"
+        "  - MetalAddressSpace\n"
+        "  - MetalThreadPosition\n"
+        "  - ArithmeticOperator\n"
+        "  - ConditionalBoundary\n"
+        "  - EqualityOperator\n"
+        "  - LogicalOperator\n"
+        "  - BooleanLiteral",
+    )
+    cfg = cfg.replace("  buildSystem: cmake", '  buildSystem: ""')
+    cfg = cfg.replace(
+        '  buildCommand: "ninja -C build"',
+        "  includeMetal: true\n"
+        # `mkdir -p build` first: xcrun/swiftc write into build/ but won't create it, so a
+        # fresh `init --preset metal` project would fail its very first build otherwise.
+        '  buildCommand: "mkdir -p build && xcrun metal -o build/kernels.metallib '
+        'src/your_kernel.metal && swiftc -O host/main.swift -o build/hosttest"',
+    )
+    cfg = cfg.replace('  testCommand: "./build/tests"', '  testCommand: "./build/hosttest"')
+    return cfg
 
 
 def _config_for_preset(preset: str | None) -> str:
     if not preset:
         return DEFAULT_CONFIG
+    if preset == "metal":
+        return _metal_config()
     values = dict(CONFIG_PRESETS[preset])
     values["buildCommand"] = ""
     values["testCommand"] = ""
@@ -1671,8 +1716,19 @@ def _resolve_defaults(args: argparse.Namespace) -> dict[str, Any]:
     elif exec_mutators:
         defaults["mutators"] = ",".join(exec_mutators)
 
+    mutators_explicit = defaults["mutators"] is not None
     if defaults["mutators"] is None:
         defaults["mutators"] = ",".join(engine.mutators_for_level(defaults["mutation_level"]))
+
+    # --include-metal opts into the Metal-specific mutators when the mutator set is
+    # level-derived (not an explicit --mutators/config surface), so the flag alone
+    # yields Metal mutants at any --mutation-level.
+    if defaults["include_metal"] and not mutators_explicit:
+        selected = [m.strip() for m in defaults["mutators"].split(",") if m.strip()]
+        for metal_mutator in engine.METAL_MUTATORS:
+            if metal_mutator not in selected:
+                selected.append(metal_mutator)
+        defaults["mutators"] = ",".join(selected)
 
     if defaults["threshold"] is None:
         defaults["threshold"] = defaults.get("report_threshold")

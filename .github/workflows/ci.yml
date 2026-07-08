@@ -18,6 +18,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Lint
         run: npm run lint
       - name: Unit and contract tests
@@ -46,3 +49,37 @@ jobs:
         run: npm test
       - name: Prove clang-ast evidence with libclang enabled
         run: npm run evidence:p1
+
+  metal:
+    name: metal (macos)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Report Metal toolchain availability
+        run: |
+          echo "metal:  $(xcrun --find metal 2>&1 || echo 'not found')"
+          echo "swiftc: $(xcrun --find swiftc 2>&1 || echo 'not found')"
+          xcrun metal --version 2>&1 || true
+      - name: Best-effort Metal toolchain download
+        continue-on-error: true
+        run: xcodebuild -downloadComponent MetalToolchain 2>&1 || true
+      - name: Metal support tests
+        # The GPU end-to-end case self-skips with no Metal device; the compiler-gated
+        # compile-detection case runs wherever `xcrun metal` exists; discovery/preset/
+        # pointer-* always run. Surface any silent skip so a green run that skipped the
+        # real-compiler/GPU tiers is visible rather than mistaken for coverage.
+        run: |
+          set -o pipefail
+          PYTHONPATH=python python -m unittest tests.python.test_metal_support -v 2>&1 | tee metal-tests.log
+          if grep -q "MetalCompileDetectionTests.*skipped\|skipped.*MetalCompileDetection" metal-tests.log; then
+            echo "::warning title=Metal compile-detection skipped::the real xcrun-metal compile tier did not run on this runner"
+          fi
+          if grep -q "MetalEndToEndTests.*skipped\|skipped.*MetalEndToEnd" metal-tests.log; then
+            echo "::warning title=Metal GPU e2e skipped::no usable Metal GPU on this runner; the KILLED-on-GPU tier did not run"
+          fi

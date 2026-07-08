@@ -472,6 +472,109 @@ _THROW_STATEMENT_RE = re.compile(r"\bthrow\b[^;]*;")
 _OBJC_MESSAGE_SEND_RE = re.compile(r"^\s*(\[[^;{}]+\])\s*;")
 _METAL_ADDRESS_SPACE_RE = re.compile(r"\b(device|constant|threadgroup)\b(?=\s+)")
 
+# Metal-specific mutators. These only ever match Metal Shading Language surfaces
+# (address-space qualifiers, thread-position attributes) so they are language-scoped
+# and are opted into via --include-metal rather than by a mutation level.
+METAL_MUTATORS = ("MetalAddressSpace", "MetalThreadPosition")
+
+# Token-mode `*` disambiguation --------------------------------------------------
+# Without a clang AST we match `*` with a bare regex, which also hits pointer
+# declarators (`device const float* a`) and dereferences (`*ptr`). Mutating those
+# as arithmetic yields uncompilable garbage mutants -- especially noisy on
+# pointer-heavy Metal kernels. `_star_is_multiplication` classifies a `*` as a
+# genuine binary multiply (mutable) vs a pointer/deref (skip) using local context.
+_ARITH_STAR_TYPE_TOKENS = frozenset({
+    "void", "bool", "char", "short", "int", "long", "float", "double", "wchar_t",
+    "unsigned", "signed", "const", "volatile", "auto", "size_t", "ptrdiff_t",
+    "int8_t", "int16_t", "int32_t", "int64_t",
+    "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+    "char16_t", "char32_t", "intptr_t", "uintptr_t", "nullptr_t",
+    "restrict", "register",
+    # Metal / MSL scalars + address-space qualifiers
+    "uint", "uchar", "ushort", "ulong", "half",
+    "device", "constant", "threadgroup", "thread", "ray_data", "object_data",
+    "threadgroup_imageblock", "imageblock",
+})
+# Keywords that, as the token immediately left of `*`, force a unary read (deref).
+_ARITH_STAR_UNARY_LEFT_KEYWORDS = frozenset({
+    "return", "sizeof", "case", "delete", "throw", "new", "co_return", "co_yield",
+    "co_await", "and", "or", "not", "xor", "typename", "alignof", "static_assert",
+})
+# Metal/CUDA-style vector and packed vector types (e.g. float4, packed_half3).
+_ARITH_STAR_VECTOR_RE = re.compile(
+    r"(?:half|float|double|char|uchar|short|ushort|int|uint|long|ulong|bool|packed_[A-Za-z]+)[1-4]$"
+)
+
+
+def _ident_start_left(code: str, end: int) -> int:
+    i = end
+    while i > 0 and (code[i - 1].isalnum() or code[i - 1] == "_"):
+        i -= 1
+    return i
+
+
+def _star_is_multiplication(code: str, pos: int) -> bool:
+    """Return True when the `*` at ``code[pos]`` is a binary multiply rather than a
+    pointer declarator or unary dereference. Conservative: ambiguous cases that are
+    clearly declarator/deref are skipped, genuine value*value multiplies are kept."""
+    # Left context: skip whitespace and require an operand terminator.
+    j = pos - 1
+    while j >= 0 and code[j] in " \t":
+        j -= 1
+    if j < 0:
+        return False
+    left = code[j]
+    if not (left.isalnum() or left == "_" or left in ")]"):
+        return False  # preceded by operator/paren/comma/start -> unary deref
+    # Right context: must begin an operand (identifier, number, `(`, or unary prefix).
+    k = pos + 1
+    while k < len(code) and code[k] in " \t":
+        k += 1
+    if k >= len(code):
+        return False
+    if not (code[k].isalnum() or code[k] == "_" or code[k] in "(*&+-~!"):
+        return False
+    # Left is an operand terminator. If it is an identifier, walk the declaration-ish
+    # run leftwards; a type/qualifier or unary keyword means this `*` is a declarator.
+    if left.isalnum() or left == "_":
+        idx = j + 1
+        first = True
+        while True:
+            start = _ident_start_left(code, idx)
+            token = code[start:idx]
+            # A unary keyword only forces a deref when it sits directly left of `*`
+            # (`return *p`); with an operand between them it is `return k * n` -- a multiply.
+            if first and token in _ARITH_STAR_UNARY_LEFT_KEYWORDS:
+                return False
+            if token and (token in _ARITH_STAR_TYPE_TOKENS or _ARITH_STAR_VECTOR_RE.match(token)):
+                return False  # pointer declarator (`float* p`, `device T* p`)
+            first = False
+            m = start - 1
+            while m >= 0 and code[m] in " \t":
+                m -= 1
+            if m < 0 or not (code[m].isalnum() or code[m] == "_"):
+                break
+            idx = m + 1
+        # User-DEFINED-type pointer declarator: the left token isn't a known type keyword, but a
+        # SINGLE identifier `<Type>* <name><terminator>` that STARTS a statement is a declaration.
+        # Require a single left token (so `return width * height` -- two tokens -- stays a multiply)
+        # whose boundary is `;`/`{`/`}` or start-of-input (NOT `(`/`,`, which are ambiguous between a
+        # param declaration and a call argument like `foo(a * b)`). Param-list user-type pointers
+        # remain a token-mode residual, resolved correctly under --mode clang-ast.
+        lt_start = _ident_start_left(code, j + 1)
+        b = lt_start - 1
+        while b >= 0 and code[b] in " \t":
+            b -= 1
+        single_left_token = b < 0 or not (code[b].isalnum() or code[b] == "_")
+        if (
+            single_left_token
+            and (b < 0 or code[b] in ";{}")
+            and re.match(r"\s*[A-Za-z_]\w*\s*[,;=)\[{]", code[pos + 1 :])
+        ):
+            return False
+    return True
+
+
 _BLOCK_REMOVAL_RE = re.compile(r"^\s*\{[^{}]*\}\s*$")
 _STATEMENT_REMOVAL_FORBIDDEN_PREFIXES = (
     "if",
@@ -3855,6 +3958,8 @@ def discover(
                 if pattern is None:
                     continue
                 for m in re.finditer(pattern, code):
+                    if orig == "*" and not _star_is_multiplication(code, m.start()):
+                        continue  # pointer declarator / dereference, not a multiply
                     mut = Mutant(mutator, path, i, m.start(), orig, new)
                     mut.id = stable_id(mut)
                     if mutator in MUTANT_SWITCH_EXPRESSION_SPAN_MUTATORS:
@@ -9783,10 +9888,19 @@ def main(argv: list[str] | None = None) -> int:
         ignored_mutators = normalize_ignore_mutation_list(args.ignore_mutations)
     except ValueError as exc:
         ap.error(str(exc))
+    # --include-metal opts into the Metal-specific mutators without the caller
+    # having to name them (and regardless of --mutation-level). An explicit
+    # --mutators surface is respected verbatim and never augmented.
+    if getattr(args, "include_metal", False) and not args.mutators:
+        for metal_mutator in METAL_MUTATORS:
+            if metal_mutator not in enabled:
+                enabled.append(metal_mutator)
     level_mutators = set(mutators_for_level(args.mutation_level))
+    # Metal mutators are an orthogonal language layer, so ignore them when deciding
+    # whether the active set still corresponds to a named --mutation-level.
     reported_mutation_level = (
         args.mutation_level
-        if set(enabled) == level_mutators
+        if set(enabled) - set(METAL_MUTATORS) == level_mutators
         else "Custom"
     )
 
@@ -10060,7 +10174,7 @@ def main(argv: list[str] | None = None) -> int:
     for path in files:
         if path.endswith(".metal") and not args.include_metal:
             if not args.quiet:
-                print(f"[skip] {path}: .metal is not C++-mutable (numeric tests cover it)")
+                print(f"[skip] {path}: Metal source excluded by default; pass --include-metal to mutate it")
             continue
         only = changed_lines(repo, args.diff_base, path) if args.diff_base else None
         if args.lines:
