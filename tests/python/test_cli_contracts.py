@@ -4955,6 +4955,40 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(payload["language"], "cpp")
         self.assertIn("sample.cpp", payload["files"])
 
+    def test_clear_text_format_lists_surviving_mutants_with_diffs(self) -> None:
+        report = self.repo / "summary"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "true",
+            "--test-command",
+            "true",  # tests "pass" -> the mutant SURVIVES, so the survivor list renders
+            "--skip-initial-test",
+            "--report",
+            str(report),
+            "--max-mutants",
+            "1",
+            "--format",
+            "clear-text",
+            "--quiet",
+        )
+
+        # 0 = clean, 2 = survivors present; both mean the run completed and wrote the report.
+        self.assertIn(result.returncode, (0, 2), result.stderr + result.stdout)
+        text = (self.repo / "summary.txt").read_text()
+        self.assertIn("Mutation score:", text)
+        self.assertIn("Build error", text)  # totals cover build/check errors, not just kill/survive
+        self.assertIn("Check error", text)
+        self.assertIn("By file:", text)
+        self.assertRegex(text, r"Surviving mutants \(\d+\):")
+        self.assertIn("sample.cpp:", text)
+        self.assertIn(" -> ", text)  # original -> mutated diff for the survivor
+
     def test_stryker_disable_next_line_marks_mutant_ignored_without_running_it(self) -> None:
         self.source.write_text(
             "// Stryker disable next-line EqualityOperator: equivalent guard\n"

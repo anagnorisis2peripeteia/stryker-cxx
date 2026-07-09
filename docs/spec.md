@@ -119,7 +119,7 @@ Repository convention guardrails:
 - `--allow-dirty`
 - `--resume`
 - `--shard-index`, `--shard-total`
-- `--format json|markdown|html|sarif|mutation-testing-elements|github-annotations`
+- `--format json|markdown|html|sarif|mutation-testing-elements|github-annotations|clear-text`
 - `--threshold`, `--fail-on-empty`
 - `--threshold-high`, `--threshold-low`, `--threshold-break`
 - `stryker-cxx.yml` / `.stryker-cxx.yml` config loading
