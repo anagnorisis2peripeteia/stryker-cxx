@@ -6805,6 +6805,32 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(payload["survived"], 0)
         self.assertEqual(payload["mutants"], [])
 
+    def test_dry_run_failure_surfaces_log_tail_even_under_quiet(self) -> None:
+        report = self.repo / "dry-run-detail.json"
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "sample.cpp",
+            "--build-command",
+            "echo 'error: BOOM_UNIQUE_MARKER cannot compile'; exit 2",
+            "--test-command",
+            "true",
+            "--report",
+            str(report),
+            "--max-mutants",
+            "1",
+            "--quiet",
+        )
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        # Even under --quiet, a run-blocking baseline failure is surfaced to STDERR with the real
+        # cause — the failing phase, its exit code, and the log tail (not just a generic reason).
+        self.assertIn("dry run failed", result.stderr)
+        self.assertIn("initial build failed", result.stderr)
+        self.assertIn("build phase exit=2", result.stderr)
+        self.assertIn("BOOM_UNIQUE_MARKER", result.stderr)
+
     def test_dry_run_only_writes_lifecycle_report_without_mutating(self) -> None:
         report = self.repo / "dry-run-only.json"
         original = self.source.read_text()
