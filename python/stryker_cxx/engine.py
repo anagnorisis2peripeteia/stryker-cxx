@@ -5922,6 +5922,24 @@ def _is_tracked_file(repo: str, path: str) -> bool:
     return result.returncode == 0
 
 
+def _clang_parse_error_message(path: str, spelling: str) -> str:
+    """Turn a raw libclang diagnostic into an actionable message. A missing system/builtin header
+    or an unknown `__builtin_*` almost always means the loaded libclang does not match the clang
+    that produced compile_commands.json (a version/toolchain mismatch, not a code bug) — the most
+    common clang-ast pitfall, and cryptic on its own (e.g. 'stdarg.h' file not found)."""
+    message = f"clang parse failed for {path}: {spelling}"
+    lowered = spelling.lower()
+    if any(hint in lowered for hint in ("file not found", "__builtin", "header search path")):
+        message += (
+            "\n  A missing/builtin-header error here usually means the loaded libclang does not"
+            " match the clang that generated compile_commands.json (a version/toolchain mismatch,"
+            " not a code bug). clang-ast mode needs a libclang whose version matches your compiler,"
+            " with the compile database supplying the real build flags. See docs/clang-ast-dev.md,"
+            " or use --mode token."
+        )
+    return message
+
+
 def _discover_mode(
     repo: str,
     path: str,
@@ -5956,7 +5974,7 @@ def _discover_mode(
             if int(getattr(d, "severity", 0)) >= getattr(cindex.Diagnostic, "Error", 3)
         ]
         if errors:
-            raise ValueError(f"clang parse failed for {path}: {errors[0].spelling}")
+            raise ValueError(_clang_parse_error_message(path, errors[0].spelling))
 
         full = os.path.abspath(os.path.join(repo, path))
         ranges = _collect_clang_cursor_ranges(tu.cursor, full)

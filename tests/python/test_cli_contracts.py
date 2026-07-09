@@ -5022,6 +5022,16 @@ class CliContractTests(unittest.TestCase):
         # injection safety: only the two real closers, none smuggled in via mutant source
         self.assertEqual(html.count("</script>"), 2)
 
+    def test_clang_ast_parse_error_message_flags_toolchain_mismatch(self) -> None:
+        # A missing/builtin-header parse error gets an actionable libclang-version-mismatch hint;
+        # an ordinary syntax error stays plain (no misleading toolchain advice).
+        header = engine._clang_parse_error_message("foo.cpp", "'stdarg.h' file not found")
+        self.assertIn("version/toolchain mismatch", header)
+        self.assertIn("docs/clang-ast-dev.md", header)
+        self.assertIn("--mode token", header)
+        syntax = engine._clang_parse_error_message("foo.cpp", "expected ';' after expression")
+        self.assertNotIn("docs/clang-ast-dev.md", syntax)
+
     def test_stryker_disable_next_line_marks_mutant_ignored_without_running_it(self) -> None:
         self.source.write_text(
             "// Stryker disable next-line EqualityOperator: equivalent guard\n"

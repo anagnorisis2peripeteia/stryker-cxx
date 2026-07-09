@@ -84,7 +84,12 @@ auto-merge work is short; most remaining parity is structural (halt-for-Cameron)
 7. **[S] Xcode object ownership** (currently preflight-fallback). Structural → HALT.
 
 **P2 — adoption / nice-to-have**
-8. **[A] AST-native mutators as the preferred path** for ambiguous C++ rewrites (token stays fallback).
+8. **[S→in progress] AST-native mutators as the preferred path** (Cameron chose this, 2026-07-09).
+   **iter A done:** clang-ast on real code needs a libclang matching the compiler (pip libclang 18
+   vs Apple clang 21 mismatch is the common cryptic-parse-error cause) — added an actionable parse
+   error + `docs/clang-ast-dev.md`. **Blocked here:** this Mac can't host a matched LLVM toolchain
+   (disk-full container; no version-matched pip libclang for Apple clang). iter B (measure token vs
+   ast-direct precision) + iter C (prefer ast-direct) need a matched-toolchain box (H100 Linux / CI).
 9. **[S] VS Code / editor extension** (StrykerJS has one). Large, product-shaped → HALT/discuss.
 10. **[A] CUDA (`.cu`) language support** (extends the Metal/GPU story; niche).
 
