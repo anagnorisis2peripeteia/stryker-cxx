@@ -1,0 +1,73 @@
+{
+  "config": {
+    "LLVM Version": "14.0.0",
+    "Mull Version": "0.34.0"
+  },
+  "files": {
+    "small.cpp": {
+      "language": "cpp",
+      "mutants": [
+        {
+          "id": "cxx_eq_to_ne:small.cpp:2:13:2:15",
+          "mutatorName": "cxx_eq_to_ne",
+          "replacement": "!=",
+          "location": {
+            "start": {
+              "line": 2,
+              "column": 13
+            },
+            "end": {
+              "line": 2,
+              "column": 15
+            }
+          },
+          "status": "Killed"
+        },
+        {
+          "id": "cxx_replace_scalar_call:small.cpp:7:21:7:29",
+          "mutatorName": "cxx_replace_scalar_call",
+          "replacement": "42",
+          "location": {
+            "start": {
+              "line": 7,
+              "column": 21
+            },
+            "end": {
+              "line": 7,
+              "column": 29
+            }
+          },
+          "status": "Killed"
+        },
+        {
+          "id": "cxx_eq_to_ne:small.cpp:7:30:7:32",
+          "mutatorName": "cxx_eq_to_ne",
+          "replacement": "!=",
+          "location": {
+            "start": {
+              "line": 7,
+              "column": 30
+            },
+            "end": {
+              "line": 7,
+              "column": 32
+            }
+          },
+          "status": "Killed"
+        }
+      ],
+      "source": "int value(int input) {\n  if (input == 1) {\n    return 10;\n  }\n  return input ? 20 : 30;\n}\nint main() { return value(1) == 10 ? 0 : 1; }\n"
+    }
+  },
+  "thresholds": {
+    "high": 80,
+    "low": 60
+  },
+  "schemaVersion": "1.7",
+  "framework": {
+    "brandingInformation": {},
+    "name": "Mull",
+    "version": "0.34.0, LLVM 14.0.0"
+  },
+  "mutationScore": 100
+}
