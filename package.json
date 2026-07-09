@@ -35,7 +35,8 @@
     "validate:full-spec": "node scripts/validate-full-spec.mjs",
     "lint": "node scripts/lint.mjs",
     "release:dry-run": "npm publish --dry-run --provenance --access public",
-    "start": "node bin/stryker-cxx.js"
+    "start": "node bin/stryker-cxx.js",
+    "bench": "node scripts/benchmark.mjs"
   },
   "keywords": [
     "mutation-testing",

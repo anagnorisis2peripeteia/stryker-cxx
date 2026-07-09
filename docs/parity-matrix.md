@@ -56,7 +56,7 @@ auto-merge work is short; most remaining parity is structural (halt-for-Cameron)
 | Ignore/disable comments | ✅ Stryker-style | ✅ | ✅ | ✅ | 🟡 | 🟡 |
 | Plugin/extension hooks | ✅ runner/checker/test/coverage | ✅ | ✅ | 🟡 | ❌ | ❌ |
 | **Editor/IDE extension (VS Code)** | ❌ | 🟡 | ✅ | 🟡 | ❌ | ❌ |
-| **Published head-to-head benchmark suite** | ❌ (compare:mull harness exists, no committed numbers) | 🟡 | ✅ | 🟡 | ❌ | ✅ |
+| Committed reproducible benchmark | ✅ `npm run bench` (baseline + regression guard, added 2026-07-09) | 🟡 | ✅ | 🟡 | ❌ | ✅ |
 | Init presets / scaffolding | ✅ (incl. metal) | 🟡 | ✅ | ✅ | 🟡 | 🟡 |
 
 ## Gap list (loop backlog, prioritised)
@@ -77,8 +77,10 @@ auto-merge work is short; most remaining parity is structural (halt-for-Cameron)
 5. ~~**[A] Interactive HTML Mutation-Testing-Elements report**~~ — **DONE (loop iter 2, 2026-07-09).**
    Added `--format html-report`: the vendored `mutation-testing-elements` web component fed the MTE
    payload as one self-contained, injection-safe offline HTML file (the browsable Stryker report UI).
-6. **[A] Published benchmark suite** — commit a reproducible `compare:mull` run + numbers (mutants
-   generated/killed, speed) so parity is provable, not just asserted. Additive.
+6. ~~**[A] Published benchmark suite**~~ — **DONE (loop iter 3, 2026-07-09).** `npm run bench` runs a
+   committed fixture, checks deterministic mutant metrics vs a baseline (regression guard), and
+   documents the opt-in mull head-to-head (`compare:mull` + `MULL_REPORT`). Real mull numbers need
+   mull installed (not available on macOS via brew/Docker) — the harness accepts them when present.
 7. **[S] Xcode object ownership** (currently preflight-fallback). Structural → HALT.
 
 **P2 — adoption / nice-to-have**

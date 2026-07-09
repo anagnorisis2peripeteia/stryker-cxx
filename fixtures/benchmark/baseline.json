@@ -1,0 +1,26 @@
+{
+  "fixture": "sample.cpp",
+  "mutationLevel": "Complete",
+  "totalMutants": 83,
+  "byMutator": {
+    "ArithmeticOperator": 8,
+    "AssignmentOperator": 6,
+    "BitwiseOperator": 1,
+    "BooleanLiteral": 2,
+    "ConditionalBoundary": 7,
+    "ConditionalExpression": 7,
+    "ContainerStateCall": 1,
+    "EqualityOperator": 7,
+    "FloatingPointLiteral": 5,
+    "IntegerLiteral": 17,
+    "LogicalOperator": 2,
+    "LoopBoundary": 2,
+    "LoopCondition": 2,
+    "MemberAccessOperator": 1,
+    "ReturnValue": 2,
+    "ShiftOperator": 1,
+    "StatementRemoval": 6,
+    "StringLiteral": 4,
+    "UpdateOperator": 2
+  }
+}
