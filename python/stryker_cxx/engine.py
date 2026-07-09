@@ -4572,6 +4572,40 @@ def _dry_run(
     return result
 
 
+def _read_log_tail(path: str, max_chars: int = 4000) -> str:
+    # Seek to the tail so a large build/test log isn't slurped whole just to show its last lines.
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - max_chars))
+            return fh.read().decode("utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+
+
+def _format_dry_run_failure(dry_run: dict[str, Any]) -> str:
+    # Surface WHY the run-blocking baseline failed: the failing phase, its exit code, log path, and
+    # the log tail (the actual compiler/test error) — not just a generic "initial build failed".
+    reason = dry_run.get("failureReason", "unknown failure")
+    lines = [f"[error] dry run failed: {reason}"]
+    for phase in ("build", "check", "test"):
+        item = dry_run.get(phase)
+        if not isinstance(item, dict):
+            continue
+        rc = item.get("exitCode")
+        if rc in (0, None):
+            continue
+        log_path = item.get("log")
+        lines.append(f"  {phase} phase exit={rc}" + (f" — log: {log_path}" if log_path else ""))
+        tail = _read_log_tail(log_path) if isinstance(log_path, str) else ""
+        if tail:
+            lines.append(f"  --- {phase} log tail (the actual error) ---")
+            lines.extend(f"  {ln}" for ln in tail.splitlines()[-40:])
+        break  # the first failing phase is the cause
+    return "\n".join(lines)
+
+
 def _effective_timeout_ms(
     fixed_timeout_seconds: int | None,
     dry_run: dict[str, Any],
@@ -10559,8 +10593,10 @@ def main(argv: list[str] | None = None) -> int:
         effective_timeout_seconds = _timeout_seconds_from_ms(effective_timeout)
         rep.timeoutSeconds = effective_timeout_seconds
         if rep.dryRun.get("status") != "PASSED":
-            if not args.quiet:
-                print(f"[error] dry run failed: {rep.dryRun.get('failureReason', 'unknown failure')}")
+            # ALWAYS surface a run-blocking baseline failure (even under --quiet), with the failing
+            # phase's log path + tail — a silent or generic-only baseline failure is undiagnosable.
+            # Goes to stderr so it never corrupts a JSON report written to stdout.
+            print(_format_dry_run_failure(rep.dryRun), file=sys.stderr)
             rep.finalize()
             dashboard_upload_error = _attempt_dashboard_upload(args, rep)
             _write_report(args.report, rep, output_mode=output_mode)
