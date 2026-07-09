@@ -9,7 +9,22 @@ const outputPath = resolve(
   process.env.STRYKER_CXX_COMPARISON_REPORT
     || join(repoRoot, "agent_space", "stryker-cxx", "comparison", "mull-parity.json"),
 );
-const mullReportPath = process.env.MULL_REPORT ? resolve(process.env.MULL_REPORT) : null;
+// A real captured mull 0.34.0 (LLVM 14) report of this harness's fixture is committed at
+// fixtures/benchmark/mull-report.json, so `npm run compare:mull` is a real head-to-head out of the
+// box — no mull install required. Point MULL_REPORT at your own capture to override it.
+const goldenMullReport = join(repoRoot, "fixtures", "benchmark", "mull-report.json");
+const mullReportPath = process.env.MULL_REPORT
+  ? resolve(process.env.MULL_REPORT)
+  : existsSync(goldenMullReport)
+    ? goldenMullReport
+    : null;
+
+// Fail closed on an explicit-but-missing MULL_REPORT: silently ignoring it would hide a typo'd
+// path behind a misleading "mull: null" comparison. (An unset MULL_REPORT legitimately falls back
+// to the golden report or null.)
+if (process.env.MULL_REPORT && !existsSync(mullReportPath)) {
+  throw new Error(`MULL_REPORT points to a file that does not exist: ${mullReportPath}`);
+}
 
 function run(command, args, options = {}) {
   return spawnSync(command, args, {
@@ -233,10 +248,14 @@ function mullCapability() {
   const commands = ["mull-runner", "mull-reporter", "mull-cxx"];
   const available = commands.filter(commandExists);
   if (mullReportPath && existsSync(mullReportPath)) {
+    const isGolden = mullReportPath === goldenMullReport && !process.env.MULL_REPORT;
     return {
       available,
       reportPath: mullReportPath,
-      note: "MULL_REPORT supplied; comparison includes normalized Mull Mutation Testing Elements report.",
+      usingGoldenReport: isGolden,
+      note: isGolden
+        ? "Using the committed golden mull 0.34.0 (LLVM 14) report of this fixture (fixtures/benchmark/mull-report.json); comparison includes the normalized Mull Mutation Testing Elements report. Set MULL_REPORT to compare your own capture."
+        : "MULL_REPORT supplied; comparison includes normalized Mull Mutation Testing Elements report.",
     };
   }
   return {
