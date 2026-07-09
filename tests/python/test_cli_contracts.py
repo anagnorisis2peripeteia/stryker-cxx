@@ -6274,6 +6274,61 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(payload["mutants"][0]["nodeKind"], "COMPOUND_STMT")
         self.assertEqual(payload["mutants"][0]["rewriteStrategy"], "clang-ast-direct-block")
 
+    def test_clang_ast_mode_prefers_ast_over_token_only_across_constructs(self) -> None:
+        # AST-native preferred path (parity-matrix item 8): across a spread of constructs, every
+        # clang-ast mutant is AST-direct or AST-confirmed against the parse — never a token-only
+        # heuristic fallback. Guards that the AST-preferred behaviour is not silently regressed.
+        try:
+            from clang import cindex  # type: ignore
+            cindex.Index.create()
+        except Exception as exc:
+            self.skipTest(f"optional libclang binding is unavailable: {exc}")
+
+        self.source.write_text(
+            "int g(int a, int b) {\n"
+            "  int s = a + b;\n"
+            "  for (int i = 0; i < a; ++i) { s += i * 3 - 1; }\n"
+            "  if (a == b && a > 0) { s = s << 1; }\n"
+            "  bool ok = a != b;\n"
+            "  return ok ? (s > 100 ? 100 : s) : -s;\n"
+            "}\n"
+        )
+        compile_db = [
+            {
+                "directory": str(self.repo),
+                "command": "clang++ -std=c++17 -c sample.cpp -o sample.o",
+                "file": str(self.source),
+            }
+        ]
+        (self.repo / "compile_commands.json").write_text(json.dumps(compile_db))
+        self._git("add", "sample.cpp", "compile_commands.json")
+        self._git(
+            "-c", "user.name=stryker-cxx", "-c", "user.email=stryker-cxx@example.invalid",
+            "commit", "-q", "-m", "clang-ast-precision-fixture",
+        )
+        report = self.repo / "clang-ast-precision.json"
+
+        result = self._cli(
+            "run",
+            "--repo", str(self.repo),
+            "--files", "sample.cpp",
+            "--build-command", "true",
+            "--test-command", "true",
+            "--skip-initial-test",
+            "--report", str(report),
+            "--mode", "clang-ast",
+            "--mutation-level", "Complete",
+            "--quiet",
+        )
+
+        self.assertIn(result.returncode, (0, 2), result.stderr + result.stdout)
+        mutants = json.loads(report.read_text())["mutants"]
+        self.assertGreater(len(mutants), 0)
+        kinds = {(mut.get("sourcePrecision") or {}).get("kind") for mut in mutants}
+        self.assertNotIn(
+            "token-only", kinds, f"clang-ast fell back to token-only mutants (item-8 regression): {kinds}"
+        )
+
     def test_clang_ast_mode_generates_direct_unary_operator_mutants_when_available(self) -> None:
         try:
             from clang import cindex  # type: ignore
