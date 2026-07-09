@@ -181,8 +181,10 @@ there is exactly one repo-local executable test binary under `--build-dir`,
 `build`, `cmake-build-*`, `out`, or `bin`. Pass `--test-binary` to disambiguate.
 
 Report artifacts include `--format markdown`, `html`, `sarif`,
-`github-annotations`, `mutation-testing-elements`, and `clear-text` (a plain-text
-summary: score, per-file breakdown, and the surviving-mutant list with diffs).
+`github-annotations`, `mutation-testing-elements`, `clear-text` (a plain-text
+summary: score, per-file breakdown, and the surviving-mutant list with diffs), and
+`html-report` (the interactive, source-annotated `mutation-testing-elements` browsable
+report — the same UI the rest of the Stryker family produces, as one self-contained file).
 
 Coverage JSON may include per-line covering tests. With
 `--coverage-test-command-template`, `stryker-cxx` substitutes `{tests}`,

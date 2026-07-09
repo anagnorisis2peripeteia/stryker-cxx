@@ -4989,6 +4989,39 @@ class CliContractTests(unittest.TestCase):
         self.assertIn("sample.cpp:", text)
         self.assertIn(" -> ", text)  # original -> mutated diff for the survivor
 
+    def test_html_report_format_embeds_browsable_mte_app(self) -> None:
+        # Source with `<` so we also prove the inlined payload can't break out of <script>.
+        self.source.write_text("int main() { int a = 3, b = 4; return a < b ? 0 : 1; }\n")
+        self._git("add", "sample.cpp")
+        self._git(
+            "-c", "user.name=stryker-cxx", "-c", "user.email=stryker-cxx@example.invalid",
+            "commit", "-q", "-m", "html-report-fixture",
+        )
+        report = self.repo / "report"
+
+        result = self._cli(
+            "run",
+            "--repo", str(self.repo),
+            "--files", "sample.cpp",
+            "--build-command", "true",
+            "--test-command", "true",
+            "--skip-initial-test",
+            "--report", str(report),
+            "--max-mutants", "1",
+            "--format", "html-report",
+            "--quiet",
+        )
+
+        self.assertIn(result.returncode, (0, 2), result.stderr + result.stdout)
+        html = (self.repo / "report.html").read_text()
+        # the browsable mutation-testing-elements app + inlined bundle + the report payload
+        self.assertIn("<mutation-test-report-app", html)
+        self.assertIn("customElements.define", html)
+        self.assertRegex(html, r"\.report\s*=\s*\{")
+        self.assertIn('"schemaVersion": "2.0"', html)
+        # injection safety: only the two real closers, none smuggled in via mutant source
+        self.assertEqual(html.count("</script>"), 2)
+
     def test_stryker_disable_next_line_marks_mutant_ignored_without_running_it(self) -> None:
         self.source.write_text(
             "// Stryker disable next-line EqualityOperator: equivalent guard\n"

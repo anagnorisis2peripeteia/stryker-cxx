@@ -7285,6 +7285,38 @@ def _format_html(rep: Report) -> str:
     )
 
 
+_MTE_ELEMENTS_BUNDLE_PATH = os.path.join(
+    os.path.dirname(__file__), "vendor", "mutation-test-elements.js"
+)
+
+
+def _format_html_report(rep: Report) -> str:
+    """The interactive, source-annotated browsable report — the vendored
+    `mutation-testing-elements` web component (`<mutation-test-report-app>`) fed the MTE payload,
+    inlined into one self-contained offline HTML file (the same report UI the rest of the Stryker
+    family produces). Distinct from `--format html`, which is a quick filterable summary table."""
+    # Redact before inlining: the other writers redact via `_write_human_artifact`, but here the
+    # payload is serialized straight INTO the HTML, so it must be redacted at the source or
+    # secrets/env in the report could leak into the browsable file.
+    payload = _redact_report_artifact(_mutation_testing_elements(rep))
+    with open(_MTE_ELEMENTS_BUNDLE_PATH, "r", encoding="utf-8") as bundle_file:
+        bundle = bundle_file.read()
+    # Escape `<` so mutant source containing `</script>` (or any tag) in the inlined JSON cannot
+    # break out of the <script> block; `<` is valid JSON and parses back to `<`.
+    report_json = json.dumps(payload).replace("<", "\\u003c")
+    return (
+        "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>stryker-cxx mutation report</title>"
+        f"<script>{bundle}</script>"
+        "</head><body>"
+        "<mutation-test-report-app title-postfix='stryker-cxx'></mutation-test-report-app>"
+        "<script>document.getElementsByTagName('mutation-test-report-app').item(0).report="
+        f"{report_json};</script>"
+        "</body></html>"
+    )
+
+
 def _format_sarif(rep: Report) -> dict:
     results = []
     for mut in rep.mutants:
@@ -7635,6 +7667,8 @@ def _write_human_artifact(path: str, report: str, payload: Any) -> str:
             out_path = path + ".github-annotations"
         elif report == "clear-text":
             out_path = path + ".txt"
+        elif report == "html-report":
+            out_path = path + ".html"
     payload = _redact_report_artifact(payload)
     if report == "json" and isinstance(payload, dict) and payload.get("schemaVersion") == "2.0":
         require_mte(payload)
@@ -7650,6 +7684,8 @@ def _write_human_artifact(path: str, report: str, payload: Any) -> str:
         elif report == "github-annotations":
             f.write(payload)
         elif report == "clear-text":
+            f.write(payload)
+        elif report == "html-report":
             f.write(payload)
         else:
             json.dump(payload, f, indent=2)
@@ -7669,6 +7705,8 @@ def _write_output_artifacts(report_path: str, output_format: str, rep: "Report")
         _write_human_artifact(report_path, "json", _mutation_testing_elements(rep))
     elif output_format == "clear-text":
         _write_human_artifact(report_path, "clear-text", _format_clear_text(rep))
+    elif output_format == "html-report":
+        _write_human_artifact(report_path, "html-report", _format_html_report(rep))
 
 
 def _sha256_file(path: str) -> str:
@@ -9787,7 +9825,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--output-format", default="legacy", choices=["legacy", "stryker-cxx"],
                     dest="output_format",
                     help="Compatibility report format; legacy keeps old engine fields")
-    ap.add_argument("--format", default="json", choices=["json", "markdown", "html", "sarif", "github-annotations", "mutation-testing-elements", "clear-text"],
+    ap.add_argument("--format", default="json", choices=["json", "markdown", "html", "sarif", "github-annotations", "mutation-testing-elements", "clear-text", "html-report"],
                     help="Report artifact format")
     ap.add_argument("--threshold", type=float, default=None)
     ap.add_argument("--threshold-high", type=float, default=None)

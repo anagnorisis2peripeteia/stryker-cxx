@@ -47,7 +47,7 @@ auto-merge work is short; most remaining parity is structural (halt-for-Cameron)
 | Parallelism / sharding | ✅ `--jobs` + shards | ✅ | ✅ | ✅ | 🟡 | ✅ |
 | JSON report | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Mutation-Testing-Elements schema | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
-| Interactive HTML report | 🟡 HTML format emitted (verify full MTE browser report) | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Interactive HTML report | ✅ `--format html-report` (browsable MTE app, added 2026-07-09) + custom `html` table | ✅ | ✅ | ✅ | ✅ | ❌ |
 | SARIF / GitHub annotations | ✅ | ❌ | 🟡 | ❌ | ❌ | ❌ |
 | Hosted dashboard upload | ✅ configurable endpoint | ❌ | ✅ (stryker dashboard) | ✅ | ❌ | ❌ |
 | Live per-mutant progress output | ✅ `[i/N] … status (ms)` | 🟡 | ✅ | ✅ | 🟡 | ✅ |
@@ -74,8 +74,9 @@ auto-merge work is short; most remaining parity is structural (halt-for-Cameron)
 
 **P1 — parity polish**
 4. **[S] Multi-mutant optimized sessions** (swap/test currently serialize per artifact). Structural → HALT.
-5. **[A] Interactive HTML Mutation-Testing-Elements report** — verify the emitted HTML is the full
-   browsable Stryker report; if not, wire `mutation-testing-elements` HTML generation. Additive.
+5. ~~**[A] Interactive HTML Mutation-Testing-Elements report**~~ — **DONE (loop iter 2, 2026-07-09).**
+   Added `--format html-report`: the vendored `mutation-testing-elements` web component fed the MTE
+   payload as one self-contained, injection-safe offline HTML file (the browsable Stryker report UI).
 6. **[A] Published benchmark suite** — commit a reproducible `compare:mull` run + numbers (mutants
    generated/killed, speed) so parity is provable, not just asserted. Additive.
 7. **[S] Xcode object ownership** (currently preflight-fallback). Structural → HALT.

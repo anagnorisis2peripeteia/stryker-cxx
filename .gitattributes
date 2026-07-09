@@ -1,0 +1,3 @@
+
+# Vendored third-party bundle: generated/minified — skip whitespace + diff checks.
+python/stryker_cxx/vendor/mutation-test-elements.js -diff -whitespace linguist-generated=true
