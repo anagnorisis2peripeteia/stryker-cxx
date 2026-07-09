@@ -119,7 +119,7 @@ Repository convention guardrails:
 - `--allow-dirty`
 - `--resume`
 - `--shard-index`, `--shard-total`
-- `--format json|markdown|html|sarif|mutation-testing-elements|github-annotations|clear-text`
+- `--format json|markdown|html|sarif|mutation-testing-elements|github-annotations|clear-text|html-report`
 - `--threshold`, `--fail-on-empty`
 - `--threshold-high`, `--threshold-low`, `--threshold-break`
 - `stryker-cxx.yml` / `.stryker-cxx.yml` config loading
@@ -1515,7 +1515,12 @@ Implemented artifact formats:
 - GitHub Actions log annotations via `--format github-annotations`, using
   warnings for survivors, notices for no-coverage mutants, and errors for
   build/check/timeout failures;
-- direct Mutation Testing Elements JSON.
+- direct Mutation Testing Elements JSON;
+- clear-text summary via `--format clear-text`: score, per-file breakdown, and the
+  surviving-mutant list with `original -> mutated` diffs;
+- browsable Mutation Testing Elements report via `--format html-report`: the vendored
+  `mutation-testing-elements` web component rendering the run's MTE payload as one
+  self-contained, offline HTML file.
 - dashboard export/upload policy with explicit upload URL, optional
   `--dashboard-auth-token-env`, dashboard payload version metadata, provenance
   fields, threshold-band status, CI project/branch/commit/run/build URL

@@ -167,7 +167,7 @@
         "batchMutants": { "type": "boolean" },
         "batchSize": { "type": "integer", "minimum": 1 },
         "worktreeMode": { "enum": ["inplace", "copy", "git-worktree"] },
-        "format": { "enum": ["json", "markdown", "html", "sarif", "github-annotations", "mutation-testing-elements", "clear-text"] },
+        "format": { "enum": ["json", "markdown", "html", "sarif", "github-annotations", "mutation-testing-elements", "clear-text", "html-report"] },
         "outputFormat": { "enum": ["legacy", "stryker-cxx"] },
         "skipInitialTest": { "type": "boolean" },
         "initialTest": { "type": "boolean" },
