@@ -181,7 +181,8 @@ there is exactly one repo-local executable test binary under `--build-dir`,
 `build`, `cmake-build-*`, `out`, or `bin`. Pass `--test-binary` to disambiguate.
 
 Report artifacts include `--format markdown`, `html`, `sarif`,
-`github-annotations`, and `mutation-testing-elements`.
+`github-annotations`, `mutation-testing-elements`, and `clear-text` (a plain-text
+summary: score, per-file breakdown, and the surviving-mutant list with diffs).
 
 Coverage JSON may include per-line covering tests. With
 `--coverage-test-command-template`, `stryker-cxx` substitutes `{tests}`,

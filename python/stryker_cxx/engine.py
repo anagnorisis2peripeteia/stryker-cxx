@@ -7185,6 +7185,41 @@ def _format_markdown(rep: Report) -> str:
     return "\n".join(lines)
 
 
+def _format_clear_text(rep: Report) -> str:
+    """StrykerJS-style clear-text summary: score, per-file breakdown, and the surviving-mutant
+    list with original -> mutated diffs (the actionable part the other reporters bury)."""
+    summary = _summary([_normalize_mutant_record(mut) for mut in rep.mutants])
+    lines: list[str] = []
+    lines.append(f"Mutation score: {rep.score * 100:.2f}%")
+    lines.append(
+        f"Killed {rep.killed} · Survived {rep.survived} · Timeout {rep.timeouts} "
+        f"· No coverage {rep.noCoverage} · Build error {rep.buildError} "
+        f"· Check error {rep.checkErrors} · Ignored {rep.ignored} · Total {rep.total}"
+    )
+    if summary["byFile"]:
+        lines.append("")
+        lines.append("By file:")
+        for file_name, bucket in summary["byFile"].items():
+            lines.append(
+                f"  {file_name}  {bucket['score'] * 100:.2f}%  ({bucket['killed']}/{bucket['total']})"
+            )
+    survivors = [
+        mut for mut in rep.mutants
+        if str(mut.get("status", "")).upper() in {"SURVIVED", "NO_COVERAGE"}
+    ]
+    if survivors:
+        lines.append("")
+        lines.append(f"Surviving mutants ({len(survivors)}):")
+        for mut in survivors:
+            tag = " [no coverage]" if str(mut.get("status", "")).upper() == "NO_COVERAGE" else ""
+            lines.append(
+                f"  {mut['file']}:{mut['line']}  {mut['mutator']}{tag}  "
+                f"{mut['original']} -> {mut['mutated']}"
+            )
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _format_html(rep: Report) -> str:
     def esc(value: Any) -> str:
         return html_lib.escape(str(value if value is not None else ""))
@@ -7589,7 +7624,7 @@ def _write_human_artifact(path: str, report: str, payload: Any) -> str:
     os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
     out_path = path
     ext = os.path.splitext(path)[1].lower()
-    if ext not in {".md", ".html", ".sarif", ".github-annotations"}:
+    if ext not in {".md", ".html", ".sarif", ".github-annotations", ".txt"}:
         if report == "markdown":
             out_path = path + ".md"
         elif report == "html":
@@ -7598,6 +7633,8 @@ def _write_human_artifact(path: str, report: str, payload: Any) -> str:
             out_path = path + ".sarif"
         elif report == "github-annotations":
             out_path = path + ".github-annotations"
+        elif report == "clear-text":
+            out_path = path + ".txt"
     payload = _redact_report_artifact(payload)
     if report == "json" and isinstance(payload, dict) and payload.get("schemaVersion") == "2.0":
         require_mte(payload)
@@ -7611,6 +7648,8 @@ def _write_human_artifact(path: str, report: str, payload: Any) -> str:
         elif report == "sarif":
             json.dump(payload, f, indent=2)
         elif report == "github-annotations":
+            f.write(payload)
+        elif report == "clear-text":
             f.write(payload)
         else:
             json.dump(payload, f, indent=2)
@@ -7628,6 +7667,8 @@ def _write_output_artifacts(report_path: str, output_format: str, rep: "Report")
         _write_human_artifact(report_path, "github-annotations", _format_github_annotations(rep))
     elif output_format == "mutation-testing-elements":
         _write_human_artifact(report_path, "json", _mutation_testing_elements(rep))
+    elif output_format == "clear-text":
+        _write_human_artifact(report_path, "clear-text", _format_clear_text(rep))
 
 
 def _sha256_file(path: str) -> str:
@@ -9746,7 +9787,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--output-format", default="legacy", choices=["legacy", "stryker-cxx"],
                     dest="output_format",
                     help="Compatibility report format; legacy keeps old engine fields")
-    ap.add_argument("--format", default="json", choices=["json", "markdown", "html", "sarif", "github-annotations", "mutation-testing-elements"],
+    ap.add_argument("--format", default="json", choices=["json", "markdown", "html", "sarif", "github-annotations", "mutation-testing-elements", "clear-text"],
                     help="Report artifact format")
     ap.add_argument("--threshold", type=float, default=None)
     ap.add_argument("--threshold-high", type=float, default=None)
