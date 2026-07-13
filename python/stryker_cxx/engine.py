@@ -6204,11 +6204,19 @@ def _resolve_compile_entry(repo: str, path: str) -> list[str] | None:
             match = entry
             break
 
-    if match is None and entries:
-        first = entries[0]
-        match = first if isinstance(first, dict) else None
-
     if match is None:
+        # The compile database exists but carries no entry for this file. Do NOT borrow another
+        # entry's flags: a foreign -std/-D/-I would silently parse this file into the wrong AST
+        # (wrong or missing mutation sites) with no compile error to catch it. Fall back to a
+        # flagless syntax-only parse, and make the miss loud so a low clang-ast yield here is
+        # attributable rather than silent.
+        if entries:
+            print(
+                f"[warn] {path} is not in compile_commands.json; parsing without project flags"
+                " -- clang-ast mutation sites may be incomplete. Add a compile-db entry (real"
+                " -I/-D/-std) for full fidelity, or use --mode token.",
+                file=sys.stderr,
+            )
         return ["-fsyntax-only"]
 
     cmd = match.get("arguments")
