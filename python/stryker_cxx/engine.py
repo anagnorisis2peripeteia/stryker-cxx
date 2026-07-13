@@ -5186,6 +5186,84 @@ def _baseline_reuse_rejection(cached: Any, args: argparse.Namespace) -> str | No
     return None
 
 
+def _build_error_class(run: dict[str, Any]) -> str:
+    """Classify a BUILD_ERROR mutant. genuineUncompilable requires POSITIVE per-mutant evidence: a
+    faithful single-mutant compile that failed — the user's real build on one mutated worktree
+    (source-overlay), a compiled-artifact build of exactly one applied mutant, or the per-mutant
+    compile-pruning probe — each recorded as run["reconstructionFidelity"] == "faithful" at that
+    site. EVERYTHING ELSE is a reconstructionMiss: a configure failure (configure does not compile
+    the mutation), a shared mutant-switch/batch build failure (fails many mutants at once and
+    attributes the error to none), a compiled-object that built but could not be tied to a produced
+    object, or any untagged path. A non-zero build/configure exit alone is NOT evidence the mutation
+    is uncompilable — only that a command failed. This fail-closed default keeps
+    --tolerate-uncompilable-mutants from ever silently passing a reconstruction or runner failure —
+    the cardinal 'misclassification = fail-open' rule for a mutation engine."""
+    return "genuineUncompilable" if run.get("reconstructionFidelity") == "faithful" else "reconstructionMiss"
+
+
+def _compute_coverage_integrity(rep: Report) -> dict[str, Any]:
+    """Coverage-integrity signal: of the mutations we intended to build+score, how many actually
+    scored, and split the build errors into 'our reconstruction couldn't build your code'
+    (reconstructionMiss) vs 'this mutant is genuinely uncompilable' (genuineUncompilable). Surfaced
+    so a clean score is never read as trustworthy when a chunk of intended mutations never compiled."""
+    recon = 0
+    genuine = 0
+    for mut in rep.mutants:
+        if str(mut.get("status", "")).upper() != "BUILD_ERROR":
+            continue
+        if _build_error_class(mut.get("run", {}) or {}) == "reconstructionMiss":
+            recon += 1
+        else:
+            genuine += 1
+    scored = rep.killed + rep.survived
+    intended = scored + rep.buildError + rep.checkErrors + rep.timeouts
+    coverage = (scored / intended) if intended else 1.0
+    return {
+        "mutantsIntended": intended,
+        "builtAndScored": scored,
+        "coveragePercent": round(100.0 * coverage, 2),
+        "buildErrors": {
+            "total": rep.buildError,
+            "reconstructionMiss": recon,
+            "genuineUncompilable": genuine,
+        },
+    }
+
+
+def _finite_rate(value: str) -> float:
+    """argparse/config validator for --max-build-error-rate: a FINITE fraction in [0, 1]. Rejects
+    NaN, inf, and out-of-range values — a >1 or NaN cap would silently disable the rate guard
+    (`rate > NaN` is always False), so it must fail loudly at parse time, not pass through."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"invalid rate {value!r}: expected a number in [0, 1]")
+    if not math.isfinite(parsed) or parsed < 0.0 or parsed > 1.0:
+        raise argparse.ArgumentTypeError(f"invalid rate {value!r}: expected a finite value in [0, 1]")
+    return parsed
+
+
+def _build_error_exit_status(rep: Report, tolerate_uncompilable: bool, max_build_error_rate: float | None) -> int:
+    """Decide whether the build-error policy fails the run. Returns 2 to fail, 0 to allow the run
+    to proceed to the score-threshold check. Strict by default: ANY build error fails (unchanged).
+    Under --tolerate-uncompilable-mutants: a reconstruction miss ALWAYS fails (our fidelity gap),
+    while genuine-uncompilable-only fails only if the optional build-error-rate guard is exceeded."""
+    if not rep.buildError:
+        return 0
+    if not tolerate_uncompilable:
+        return 2
+    ci = rep.execution.get("coverageIntegrity", {})
+    be = ci.get("buildErrors", {}) if isinstance(ci, dict) else {}
+    if int(be.get("reconstructionMiss", 0)) > 0:
+        return 2
+    if max_build_error_rate is not None:
+        intended = int(ci.get("mutantsIntended", 0)) if isinstance(ci, dict) else 0
+        rate = (rep.buildError / intended) if intended else 0.0
+        if rate > float(max_build_error_rate):
+            return 2
+    return 0
+
+
 def _count_status(rep: Report, status: str) -> None:
     if status == "KILLED":
         rep.killed += 1
@@ -8454,6 +8532,9 @@ def _run_mutant_once(
                 mut.status = "TIMEOUT"
                 mut.detail = "build timed out"
             elif build_rc != 0:
+                # source-overlay: the user's real build ran on ONE mutated worktree and failed ->
+                # positively attributes uncompilability to this mutation.
+                mut.run["reconstructionFidelity"] = "faithful"
                 mut.status = "BUILD_ERROR"
                 mut.detail = "did not compile"
             else:
@@ -8694,6 +8775,9 @@ def _run_mutant_once_compiled_artifact(
             mut.detail = f"{artifact_backend} build timed out"
             return mut
         if build_rc != 0:
+            # compiled-artifact: exactly one mutant was applied and the target build failed ->
+            # positively attributes to this mutation (unlike the configure step above).
+            mut.run["reconstructionFidelity"] = "faithful"
             mut.status = "BUILD_ERROR"
             mut.detail = f"{artifact_backend} mutant did not compile"
             return mut
@@ -8702,6 +8786,11 @@ def _run_mutant_once_compiled_artifact(
             object_artifacts = _compiled_object_records(scratch_build_dir, scratch_repo, [mut])
             mut.run["compiledObjects"] = object_artifacts
             if not object_artifacts or not object_artifacts[0].get("objectProduced"):
+                # The target built (build_rc == 0) but we could not attribute the mutant to a
+                # produced object -- its source is absent from compile_commands.json (or was not
+                # compiled into the target). That is a reconstruction/fidelity gap, not the mutant
+                # being uncompilable, so tag it degraded: tolerate-mode must still fail on it.
+                mut.run["reconstructionFidelity"] = "degraded"
                 mut.status = "BUILD_ERROR"
                 mut.detail = "compiled-object backend did not produce a mutated object artifact"
                 return mut
@@ -9250,6 +9339,8 @@ def _compile_probe_mutant(
                 mut.status = "TIMEOUT"
                 mut.detail = "build timed out during compile pruning"
             elif build_rc != 0:
+                # compile-pruning probe: a per-mutant compile of ONE mutant failed -> faithful.
+                mut.run["reconstructionFidelity"] = "faithful"
                 mut.status = "BUILD_ERROR"
                 mut.detail = "did not compile during compile pruning"
             elif check_cmd:
@@ -9807,6 +9898,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--config-hash", default=None)
     ap.add_argument("--effective-config-json", default=None)
     ap.add_argument("--max-mutants", type=int, default=0)
+    ap.add_argument("--tolerate-uncompilable-mutants", action="store_true",
+                    dest="tolerate_uncompilable_mutants",
+                    help="Do not fail the run on genuinely-uncompilable mutants (faithful flags, real "
+                         "compile still failed); reconstruction misses still fail. Strict by default.")
+    ap.add_argument("--max-build-error-rate", type=_finite_rate, default=None,
+                    dest="max_build_error_rate",
+                    help="Under --tolerate-uncompilable-mutants, still fail if build_errors/intended "
+                         "exceeds this fraction (0..1). Default: no rate cap.")
     ap.add_argument("--include-metal", action="store_true", dest="include_metal")
     ap.add_argument("--mutators", default=None)
     ap.add_argument("--mutation-level", choices=sorted(MUTATION_LEVEL_NAMES), default="Standard", dest="mutation_level")
@@ -11345,6 +11444,13 @@ def main(argv: list[str] | None = None) -> int:
 
     rep.finalize()
     rep.thresholds = _resolve_thresholds(args.threshold, args.threshold_high, args.threshold_low, args.threshold_break, rep.score)
+    tolerate_uncompilable = bool(getattr(args, "tolerate_uncompilable_mutants", False))
+    max_build_error_rate = getattr(args, "max_build_error_rate", None)
+    rep.execution["coverageIntegrity"] = _compute_coverage_integrity(rep)
+    rep.execution["buildErrorPolicy"] = {
+        "tolerateUncompilable": tolerate_uncompilable,
+        "maxBuildErrorRate": max_build_error_rate,
+    }
     if write_baseline_path:
         for rec in rep.mutants:
             status = str(rec.get("status", "")).upper()
@@ -11416,6 +11522,16 @@ def main(argv: list[str] | None = None) -> int:
             f"check_error={rep.checkErrors} no_coverage={rep.noCoverage} "
             f"timeouts={rep.timeouts} ignored={rep.ignored}",
         )
+        if rep.buildError:
+            ci = rep.execution.get("coverageIntegrity", {})
+            be = ci.get("buildErrors", {})
+            print(
+                f"[stryker-cxx] coverage-integrity: score covers "
+                f"{ci.get('coveragePercent', 100.0):.2f}% of {ci.get('mutantsIntended', 0)} intended "
+                f"mutations; build_errors={be.get('total', 0)} "
+                f"(reconstruction_miss={be.get('reconstructionMiss', 0)}, "
+                f"genuine_uncompilable={be.get('genuineUncompilable', 0)})",
+            )
     for m in rep.mutants:
         if m["status"] == "SURVIVED":
             print(f"  SURVIVOR {m['file']}:{m['line']} {m['original']}->{m['mutated']} ({m['mutator']})")
@@ -11425,7 +11541,7 @@ def main(argv: list[str] | None = None) -> int:
             return 3
         return 0
 
-    if rep.buildError:
+    if _build_error_exit_status(rep, tolerate_uncompilable, max_build_error_rate) == 2:
         return 2
 
     effective_threshold = rep.thresholds["break"]

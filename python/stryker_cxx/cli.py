@@ -332,6 +332,8 @@ CONFIG_ALLOWED_NESTED = {
         "thresholdHigh",
         "thresholdLow",
         "thresholdBreak",
+        "tolerateUncompilableMutants",
+        "maxBuildErrorRate",
         "timeoutSeconds",
         "timeoutFactor",
         "timeoutConstantMs",
@@ -957,6 +959,13 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--threshold-high", type=float, default=None, dest="threshold_high")
     run.add_argument("--threshold-low", type=float, default=None, dest="threshold_low")
     run.add_argument("--threshold-break", type=float, default=None, dest="threshold_break")
+    run.add_argument("--tolerate-uncompilable-mutants", action="store_true", default=None,
+                     dest="tolerate_uncompilable_mutants",
+                     help="Do not fail the run on genuinely-uncompilable mutants (faithful flags, real "
+                          "compile still failed); reconstruction misses still fail. Strict by default.")
+    run.add_argument("--max-build-error-rate", type=engine._finite_rate, default=None, dest="max_build_error_rate",
+                     help="Under --tolerate-uncompilable-mutants, still fail if build_errors/intended "
+                          "exceeds this fraction (0..1). Default: no rate cap.")
     run.add_argument("--fail-on-empty", action="store_true", dest="fail_on_empty")
     run.add_argument("--timeout", type=int, default=None, dest="timeout", help="Per-mutant timeout in seconds")
     run.add_argument("--timeout-factor", type=float, default=None, dest="timeout_factor")
@@ -1546,6 +1555,16 @@ def _resolve_defaults(args: argparse.Namespace) -> dict[str, Any]:
             if getattr(args, "threshold_break", None) is not None
             else thresholds_cfg.get("break", report_thresholds_cfg.get("break", execution.get("thresholdBreak")))
         ),
+        "tolerate_uncompilable_mutants": (
+            bool(getattr(args, "tolerate_uncompilable_mutants", None))
+            if getattr(args, "tolerate_uncompilable_mutants", None) is not None
+            else bool(execution.get("tolerateUncompilableMutants", False))
+        ),
+        "max_build_error_rate": (
+            getattr(args, "max_build_error_rate", None)
+            if getattr(args, "max_build_error_rate", None) is not None
+            else execution.get("maxBuildErrorRate")
+        ),
         "timeout": getattr(args, "timeout", None) if getattr(args, "timeout", None) is not None else execution.get("timeoutSeconds"),
         "timeout_factor": (
             getattr(args, "timeout_factor", None)
@@ -1860,6 +1879,10 @@ def _run(args: argparse.Namespace) -> int:
         legacy_args.extend(["--threshold-low", str(cfg["threshold_low"])])
     if cfg["threshold_break"] is not None:
         legacy_args.extend(["--threshold-break", str(cfg["threshold_break"])])
+    if cfg["tolerate_uncompilable_mutants"]:
+        legacy_args.append("--tolerate-uncompilable-mutants")
+    if cfg["max_build_error_rate"] is not None:
+        legacy_args.extend(["--max-build-error-rate", str(cfg["max_build_error_rate"])])
     if cfg["timeout"] is not None:
         legacy_args.extend(["--timeout", str(cfg["timeout"])])
     if cfg["timeout_factor"] is not None:

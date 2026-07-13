@@ -64,6 +64,29 @@
         "executionBackend": { "enum": ["auto", "source-overlay", "mutant-switch", "compiled-artifact", "llvm-switch"] },
         "requestedExecutionBackend": { "enum": ["auto", "source-overlay", "mutant-switch", "compiled-artifact", "llvm-switch"] },
         "executionBackendFallbackReason": { "type": ["string", "null"] },
+        "coverageIntegrity": {
+          "type": "object",
+          "properties": {
+            "mutantsIntended": { "type": "integer", "minimum": 0 },
+            "builtAndScored": { "type": "integer", "minimum": 0 },
+            "coveragePercent": { "type": "number", "minimum": 0, "maximum": 100 },
+            "buildErrors": {
+              "type": "object",
+              "properties": {
+                "total": { "type": "integer", "minimum": 0 },
+                "reconstructionMiss": { "type": "integer", "minimum": 0 },
+                "genuineUncompilable": { "type": "integer", "minimum": 0 }
+              }
+            }
+          }
+        },
+        "buildErrorPolicy": {
+          "type": "object",
+          "properties": {
+            "tolerateUncompilable": { "type": "boolean" },
+            "maxBuildErrorRate": { "type": ["number", "null"], "minimum": 0, "maximum": 1 }
+          }
+        },
         "artifactBackend": {
           "enum": ["source-overlay", "compiled-executable", "compiled-library", "compiled-object"]
         },

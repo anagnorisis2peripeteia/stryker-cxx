@@ -101,6 +101,8 @@
         "thresholdHigh": { "type": "number", "minimum": 0, "maximum": 1 },
         "thresholdLow": { "type": "number", "minimum": 0, "maximum": 1 },
         "thresholdBreak": { "type": "number", "minimum": 0, "maximum": 1 },
+        "tolerateUncompilableMutants": { "type": "boolean" },
+        "maxBuildErrorRate": { "type": "number", "minimum": 0, "maximum": 1 },
         "timeoutSeconds": { "type": "integer", "minimum": 1 },
         "timeoutFactor": { "type": "number", "minimum": 0 },
         "timeoutConstantMs": { "type": "integer", "minimum": 0 },

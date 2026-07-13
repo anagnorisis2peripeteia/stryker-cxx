@@ -118,6 +118,21 @@ Compile and checker failures still appear as native `BUILD_ERROR` and
 which mutants were pruned before test execution under
 `execution.compilePruning`.
 
+## Coverage integrity and build-error policy
+
+Native reports include two additive objects (reports without them remain valid):
+
+- `execution.coverageIntegrity` — `mutantsIntended`, `builtAndScored`, `coveragePercent`, and
+  `buildErrors.{total, reconstructionMiss, genuineUncompilable}`. The split always sums to
+  `total`. `genuineUncompilable` is set only when a faithful per-mutant compile (source-overlay,
+  compiled-artifact build of one applied mutant, or the compile-pruning probe) positively
+  attributed the failure to the mutation; every other build error (configure failure, shared
+  mutant-switch/batch build, missing `compile_commands.json` entry) is a `reconstructionMiss`.
+- `execution.buildErrorPolicy` — `tolerateUncompilable` (boolean) and `maxBuildErrorRate`
+  (number in `[0, 1]` or null), the policy that governed the exit decision. Strict by default
+  (any build error fails); `--tolerate-uncompilable-mutants` tolerates `genuineUncompilable`
+  errors but never a `reconstructionMiss`, and `--max-build-error-rate` caps the total rate.
+
 ## Project analysis metadata
 
 Native reports may include an optional `projectAnalysis` object with

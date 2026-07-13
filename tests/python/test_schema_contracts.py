@@ -334,6 +334,37 @@ class TestContracts(unittest.TestCase):
 
         self.assertTrue(any("execution.testScheduler.sessions" in item for item in errors))
 
+    def test_report_validator_accepts_valid_coverage_integrity(self) -> None:
+        payload = _report_dict(self._base_report())
+        payload["execution"]["coverageIntegrity"] = {
+            "mutantsIntended": 10,
+            "builtAndScored": 7,
+            "coveragePercent": 70.0,
+            "buildErrors": {"total": 3, "reconstructionMiss": 1, "genuineUncompilable": 2},
+        }
+        payload["execution"]["buildErrorPolicy"] = {"tolerateUncompilable": True, "maxBuildErrorRate": 0.5}
+
+        self.assertEqual(validate_report(payload), [])
+
+    def test_report_validator_rejects_inconsistent_coverage_integrity_totals(self) -> None:
+        payload = _report_dict(self._base_report())
+        # reconstructionMiss + genuineUncompilable (1 + 1) != total (3)
+        payload["execution"]["coverageIntegrity"] = {
+            "buildErrors": {"total": 3, "reconstructionMiss": 1, "genuineUncompilable": 1},
+        }
+
+        errors = validate_report(payload)
+
+        self.assertTrue(any("execution.coverageIntegrity.buildErrors" in item for item in errors))
+
+    def test_report_validator_rejects_out_of_range_build_error_policy_rate(self) -> None:
+        payload = _report_dict(self._base_report())
+        payload["execution"]["buildErrorPolicy"] = {"tolerateUncompilable": True, "maxBuildErrorRate": 2.0}
+
+        errors = validate_report(payload)
+
+        self.assertTrue(any("execution.buildErrorPolicy.maxBuildErrorRate" in item for item in errors))
+
     def test_report_validator_checks_execution_mode_shape_when_present(self) -> None:
         payload = _report_dict(self._base_report())
         payload["execution"]["executionMode"] = "unknown"
