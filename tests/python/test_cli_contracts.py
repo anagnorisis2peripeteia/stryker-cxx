@@ -5922,6 +5922,49 @@ class CliContractTests(unittest.TestCase):
         self.assertIn("FloatingPointLiteral", mutators)
         self.assertIn("StringLiteral", mutators)
 
+    def test_resolve_compile_entry_uses_real_flags_for_matched_file(self) -> None:
+        # Acceptance side: a file listed in compile_commands.json is parsed with its OWN real flags.
+        compile_db = [
+            {
+                "directory": str(self.repo),
+                "command": "clang++ -std=c++17 -DSAMPLE=1 -I/opt/sample/include -c sample.cpp -o sample.o",
+                "file": str(self.source),
+            }
+        ]
+        (self.repo / "compile_commands.json").write_text(json.dumps(compile_db))
+        flags = engine._resolve_compile_entry(str(self.repo), "sample.cpp")
+        self.assertIn("-std=c++17", flags)
+        self.assertIn("-DSAMPLE=1", flags)
+        self.assertIn("-I/opt/sample/include", flags)
+        self.assertIn("-fsyntax-only", flags)
+
+    def test_resolve_compile_entry_does_not_borrow_foreign_flags_for_unlisted_file(self) -> None:
+        # Rejection side: a file ABSENT from compile_commands.json must NOT inherit another entry's
+        # -std/-D/-I. Borrowing foreign flags silently parses it into the wrong AST (wrong/missing
+        # mutation sites) with no compile error to catch it -- the clang-ast fail-open bug.
+        import contextlib
+        import io
+
+        other = self.repo / "other.cpp"
+        other.write_text("int other() { return 0; }\n")
+        compile_db = [
+            {
+                "directory": str(self.repo),
+                "command": "clang++ -std=c++20 -DOTHER=1 -I/opt/other/include -c other.cpp -o other.o",
+                "file": str(other),
+            }
+        ]
+        (self.repo / "compile_commands.json").write_text(json.dumps(compile_db))
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            flags = engine._resolve_compile_entry(str(self.repo), "sample.cpp")
+        self.assertEqual(flags, ["-fsyntax-only"])
+        self.assertNotIn("-std=c++20", flags)
+        self.assertNotIn("-DOTHER=1", flags)
+        self.assertNotIn("-I/opt/other/include", flags)
+        # The miss is surfaced loudly, not silently papered over.
+        self.assertIn("not in compile_commands.json", buf.getvalue())
+
     def test_clang_mode_runs_compile_database_fixture_when_bindings_are_available(self) -> None:
         try:
             from clang import cindex  # type: ignore
