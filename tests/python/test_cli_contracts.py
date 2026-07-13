@@ -2425,6 +2425,108 @@ class CliContractTests(unittest.TestCase):
         self.assertIn("--mode token", repro)
         self.assertIn("--execution-mode mutant-switch", repro)
 
+    def _write_reproducible_build_error_fixture(self) -> None:
+        (self.repo / "m.cpp").write_text("int main() { return 1; }\n")
+        build = self.repo / "build.sh"
+        build.write_text('#!/bin/bash\ngrep -q "return 0" m.cpp && exit 1\nexit 0\n')
+        build.chmod(0o755)
+        self._git("add", "m.cpp", "build.sh")
+        self._git(
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "f",
+        )
+
+    def _run_build_error_cli(self, extra: list[str], *, report: Path) -> subprocess.CompletedProcess[str]:
+        return self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "m.cpp",
+            "--build-command",
+            "./build.sh",
+            "--test-command",
+            "true",
+            "--skip-initial-test",
+            "--mutators",
+            "IntegerLiteral",
+            "--report",
+            str(report),
+            "--quiet",
+            *extra,
+        )
+
+    def test_run_default_fails_on_build_error_and_reports_coverage_integrity(self) -> None:
+        self._write_reproducible_build_error_fixture()
+        report = self.repo / "rep.json"
+
+        result = self._run_build_error_cli([], report=report)
+
+        self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+        payload = json.loads(report.read_text())
+        build_errors = payload["execution"]["coverageIntegrity"]["buildErrors"]
+        self.assertGreaterEqual(build_errors["total"], 1)
+        self.assertGreaterEqual(build_errors["genuineUncompilable"], 1)
+        self.assertEqual(build_errors["reconstructionMiss"], 0)
+        self.assertFalse(payload["execution"]["buildErrorPolicy"]["tolerateUncompilable"])
+
+    def test_run_tolerate_uncompilable_passes_genuine_build_errors(self) -> None:
+        self._write_reproducible_build_error_fixture()
+        report = self.repo / "rep.json"
+
+        result = self._run_build_error_cli(["--tolerate-uncompilable-mutants"], report=report)
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+    def test_run_max_build_error_rate_guard_still_fails(self) -> None:
+        self._write_reproducible_build_error_fixture()
+        report = self.repo / "rep.json"
+
+        result = self._run_build_error_cli(
+            [
+                "--tolerate-uncompilable-mutants",
+                "--max-build-error-rate",
+                "0.0",
+            ],
+            report=report,
+        )
+
+        self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+
+    def test_run_tolerate_via_config_file(self) -> None:
+        self._write_reproducible_build_error_fixture()
+        config = self.repo / "cfg.json"
+        config.write_text(json.dumps({"execution": {"tolerateUncompilableMutants": True}}))
+        report = self.repo / "rep.json"
+
+        result = self._cli(
+            "run",
+            "--repo",
+            str(self.repo),
+            "--files",
+            "m.cpp",
+            "--build-command",
+            "./build.sh",
+            "--test-command",
+            "true",
+            "--skip-initial-test",
+            "--mutators",
+            "IntegerLiteral",
+            "--report",
+            str(report),
+            "--quiet",
+            "--config",
+            str(config),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
     def test_plugin_mutator_is_available_to_list_mutants(self) -> None:
         plugin = self.repo / "literal-plugin.json"
         plugin.write_text(json.dumps({
@@ -5031,6 +5133,106 @@ class CliContractTests(unittest.TestCase):
         self.assertIn("--mode token", header)
         syntax = engine._clang_parse_error_message("foo.cpp", "expected ';' after expression")
         self.assertNotIn("docs/clang-ast-dev.md", syntax)
+
+    def test__build_error_class_requires_positive_per_mutant_evidence(self) -> None:
+        # genuineUncompilable ONLY with an explicit "faithful" tag; a non-zero build/configure exit
+        # alone is NOT evidence the mutation is uncompilable (P1: configure + shared-batch failures
+        # must stay reconstruction misses so tolerate-mode can't pass a reconstruction/runner fail).
+        cases = (
+            ({"reconstructionFidelity": "faithful"}, "genuineUncompilable"),
+            ({"reconstructionFidelity": "faithful", "buildReturnCode": 0}, "genuineUncompilable"),
+            ({"reconstructionFidelity": "degraded"}, "reconstructionMiss"),
+            ({"buildReturnCode": 1}, "reconstructionMiss"),          # untagged real failure (e.g. shared batch)
+            ({"configureReturnCode": 2}, "reconstructionMiss"),      # configure failure (does not compile the mutation)
+            ({"buildReturnCode": 0}, "reconstructionMiss"),
+            ({}, "reconstructionMiss"),
+        )
+        for run, expected in cases:
+            with self.subTest(run=run):
+                self.assertEqual(engine._build_error_class(run), expected)
+
+    def test__compute_coverage_integrity_math_and_split_sums_to_total(self) -> None:
+        rep = engine.Report(target_files=[])
+        rep.killed = 8
+        rep.survived = 2
+        rep.buildError = 3
+        rep.checkErrors = 0
+        rep.timeouts = 0
+        rep.mutants = [
+            {"status": "BUILD_ERROR", "run": {"reconstructionFidelity": "faithful"}},  # genuine
+            {"status": "BUILD_ERROR", "run": {"reconstructionFidelity": "degraded"}},  # recon
+            {"status": "BUILD_ERROR", "run": {"buildReturnCode": 1}},                   # recon (untagged)
+            {"status": "SURVIVED", "run": {}},
+            {"status": "KILLED", "run": {}},
+        ]
+
+        integrity = engine._compute_coverage_integrity(rep)
+        self.assertEqual(integrity["mutantsIntended"], 13)
+        self.assertEqual(integrity["builtAndScored"], 10)
+        self.assertEqual(integrity["coveragePercent"], 76.92)
+        self.assertEqual(
+            integrity["buildErrors"],
+            {
+                "total": 3,
+                "reconstructionMiss": 2,
+                "genuineUncompilable": 1,
+            },
+        )
+        self.assertEqual(
+            integrity["buildErrors"]["reconstructionMiss"] + integrity["buildErrors"]["genuineUncompilable"],
+            integrity["buildErrors"]["total"],
+        )
+
+    def test__build_error_exit_status_matrix(self) -> None:
+        def rep_with(build_error: int, killed: int, mutants: list) -> "engine.Report":
+            rep = engine.Report(target_files=[])
+            rep.buildError = build_error
+            rep.killed = killed
+            rep.mutants = mutants
+            rep.execution["coverageIntegrity"] = engine._compute_coverage_integrity(rep)
+            return rep
+
+        faithful = {"status": "BUILD_ERROR", "run": {"reconstructionFidelity": "faithful"}}
+        degraded = {"status": "BUILD_ERROR", "run": {"reconstructionFidelity": "degraded"}}
+        untagged = {"status": "BUILD_ERROR", "run": {"buildReturnCode": 1}}  # e.g. shared batch / configure
+
+        # no build errors -> allow
+        self.assertEqual(engine._build_error_exit_status(rep_with(0, 0, []), False, None), 0)
+        # any build error, strict default -> fail
+        self.assertEqual(engine._build_error_exit_status(rep_with(1, 1, [faithful]), False, None), 2)
+        # tolerate + reconstruction miss (degraded) -> ALWAYS fail (cardinal guard)
+        self.assertEqual(engine._build_error_exit_status(rep_with(1, 1, [degraded]), True, None), 2)
+        # tolerate + reconstruction miss (untagged real failure, e.g. configure/shared batch) -> fail (P1)
+        self.assertEqual(engine._build_error_exit_status(rep_with(1, 1, [untagged]), True, None), 2)
+        # tolerate + genuine-only, no rate cap -> allow
+        self.assertEqual(engine._build_error_exit_status(rep_with(1, 9, [faithful]), True, None), 0)
+        # tolerate + genuine-only, rate (1/10=0.1) NOT above cap 0.1 -> allow
+        self.assertEqual(engine._build_error_exit_status(rep_with(1, 9, [faithful]), True, 0.1), 0)
+        # tolerate + genuine-only, rate 0.1 above cap 0.09 -> fail
+        self.assertEqual(engine._build_error_exit_status(rep_with(1, 9, [faithful]), True, 0.09), 2)
+
+    def test__finite_rate_validator_rejects_out_of_range_and_non_finite(self) -> None:
+        import argparse as _argparse
+        import math as _math
+
+        self.assertEqual(engine._finite_rate("0"), 0.0)
+        self.assertEqual(engine._finite_rate("0.5"), 0.5)
+        self.assertEqual(engine._finite_rate("1"), 1.0)
+        for bad in ("-0.1", "1.5", "2", "nan", "inf", "-inf", "abc", ""):
+            with self.subTest(bad=bad):
+                with self.assertRaises(_argparse.ArgumentTypeError):
+                    engine._finite_rate(bad)
+
+    def test_run_rejects_invalid_max_build_error_rate(self) -> None:
+        self._write_reproducible_build_error_fixture()
+        report = self.repo / "rep.json"
+        for bad in ("2.0", "nan", "-0.5"):
+            with self.subTest(bad=bad):
+                result = self._run_build_error_cli(
+                    ["--tolerate-uncompilable-mutants", "--max-build-error-rate", bad],
+                    report=report,
+                )
+                self.assertNotEqual(result.returncode, 0, result.stderr + result.stdout)
 
     def test_stryker_disable_next_line_marks_mutant_ignored_without_running_it(self) -> None:
         self.source.write_text(

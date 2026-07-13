@@ -122,6 +122,9 @@ Repository convention guardrails:
 - `--format json|markdown|html|sarif|mutation-testing-elements|github-annotations|clear-text|html-report`
 - `--threshold`, `--fail-on-empty`
 - `--threshold-high`, `--threshold-low`, `--threshold-break`
+- `--tolerate-uncompilable-mutants`, `--max-build-error-rate` — opt-in build-error policy
+  (config: `execution.tolerateUncompilableMutants` boolean, `execution.maxBuildErrorRate`
+  number in `[0, 1]`). Strict by default: any build error fails. See **Exit codes** below.
 - `stryker-cxx.yml` / `.stryker-cxx.yml` config loading
 - unknown config keys are rejected by default
 - `stryker-cxx init --path stryker-cxx.yml`
@@ -187,6 +190,15 @@ Required top-level fields:
 - `execution.initialTest`, `execution.dryRunOnly`
 - `execution.timeoutFactor`, `execution.timeoutConstantMs`,
   `execution.effectiveTimeoutMs`
+- `execution.coverageIntegrity` — coverage-integrity of the run: `mutantsIntended`
+  (killed+survived+buildError+checkErrors+timeouts = mutations attempted), `builtAndScored`
+  (killed+survived), `coveragePercent`, and `buildErrors.{total, reconstructionMiss,
+  genuineUncompilable}` (the split always sums to `total`). `reconstructionMiss` = our compile
+  reconstruction could not faithfully build/attribute the mutant (configure failure, shared
+  batch build, missing `compile_commands.json` entry); `genuineUncompilable` = a faithful
+  per-mutant compile positively attributed the failure to the mutation.
+- `execution.buildErrorPolicy` — `tolerateUncompilable` (boolean) and `maxBuildErrorRate`
+  (number in `[0, 1]` or null) that governed the exit decision.
 - `dryRun.status`
 - `coverage.enabled`, `coverage.provider`, `coverage.coveredMutants`,
   `coverage.noCoverageMutants`
@@ -258,7 +270,11 @@ Compatibility aliases such as `CompileError` and `TimedOut` do not belong in
 
 - `0`: completed and met threshold.
 - `1`: usage or infrastructure error.
-- `2`: completed but score was below threshold.
+- `2`: completed but score was below threshold, **or** the build-error policy failed the run.
+  Build-error policy (strict by default): any build error fails. Under
+  `--tolerate-uncompilable-mutants`, a `genuineUncompilable` build error is tolerated, but a
+  `reconstructionMiss` build error ALWAYS fails (it is a fidelity gap, not an uncompilable
+  mutation), and a total build-error rate above `--max-build-error-rate` fails.
 - `3`: no mutants and `--fail-on-empty` was set.
 
 ## Mutators

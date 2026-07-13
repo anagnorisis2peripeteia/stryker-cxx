@@ -149,6 +149,52 @@ def validate_report(payload: dict[str, Any]) -> list[str]:
                     (str, type(None)),
                 ):
                     errors.append(_collect("execution.llvmSwitch.fallbackReason", "expected string or null"))
+        coverage_integrity = exec_ctx.get("coverageIntegrity")
+        if coverage_integrity is not None:
+            if not isinstance(coverage_integrity, dict):
+                errors.append(_collect("execution.coverageIntegrity", "expected object"))
+            else:
+                for key in ("mutantsIntended", "builtAndScored"):
+                    value = coverage_integrity.get(key)
+                    if key in coverage_integrity and not (isinstance(value, int) and not isinstance(value, bool) and value >= 0):
+                        errors.append(_collect(f"execution.coverageIntegrity.{key}", "expected non-negative integer"))
+                pct = coverage_integrity.get("coveragePercent")
+                if "coveragePercent" in coverage_integrity and not (
+                    isinstance(pct, (int, float)) and not isinstance(pct, bool) and 0 <= pct <= 100
+                ):
+                    errors.append(_collect("execution.coverageIntegrity.coveragePercent", "expected number in [0, 100]"))
+                build_errors = coverage_integrity.get("buildErrors")
+                if build_errors is not None:
+                    if not isinstance(build_errors, dict):
+                        errors.append(_collect("execution.coverageIntegrity.buildErrors", "expected object"))
+                    else:
+                        counts: dict[str, Any] = {}
+                        for key in ("total", "reconstructionMiss", "genuineUncompilable"):
+                            value = build_errors.get(key)
+                            if key in build_errors and not (isinstance(value, int) and not isinstance(value, bool) and value >= 0):
+                                errors.append(_collect(f"execution.coverageIntegrity.buildErrors.{key}", "expected non-negative integer"))
+                            else:
+                                counts[key] = value
+                        if all(isinstance(counts.get(k), int) for k in ("total", "reconstructionMiss", "genuineUncompilable")):
+                            if counts["reconstructionMiss"] + counts["genuineUncompilable"] != counts["total"]:
+                                errors.append(_collect(
+                                    "execution.coverageIntegrity.buildErrors",
+                                    "reconstructionMiss + genuineUncompilable must equal total",
+                                ))
+        build_error_policy = exec_ctx.get("buildErrorPolicy")
+        if build_error_policy is not None:
+            if not isinstance(build_error_policy, dict):
+                errors.append(_collect("execution.buildErrorPolicy", "expected object"))
+            else:
+                if "tolerateUncompilable" in build_error_policy and not isinstance(
+                    build_error_policy.get("tolerateUncompilable"), bool
+                ):
+                    errors.append(_collect("execution.buildErrorPolicy.tolerateUncompilable", "expected boolean"))
+                rate = build_error_policy.get("maxBuildErrorRate")
+                if "maxBuildErrorRate" in build_error_policy and not (
+                    rate is None or (isinstance(rate, (int, float)) and not isinstance(rate, bool) and 0 <= rate <= 1)
+                ):
+                    errors.append(_collect("execution.buildErrorPolicy.maxBuildErrorRate", "expected number in [0, 1] or null"))
         fallback = exec_ctx.get("artifactFallback")
         if isinstance(fallback, str) and fallback not in ARTIFACT_FALLBACKS:
             errors.append(_collect("execution.artifactFallback", f"unexpected fallback {fallback!r}"))
